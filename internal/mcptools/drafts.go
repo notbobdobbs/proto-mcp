@@ -372,7 +372,8 @@ func buildDraftTemplate(deps Deps, subject string, to, cc, bcc []string, bodyTex
 		mimeType = "text/html"
 	}
 
-	if err := rejectHiddenText("subject", subject); err != nil {
+	subject, err := exactField("subject", subject)
+	if err != nil {
 		return gpa.DraftTemplate{}, "", err
 	}
 	sender, err := primarySenderAddress(deps)

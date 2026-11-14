@@ -55,6 +55,10 @@ func TestDraftChange(t *testing.T) {
 func TestDraftPromptBody_ShowsEverythingAndResistsInjection(t *testing.T) {
 	d := testDraft()
 	d.Subject = "hi\nBCC: evil@x.com"
+	if _, _, err := draftPromptBody(d); err == nil {
+		t.Fatal("newline in the subject was rewritten into the dialog instead of refused")
+	}
+	d.Subject = "hi"
 	d.BCCList = []*mail.Address{{Address: "carol@x.com"}}
 	for i := 2; i <= 5; i++ {
 		d.Attachments = append(d.Attachments, gpa.Attachment{ID: "a", Name: "file" + string(rune('0'+i)) + ".txt", Size: 10})
@@ -63,7 +67,7 @@ func TestDraftPromptBody_ShowsEverythingAndResistsInjection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("draftPromptBody: %v", err)
 	}
-	for _, want := range []string{"Subject: hi BCC: evil@x.com", "To (1): alice@x.com", "Cc (1): bob@x.com", "Bcc (1): carol@x.com", "q3.pdf", "file5.txt"} {
+	for _, want := range []string{"Subject: hi", "To (1): alice@x.com", "Cc (1): bob@x.com", "Bcc (1): carol@x.com", "q3.pdf", "file5.txt"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("prompt body missing %q:\n%s", want, body)
 		}

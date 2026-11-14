@@ -130,25 +130,31 @@ func draftPromptBody(d gpa.Message) (string, []string, error) {
 		}
 	}
 	to, cc, bcc := addressStrings(d.ToList), addressStrings(d.CCList), addressStrings(d.BCCList)
-	tj, err := joinAddrs(to)
+	tj, toCanon, err := joinAddrs(to)
 	if err != nil {
 		return "", nil, err
 	}
-	cj, err := joinAddrs(cc)
+	cj, ccCanon, err := joinAddrs(cc)
 	if err != nil {
 		return "", nil, err
 	}
-	bj, err := joinAddrs(bcc)
+	bj, bccCanon, err := joinAddrs(bcc)
 	if err != nil {
 		return "", nil, err
 	}
 	parts := []string{"Send draft " + capField(d.ID, promptNameMaxRunes)}
-	parts = append(parts, recipientLines(orNone(tj), orNone(cj), orNone(bj))...)
-	parts = append(parts, "Subject: "+capField(d.Subject, promptSubjectMaxRunes))
-	if s := messageAttachmentsList(d.Attachments); s != "" {
+	parts = append(parts, recipientLines(tj, cj, bj)...)
+	subject, err := exactField("subject", d.Subject)
+	if err != nil {
+		return "", nil, err
+	}
+	parts = append(parts, "Subject: "+subject)
+	if s, err := messageAttachmentsList(d.Attachments); err != nil {
+		return "", nil, err
+	} else if s != "" {
 		parts = append(parts, "Attachments: "+s)
 	}
-	addrs := append(append(append([]string{}, to...), cc...), bcc...)
+	addrs := append(append(append([]string{}, toCanon...), ccCanon...), bccCanon...)
 	return strings.Join(parts, "\n"), addrs, nil
 }
 
@@ -172,12 +178,16 @@ func addrCount(joined string) int {
 
 // messageAttachmentsList renders every attachment already on a server
 // message as "name (size), …", each name capped. "" when none.
-func messageAttachmentsList(atts []gpa.Attachment) string {
+func messageAttachmentsList(atts []gpa.Attachment) (string, error) {
 	out := make([]string, 0, len(atts))
 	for _, a := range atts {
-		out = append(out, fmt.Sprintf("%s (%s)", capField(a.Name, promptNameMaxRunes), humanBytes(a.Size)))
+		name, err := exactField("attachment name", a.Name)
+		if err != nil {
+			return "", err
+		}
+		out = append(out, fmt.Sprintf("%s (%s)", name, humanBytes(a.Size)))
 	}
-	return strings.Join(out, ", ")
+	return strings.Join(out, ", "), nil
 }
 
 // draftChange names the first thing that differs between the draft
@@ -275,25 +285,31 @@ func replyPromptBody(deps Deps, parent gpa.Message, parentID string, replyAll bo
 		return "", nil, err
 	}
 	to, cc := replyRecipients(deps, parent, replyAll)
-	tj, err := joinAddrs(to)
+	tj, toCanon, err := joinAddrs(to)
 	if err != nil {
 		return "", nil, err
 	}
-	cj, err := joinAddrs(cc)
+	cj, ccCanon, err := joinAddrs(cc)
 	if err != nil {
 		return "", nil, err
 	}
 	parts := []string{verb + " message " + capField(parentID, promptNameMaxRunes)}
-	parts = append(parts, recipientLines(orNone(tj), orNone(cj), "(none)")...)
-	parts = append(parts, "Subject: "+capField(replySubject(parent.Subject), promptSubjectMaxRunes))
+	parts = append(parts, recipientLines(tj, cj, "")...)
+	subject, err := exactField("subject", replySubject(parent.Subject))
+	if err != nil {
+		return "", nil, err
+	}
+	parts = append(parts, "Subject: "+subject)
 	decoded, err := decodeAndValidateAttachments(deps, attachments)
 	if err != nil {
 		return "", nil, err
 	}
-	if s := attachmentsSummary(decoded); s != "" {
+	if s, err := attachmentsSummary(decoded); err != nil {
+		return "", nil, err
+	} else if s != "" {
 		parts = append(parts, s)
 	}
-	return strings.Join(parts, "\n"), append(append([]string{}, to...), cc...), nil
+	return strings.Join(parts, "\n"), append(append([]string{}, toCanon...), ccCanon...), nil
 }
 
 // forwardPromptSnapshot is mail_forward's PromptSnapshot (issue #125).
@@ -350,16 +366,26 @@ func forwardPromptBody(deps Deps, parent gpa.Message, in forwardInput) (string, 
 	}
 	parts := []string{"Forward message " + capField(in.ForwardOf, promptNameMaxRunes)}
 	parts = append(parts, recipientLines(to, cc, bcc)...)
-	parts = append(parts, "Subject: "+capField(forwardSubject(parent.Subject), promptSubjectMaxRunes))
+	subject, err := exactField("subject", forwardSubject(parent.Subject))
+	if err != nil {
+		return "", nil, err
+	}
+	parts = append(parts, "Subject: "+subject)
 	decoded, err := decodeAndValidateAttachments(deps, in.Attachments)
 	if err != nil {
 		return "", nil, err
 	}
-	if s := attachmentsSummary(decoded); s != "" {
+	if s, err := attachmentsSummary(decoded); err != nil {
+		return "", nil, err
+	} else if s != "" {
 		parts = append(parts, s)
 	}
 	if in.IncludeParentAttachments {
-		parts = append(parts, "Forwarded attachments: "+orNone(messageAttachmentsList(parent.Attachments)))
+		s, err := messageAttachmentsList(parent.Attachments)
+		if err != nil {
+			return "", nil, err
+		}
+		parts = append(parts, "Forwarded attachments: "+orNone(s))
 	}
 	addrs := append(append(append([]string{}, toA...), ccA...), bccA...)
 	return strings.Join(parts, "\n"), addrs, nil

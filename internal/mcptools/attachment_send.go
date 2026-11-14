@@ -200,15 +200,19 @@ func uploadAttachmentsAndCollectKeys(
 // long list still says how many files ride along; the names themselves
 // are not cut down to three. A dialog that cannot fit the full list
 // is refused by sendApprovalDialog rather than shown in part.
-func attachmentsSummary(decoded []decodedAttachment) string {
+func attachmentsSummary(decoded []decodedAttachment) (string, error) {
 	if len(decoded) == 0 {
-		return ""
+		return "", nil
 	}
 	parts := make([]string, 0, len(decoded))
 	for _, d := range decoded {
-		parts = append(parts, fmt.Sprintf("%s (%s)", capField(d.Filename, promptNameMaxRunes), humanBytes(int64(len(d.Plain)))))
+		name, err := exactField("attachment name", d.Filename)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", name, humanBytes(int64(len(d.Plain)))))
 	}
-	return fmt.Sprintf("Attachments (%d): %s", len(decoded), strings.Join(parts, ", "))
+	return fmt.Sprintf("Attachments (%d): %s", len(decoded), strings.Join(parts, ", ")), nil
 }
 
 // humanBytes formats a byte count as a short human-readable string.

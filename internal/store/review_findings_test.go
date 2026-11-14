@@ -267,6 +267,103 @@ func TestConcurrentSealDoesNotCorrupt(t *testing.T) {
 	}
 }
 
+func TestCloseKeepsWALWrittenAfterCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`CREATE TABLE t (v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`INSERT INTO t (v) VALUES ('before')`); err != nil {
+		t.Fatal(err)
+	}
+	prev := afterCheckpoint
+	var held *sql.DB
+	var heldTx *sql.Tx
+	afterCheckpoint = func(live string) error {
+		db, err := sql.Open("sqlite", live)
+		if err != nil {
+			return err
+		}
+		if _, err := db.Exec(`INSERT INTO t (v) VALUES ('after')`); err != nil {
+			_ = db.Close()
+			return err
+		}
+		// Hold a read so Close cannot checkpoint the new frame away
+		// before we look at the WAL.
+		tx, err := db.Begin()
+		if err != nil {
+			_ = db.Close()
+			return err
+		}
+		rows, err := tx.Query(`SELECT v FROM t`)
+		if err != nil {
+			_ = tx.Rollback()
+			_ = db.Close()
+			return err
+		}
+		_ = rows.Close()
+		held, heldTx = db, tx
+		return nil
+	}
+	t.Cleanup(func() {
+		afterCheckpoint = prev
+		if heldTx != nil {
+			_ = heldTx.Rollback()
+		}
+		if held != nil {
+			_ = held.Close()
+		}
+	})
+	if err := s.Close(); err == nil {
+		t.Fatal("close shredded or sealed over a WAL written after the checkpoint")
+	}
+	if frames, err := walHasFrames(path + ".live"); err != nil || !frames {
+		t.Fatalf("WAL frames after refused close: frames=%v err=%v", frames, err)
+	}
+	db, err := sql.Open("sqlite", path+".live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("rows = %d, want both the pre-checkpoint and the late write", n)
+	}
+}
+
+func TestOpenShredsStaleUnsealTemps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	stale := filepath.Join(dir, ".unseal.42.deadbeef")
+	const secret = "plaintext-left-by-a-crash"
+	if err := os.WriteFile(stale, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(keep, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale unseal temp still present: %v", err)
+	}
+	got, err := os.ReadFile(keep)
+	if err != nil || string(got) != "keep" {
+		t.Fatalf("unrelated file changed: %q %v", got, err)
+	}
+}
+
 func TestOpenMarksWALForNoDump(t *testing.T) {
 	var got []string
 	prev := markNoDump

@@ -183,7 +183,10 @@ func TestAttachmentsSummary(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := attachmentsSummary(tc.in)
+			got, err := attachmentsSummary(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if got != tc.want {
 				t.Errorf("attachmentsSummary:\n got  %q\n want %q", got, tc.want)
 			}

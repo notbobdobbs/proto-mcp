@@ -113,7 +113,18 @@ exit(ok ? 0 : 1)
 // The Go side labels each list "To (n)", "Cc (n)", and "Bcc (n)".
 func scrollableBody(_ text: String, allow: NSButton) -> NSScrollView {
     let width: CGFloat = 480
-    let view = NSTextView(frame: NSRect(x: 0, y: 0, width: width - 16, height: 10))
+    let contentWidth = width - 16
+    // Build TextKit 1 before the string is set. On macOS 13+ a
+    // default NSTextView is TextKit 2, and touching layoutManager
+    // afterwards flips it to TextKit 1 with an empty usedRect. That
+    // used to fall back to a 48pt viewport with Allow already enabled.
+    let storage = NSTextStorage()
+    let layout = NSLayoutManager()
+    storage.addLayoutManager(layout)
+    let container = NSTextContainer(size: NSSize(width: contentWidth, height: CGFloat.greatestFiniteMagnitude))
+    container.widthTracksTextView = true
+    layout.addTextContainer(container)
+    let view = NSTextView(frame: NSRect(x: 0, y: 0, width: contentWidth, height: 10), textContainer: container)
     view.isEditable = false
     view.isSelectable = true
     view.isRichText = false
@@ -123,27 +134,29 @@ func scrollableBody(_ text: String, allow: NSButton) -> NSScrollView {
     view.isHorizontallyResizable = false
     view.textContainerInset = NSSize(width: 4, height: 6)
     view.minSize = NSSize(width: 0, height: 0)
-    view.maxSize = NSSize(width: width - 16, height: CGFloat.greatestFiniteMagnitude)
-    view.textContainer?.widthTracksTextView = true
-    view.textContainer?.containerSize = NSSize(width: width - 16, height: CGFloat.greatestFiniteMagnitude)
+    view.maxSize = NSSize(width: contentWidth, height: CGFloat.greatestFiniteMagnitude)
     view.string = text
-    view.layoutManager?.ensureLayout(for: view.textContainer!)
-    let used = view.layoutManager?.usedRect(for: view.textContainer!) ?? .zero
-    let contentH = max(used.height + view.textContainerInset.height * 2 + 8, 48)
-    view.frame = NSRect(x: 0, y: 0, width: width - 16, height: contentH)
+    layout.ensureLayout(for: container)
+    let used = layout.usedRect(for: container)
+    // Empty or non-positive height with text present means we do not
+    // know the size. Fail closed: Allow stays off until the user
+    // scrolls to the end.
+    let uncertain = !text.isEmpty && used.height < 1
+    let contentH = used.height + view.textContainerInset.height * 2 + 8
+    let laidOut = max(contentH, 48)
+    view.frame = NSRect(x: 0, y: 0, width: contentWidth, height: uncertain ? 200 : laidOut)
 
-    // Cap the viewport well above a single line. 96pt hid every
-    // recipient after the first wrapped To line, including Bcc.
     let maxH: CGFloat = 440
-    let viewH = min(maxH, contentH)
+    let viewH = min(maxH, view.frame.height)
     let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: viewH))
     scroll.hasVerticalScroller = true
-    scroll.autohidesScrollers = contentH <= viewH + 1
+    scroll.autohidesScrollers = !uncertain && contentH <= viewH + 1
     scroll.borderType = .bezelBorder
     scroll.drawsBackground = false
     scroll.documentView = view
 
-    if contentH > viewH + 1 {
+    let mustScroll = uncertain || contentH > viewH + 1
+    if mustScroll {
         allow.isEnabled = false
         scroll.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(

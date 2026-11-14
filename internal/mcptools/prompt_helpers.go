@@ -50,15 +50,16 @@ func addressShownAsSent(addr string) bool {
 // display. Addresses are never shortened or rewritten: a cut-off or
 // normalized address would misrepresent where the mail goes. A list
 // too long to show is refused by sendApprovalDialog.
-func joinAddrs(addrs []string) (string, error) {
+func joinAddrs(addrs []string) (string, []string, error) {
 	out := make([]string, 0, len(addrs))
 	for _, a := range addrs {
-		if !addressShownAsSent(a) {
-			return "", fmt.Errorf("recipient %q cannot be shown exactly as it would be sent", a)
+		canon, err := canonicalAddress(a)
+		if err != nil {
+			return "", nil, err
 		}
-		out = append(out, a)
+		out = append(out, canon)
 	}
-	return strings.Join(out, ", "), nil
+	return strings.Join(out, ", "), out, nil
 }
 
 // --- Issue #125: approval dialogs that can't misrepresent a send ---
@@ -86,10 +87,27 @@ const (
 	promptNameMaxRunes = 100
 )
 
+// exactField returns s only when the approval dialog will contain
+// those exact bytes. The dialog sanitizer drops format characters,
+// bidi controls, and line breaks. Showing the rewritten form while
+// sending s would approve a different subject or file name than the
+// one that goes out. Callers put the returned string in the dialog
+// and send that same string.
+func exactField(kind, s string) (string, error) {
+	if sanitizeField(s) != s {
+		return "", fmt.Errorf("%s contains a line break and cannot be shown exactly as it would be sent", kind)
+	}
+	shown, err := mcp.SanitizePromptTextStrict(s, 1<<20)
+	if err != nil || shown != s {
+		return "", fmt.Errorf("%s contains a hidden or format character and cannot be shown exactly as it would be sent", kind)
+	}
+	return s, nil
+}
+
 // capField sanitizes one value for a dialog line and shortens it to
 // max runes, ending with "..." when cut. (Not "…": SanitizePromptText's
-// NFKC pass would expand it to "..." anyway.) Not for addresses; see
-// joinAddrs.
+// NFKC pass would expand it to "..." anyway.) Not for values that are
+// sent: those go through exactField so the dialog cannot rewrite them.
 func capField(s string, max int) string {
 	s = sanitizeField(s)
 	if utf8.RuneCountInString(s) <= max {
@@ -133,11 +151,11 @@ func promptAddrs(entries []string) (line string, addrs []string, err error) {
 			addrs = append(addrs, canon)
 		}
 	}
-	line, err = joinAddrs(addrs)
+	line, canon, err := joinAddrs(addrs)
 	if err != nil {
 		return "", nil, err
 	}
-	return orNone(line), addrs, nil
+	return line, canon, nil
 }
 
 // sendApprovalDialog is the one exit for every send-family dialog. It
@@ -149,6 +167,11 @@ func sendApprovalDialog(toolName, body string, addrs []string) (title, sanitized
 	sanitized, err = mcp.SanitizePromptTextStrict(body, promptBodyMaxRunes)
 	if err != nil {
 		return "", "", fmt.Errorf("%w; nothing was sent. Send to fewer recipients or attachments per call", err)
+	}
+	// The sanitizer must be a no-op. A rewritten body would approve
+	// different subject or attachment bytes than the send uses.
+	if sanitized != body {
+		return "", "", fmt.Errorf("approval dialog would not show the subject and attachment names exactly as they would be sent")
 	}
 	if err := dialogShowsAddresses(sanitized, addrs); err != nil {
 		return "", "", err

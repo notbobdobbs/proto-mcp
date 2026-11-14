@@ -124,12 +124,25 @@ func (s *Store) close() error {
 
 	var err error
 	if s.DB != nil && s.live != "" {
+		// Drain the pool to one connection so a pooled write cannot
+		// land in a fresh WAL between the checkpoint and Close.
+		s.DB.SetMaxOpenConns(1)
 		// The sealed copy is the main file, not the WAL. A busy
 		// TRUNCATE checkpoint still returns no error from Exec; the
 		// row's busy count is what says the log was not fully
 		// copied. Shredding that log would drop committed pages.
 		if cerr := checkpointTruncate(s.DB); cerr != nil {
 			err = cerr
+		}
+		if err == nil {
+			if _, cerr := s.DB.Exec("PRAGMA query_only=ON"); cerr != nil && err == nil {
+				err = fmt.Errorf("store: freeze writes: %w", cerr)
+			}
+		}
+		if afterCheckpoint != nil {
+			if herr := afterCheckpoint(s.live); herr != nil && err == nil {
+				err = herr
+			}
 		}
 	}
 	if s.DB != nil {
@@ -142,6 +155,14 @@ func (s *Store) close() error {
 		return err
 	}
 	defer s.key.Zero()
+	if err == nil {
+		frames, ferr := walHasFrames(s.live)
+		if ferr != nil {
+			err = ferr
+		} else if frames {
+			err = errors.New("store: WAL has frames after close; not sealing or shredding")
+		}
+	}
 	if err != nil {
 		// Leave the working files for the next open. Drop our pid so
 		// that open is not stuck believing this process still has them.
@@ -202,6 +223,28 @@ func (s *Store) finishLive() error {
 // finish. SQLite reports a blocked checkpoint as a successful query
 // whose first column is non-zero (busy). That is a failure: the WAL
 // still holds pages the main file does not.
+// afterCheckpoint, if set, runs after the final checkpoint and
+// before Close. Tests use it to simulate a write landing in a new
+// WAL. Production leaves it nil.
+var afterCheckpoint func(live string) error
+
+// walHasFrames reports whether the WAL holds any frame. A missing
+// file or a header-only file (32 bytes) does not. Anything larger
+// is a page the main database file does not have.
+func walHasFrames(dbPath string) (bool, error) {
+	fi, err := os.Lstat(dbPath + "-wal")
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+		return false, fmt.Errorf("store: WAL %s is not a regular file", dbPath+"-wal")
+	}
+	return fi.Size() > 32, nil
+}
+
 func checkpointTruncate(db *sql.DB) error {
 	var busy, logged, checkpointed int
 	err := db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logged, &checkpointed)
@@ -285,6 +328,9 @@ func sqlString(s string) string {
 // materialize makes sure the working file exists and the canonical
 // path is not leftover plaintext.
 func materialize(path, live string, key []byte) error {
+	if err := shredStaleSealTemps(filepath.Dir(path)); err != nil {
+		return err
+	}
 	_ = shred(live + ".snapshot")
 	switch {
 	case isSQLiteFile(live):
@@ -309,6 +355,28 @@ func materialize(path, live string, key []byte) error {
 	default:
 		return fmt.Errorf("store: %s is neither a SQLite database nor an encrypted mirror", path)
 	}
+}
+
+// shredStaleSealTemps removes plaintext leftovers from a crash
+// during seal or unseal. Those names are `.unseal.<pid>.<hex>`,
+// `.seal.<pid>.<hex>`, and `*.snapshot.<pid>.<hex>`.
+func shredStaleSealTemps(dir string) error {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range ents {
+		name := e.Name()
+		if strings.HasPrefix(name, ".unseal.") || strings.HasPrefix(name, ".seal.") || strings.Contains(name, ".snapshot.") {
+			if err := shred(filepath.Join(dir, name)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func shredSidecars(path string) error {

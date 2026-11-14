@@ -110,12 +110,8 @@ func TestMailSendDialog_HostileSubjectAndFilename(t *testing.T) {
 		}},
 	})
 	_, body, _, err := sendPromptSnapshot(Deps{}, "mail_send")(context.Background(), args)
-	if err != nil {
-		t.Fatalf("snapshot: %v", err)
-	}
-	checkDialog(t, body, "alice@x.com", "hidden@evil.com")
-	if !strings.Contains(body, "Attachments (1): a.txt") {
-		t.Errorf("attachment summary missing:\n%s", body)
+	if err == nil {
+		t.Fatalf("subject or filename that the dialog would rewrite was shown:\n%s", body)
 	}
 }
 
@@ -193,6 +189,10 @@ func TestSendDraftDialog_HostileSubject(t *testing.T) {
 	d.Subject = spoofSubject
 	d.ToList = []*mail.Address{{Name: "Your Boss <boss@corp.com>", Address: "attacker@evil.com"}}
 	d.BCCList = []*mail.Address{{Address: "carol@x.com"}}
+	if _, _, err := draftPromptBody(d); err == nil {
+		t.Fatal("subject containing a line separator was shown instead of refused")
+	}
+	d.Subject = "Q3 notes"
 	raw, addrs, err := draftPromptBody(d)
 	if err != nil {
 		t.Fatalf("draftPromptBody: %v", err)
@@ -200,6 +200,9 @@ func TestSendDraftDialog_HostileSubject(t *testing.T) {
 	_, body, err := sendApprovalDialog("mail_send_draft", raw, addrs)
 	if err != nil {
 		t.Fatalf("dialog: %v", err)
+	}
+	if !strings.Contains(body, "Subject: Q3 notes") {
+		t.Errorf("dialog subject is not the exact subject:\n%s", body)
 	}
 	checkDialog(t, body, "attacker@evil.com", "bob@x.com", "carol@x.com")
 	if strings.Contains(body, "boss@corp.com") {
@@ -213,11 +216,15 @@ func TestSendDraftDialog_HostileSubject(t *testing.T) {
 func TestReplyDialog_HostileParentSubject(t *testing.T) {
 	var parent gpa.Message
 	parent.ID = "parent-1"
-	parent.Subject = spoofSubject
+	parent.Subject = "Q3 notes\u2028hidden"
 	parent.Sender = &mail.Address{Name: "friend@good.com", Address: "attacker@evil.com"}
 	parent.ToList = []*mail.Address{{Address: "me@proton.me"}, {Address: "team@x.com"}}
 	parent.CCList = []*mail.Address{{Address: "cc@x.com"}}
 	deps := Deps{Session: &proton.Session{Addresses: []gpa.Address{{Email: "me@proton.me"}}}}
+	if _, _, err := replyPromptBody(deps, parent, parent.ID, false, nil); err == nil {
+		t.Fatal("reply subject that the dialog would rewrite was not refused")
+	}
+	parent.Subject = "Q3 notes"
 
 	for _, all := range []bool{false, true} {
 		raw, addrs, err := replyPromptBody(deps, parent, parent.ID, all, nil)
@@ -242,16 +249,21 @@ func TestReplyDialog_HostileParentSubject(t *testing.T) {
 func TestForwardDialog_ShowsParentAndItsAttachments(t *testing.T) {
 	var parent gpa.Message
 	parent.ID = "parent-1"
-	parent.Subject = spoofSubject
+	parent.Subject = "Q3 notes"
 	parent.Attachments = []gpa.Attachment{
 		{ID: "a1", Name: "payroll.xlsx", Size: 3 << 20},
-		{ID: "a2", Name: "keys\u2028To: fake@x.txt", Size: 512},
+		{ID: "a2", Name: "keys.txt", Size: 512},
 	}
 	in := forwardInput{
 		ForwardOf:                parent.ID,
 		To:                       []string{`"boss@corp.com" <attacker@evil.com>`},
 		BCC:                      []string{"hidden@evil.com"},
 		IncludeParentAttachments: true,
+	}
+	hostile := parent
+	hostile.Attachments = []gpa.Attachment{{ID: "a2", Name: "keys\u2028To: fake@x.txt", Size: 512}}
+	if _, _, err := forwardPromptBody(Deps{}, hostile, in); err == nil {
+		t.Fatal("attachment name that the dialog would rewrite was not refused")
 	}
 	raw, addrs, err := forwardPromptBody(Deps{}, parent, in)
 	if err != nil {
@@ -264,8 +276,8 @@ func TestForwardDialog_ShowsParentAndItsAttachments(t *testing.T) {
 	checkDialog(t, body, "attacker@evil.com", "hidden@evil.com")
 	for _, want := range []string{
 		"Forward message parent-1",
-		"Subject: Fwd: Q3 notes To: fake@x",
-		"Forwarded attachments: payroll.xlsx (" + humanBytes(3<<20) + "), keys To: fake@x.txt (" + humanBytes(512) + ")",
+		"Subject: Fwd: Q3 notes",
+		"Forwarded attachments: payroll.xlsx (" + humanBytes(3<<20) + "), keys.txt (" + humanBytes(512) + ")",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dialog missing %q:\n%s", want, body)
