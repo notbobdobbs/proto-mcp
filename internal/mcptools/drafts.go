@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
+	"strings"
 	"time"
 
-	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gluon/rfc822"
+	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
@@ -135,7 +136,7 @@ func mailDraftCreate(deps Deps) mcp.Tool {
 
 func mailDraftUpdate(deps Deps) mcp.Tool {
 	return mcp.Tool{
-		Name:        "mail_draft_update",
+		Name: "mail_draft_update",
 		Description: "Update an existing draft. Any field you don't pass is preserved. body_html still runs through outbound sanitization. " +
 			"Optional `attachments` array uploads ADDITIONAL files (does not replace existing attachments on the draft — for that, mail_draft_delete + mail_draft_create).",
 		InputSchema: json.RawMessage(`{
@@ -423,17 +424,33 @@ func senderKeyring(deps Deps) (string, *crypto.KeyRing, error) {
 	return addr.ID, kr, nil
 }
 
+// parseAddrList parses every recipient the send will use. One entry
+// may hold several addresses ("a@x.com, b@y.com"); those are exploded
+// so the send matches the approval dialog, which shows each of them.
+// An address the dialog would rewrite (bidi, zero-width, NFKC) is
+// refused — same rule as addressShownAsSent (issue #125).
 func parseAddrList(addrs []string) ([]*mail.Address, error) {
 	if len(addrs) == 0 {
 		return nil, nil
 	}
-	out := make([]*mail.Address, 0, len(addrs))
+	var out []*mail.Address
 	for _, s := range addrs {
-		a, err := mail.ParseAddress(s)
-		if err != nil {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		list, err := mail.ParseAddressList(s)
+		if err != nil || len(list) == 0 {
+			if err == nil {
+				err = errors.New("no addresses")
+			}
 			return nil, fmt.Errorf("invalid address %q: %w", s, err)
 		}
-		out = append(out, a)
+		for _, a := range list {
+			if a == nil || !addressShownAsSent(a.Address) {
+				return nil, fmt.Errorf("invalid address %q: cannot be shown exactly as it would be sent", s)
+			}
+			out = append(out, a)
+		}
 	}
 	return out, nil
 }

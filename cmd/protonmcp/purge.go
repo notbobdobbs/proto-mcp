@@ -16,11 +16,11 @@ import (
 
 // runPurge hard-deletes cached message bodies older than a cutoff.
 //
-// SECURITY D13 / C-1 mitigation. The audit calls cached plaintext
-// bodies at rest the single biggest residual risk; this is the
-// explicit removal path. serve-stdio sweeps on startup using
-// store.DefaultBodyRetention; users can run a more aggressive
-// sweep manually via `protonmcp purge --older-than 7d`.
+// SECURITY D13 / C-1. The mirror file is sealed; this is still the
+// retention control for decrypted bodies inside it (and for the
+// plaintext working file while a process has the store open).
+// serve-stdio sweeps on startup using store.DefaultBodyRetention;
+// `protonmcp purge --older-than 7d` is the tighter manual sweep.
 //
 // Flags:
 //

@@ -1,24 +1,23 @@
-// protonmcp-touchid — single-prompt Touch ID helper for proto-mcp.
+// protonmcp-touchid — Touch ID + NSAlert helper for proto-mcp.
 //
 // Spec:
 //   - Read one JSON object from stdin (single line or multi-line).
-//   - Run LAContext.evaluatePolicy(.deviceOwnerAuthentication) with
-//     the body text (plus caller info, when present) as the
-//     localizedReason. The biometric IS the confirmation — no
-//     separate NSAlert step.
+//   - If confirm: true, show an NSAlert whose body is the full
+//     operation text in a scroll view. macOS puts LAContext's
+//     localizedReason in the dialog title and clips it, so a send's
+//     recipient list cannot live only there (issue #125). Cancel
+//     exits 1 and skips biometrics.
+//   - Then run LAContext.evaluatePolicy(.deviceOwnerAuthentication).
+//     When the alert already showed the body, the Touch ID reason is
+//     the short title. Otherwise the reason is the body, as before.
 //   - Exit 0 on biometric/password success, 1 on deny/cancel/
 //     auth-fail, 2 on stdin parse error.
-//
-// History: earlier versions of this helper showed an NSAlert FIRST
-// when policy had confirm:true, then the Touch ID prompt — same
-// body text shown twice with one extra click. Collapsed to a single
-// prompt; the `confirm` field on the request is now accepted for
-// backwards compat but does not gate a second dialog.
 //
 // Distribution: ad-hoc signed by swiftc on the dev machine. Phase 7
 // adds Developer ID signing + notarization + NSFaceIDUsageDescription
 // in an Info.plist when we bundle this as a .app.
 
+import AppKit
 import Foundation
 import LocalAuthentication
 
@@ -35,6 +34,37 @@ guard let req = try? JSONDecoder().decode(Request.self, from: data) else {
     exit(2)
 }
 
+// AppKit needs an NSApplication for NSAlert. Without this the alert
+// silently no-ops. .accessory keeps a one-shot prompt out of the Dock.
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+
+// confirm: true is the policy flag for "show the literal operation
+// before Touch ID" (mail_send and the other irreversible tools).
+// The body goes in a scroll view, not informativeText: informative
+// text is clipped, and a clipped BCC line is the bug #125 closed.
+if req.confirm == true {
+    var full = req.body
+    if let caller = req.caller, !caller.isEmpty {
+        if !full.isEmpty {
+            full += "\n\n"
+        }
+        full += "Requested by: \(caller)"
+    }
+
+    let alert = NSAlert()
+    alert.messageText = req.title.isEmpty ? "Approve this action?" : req.title
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Allow")
+    alert.addButton(withTitle: "Cancel")
+    alert.accessoryView = scrollableBody(full)
+
+    NSApp.activate(ignoringOtherApps: true)
+    if alert.runModal() != .alertFirstButtonReturn {
+        exit(1)
+    }
+}
+
 // D30 (Phase 7/A): use .deviceOwnerAuthentication instead of
 // .deviceOwnerAuthenticationWithBiometrics so the system falls back
 // to the user's login password when biometric hardware is missing
@@ -45,20 +75,22 @@ guard let req = try? JSONDecoder().decode(Request.self, from: data) else {
 let ctx = LAContext()
 var laError: NSError?
 guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &laError) else {
-    // Neither biometric NOR password available — extremely rare
-    // (only happens with no user account configured for the local
-    // session). Treat as deny.
     FileHandle.standardError.write(Data("authentication not available: \(laError?.localizedDescription ?? "unknown")\n".utf8))
     exit(1)
 }
 
-// Compose the reason text. macOS's Touch ID dialog renders this
-// just below the lock icon; multi-line is supported but kept short.
-// Caller info appended on a final line so the user can see which
-// process is asking.
-var reason = req.body
-if let caller = req.caller, !caller.isEmpty {
-    reason += "\n\nRequested by: \(caller)"
+// The Touch ID sheet's localizedReason is a title on macOS, not a
+// scrolling body. After the alert has shown every recipient, the
+// reason stays the short title so the sheet cannot clip the list
+// the user just approved.
+var reason: String
+if req.confirm == true {
+    reason = req.title.isEmpty ? "Approve this action" : req.title
+} else {
+    reason = req.body
+    if let caller = req.caller, !caller.isEmpty {
+        reason += "\n\nRequested by: \(caller)"
+    }
 }
 
 let sem = DispatchSemaphore(value: 0)
@@ -72,3 +104,35 @@ ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { succes
 }
 sem.wait()
 exit(ok ? 0 : 1)
+
+// scrollableBody is an NSTextView in an NSScrollView sized to the
+// text, capped so a long recipient list scrolls instead of being cut
+// off. Selectable so the user can copy an address out of the alert.
+func scrollableBody(_ text: String) -> NSScrollView {
+    let width: CGFloat = 480
+    let lines = max(1, text.components(separatedBy: "\n").count)
+    let height = min(360, max(96, CGFloat(lines) * 18 + 24))
+
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+    scroll.hasVerticalScroller = true
+    scroll.autohidesScrollers = true
+    scroll.borderType = .bezelBorder
+    scroll.drawsBackground = false
+
+    let view = NSTextView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+    view.isEditable = false
+    view.isSelectable = true
+    view.isRichText = false
+    view.font = NSFont.userFixedPitchFont(ofSize: 12)
+    view.drawsBackground = false
+    view.isVerticallyResizable = true
+    view.isHorizontallyResizable = false
+    view.textContainerInset = NSSize(width: 4, height: 4)
+    view.maxSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+    view.textContainer?.widthTracksTextView = true
+    view.textContainer?.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+    view.string = text
+
+    scroll.documentView = view
+    return scroll
+}

@@ -121,6 +121,58 @@ func TestMailSendDialog_HostileSubjectAndFilename(t *testing.T) {
 
 // Fail closed: a dialog that can't be shown in full refuses the call
 // rather than prompting with part of it.
+// Characters the dialog sanitizer drops or rewrites (zero-width, bidi
+// override, NFKC-unstable letters) must not be stripped for display
+// and then still used as the real recipient. Refuse the call instead.
+func TestMailSendDialog_HiddenAddressCharsAreRefused(t *testing.T) {
+	cases := []string{
+		"alic\u200be@example.com", // ZWSP
+		"alice@\u202eexample.com", // right-to-left override
+		"ａlice@example.com",       // fullwidth 'a', NFKC folds to ASCII
+	}
+	for _, addr := range cases {
+		args, err := json.Marshal(map[string]any{
+			"subject": "hi",
+			"to":      []string{addr},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, body, _, err := sendPromptSnapshot(Deps{}, "mail_send")(context.Background(), args)
+		if err == nil {
+			t.Errorf("address %q was approved for display:\n%s", addr, body)
+		}
+	}
+}
+
+// One array entry that holds several addresses is shown and sent as
+// each of those addresses. The dialog used to explode the list while
+// the send path rejected it, so the user could approve a recipient
+// the send would not use — or the reverse, if the parsers ever diverged.
+func TestMailSendDialog_MultiAddressEntryMatchesSend(t *testing.T) {
+	args, err := json.Marshal(map[string]any{
+		"subject": "hi",
+		"to":      []string{"alice@x.com, eve@evil.com"},
+		"bcc":     []string{"hidden@evil.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, body, _, err := sendPromptSnapshot(Deps{}, "mail_send")(context.Background(), args)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	checkDialog(t, body, "alice@x.com", "eve@evil.com", "hidden@evil.com")
+
+	parsed, err := parseAddrList([]string{"alice@x.com, eve@evil.com"})
+	if err != nil {
+		t.Fatalf("parseAddrList: %v", err)
+	}
+	if len(parsed) != 2 || parsed[0].Address != "alice@x.com" || parsed[1].Address != "eve@evil.com" {
+		t.Fatalf("parseAddrList = %#v", parsed)
+	}
+}
+
 func TestMailSendDialog_TooLongIsRefused(t *testing.T) {
 	to := make([]string, 300)
 	for i := range to {
@@ -141,7 +193,11 @@ func TestSendDraftDialog_HostileSubject(t *testing.T) {
 	d.Subject = spoofSubject
 	d.ToList = []*mail.Address{{Name: "Your Boss <boss@corp.com>", Address: "attacker@evil.com"}}
 	d.BCCList = []*mail.Address{{Address: "carol@x.com"}}
-	_, body, err := sendApprovalDialog("mail_send_draft", draftPromptBody(d))
+	raw, addrs, err := draftPromptBody(d)
+	if err != nil {
+		t.Fatalf("draftPromptBody: %v", err)
+	}
+	_, body, err := sendApprovalDialog("mail_send_draft", raw, addrs)
 	if err != nil {
 		t.Fatalf("dialog: %v", err)
 	}
@@ -164,7 +220,11 @@ func TestReplyDialog_HostileParentSubject(t *testing.T) {
 	deps := Deps{Session: &proton.Session{Addresses: []gpa.Address{{Email: "me@proton.me"}}}}
 
 	for _, all := range []bool{false, true} {
-		_, body, err := sendApprovalDialog("mail_reply", replyPromptBody(deps, parent, parent.ID, all, nil))
+		raw, addrs, err := replyPromptBody(deps, parent, parent.ID, all, nil)
+		if err != nil {
+			t.Fatalf("replyAll=%v: replyPromptBody: %v", all, err)
+		}
+		_, body, err := sendApprovalDialog("mail_reply", raw, addrs)
 		if err != nil {
 			t.Fatalf("replyAll=%v: dialog: %v", all, err)
 		}
@@ -193,7 +253,11 @@ func TestForwardDialog_ShowsParentAndItsAttachments(t *testing.T) {
 		BCC:                      []string{"hidden@evil.com"},
 		IncludeParentAttachments: true,
 	}
-	_, body, err := sendApprovalDialog("mail_forward", forwardPromptBody(Deps{}, parent, in))
+	raw, addrs, err := forwardPromptBody(Deps{}, parent, in)
+	if err != nil {
+		t.Fatalf("forwardPromptBody: %v", err)
+	}
+	_, body, err := sendApprovalDialog("mail_forward", raw, addrs)
 	if err != nil {
 		t.Fatalf("dialog: %v", err)
 	}
@@ -214,14 +278,22 @@ func TestForwardDialog_ShowsParentAndItsAttachments(t *testing.T) {
 	// Without the flag, nothing is carried over and the dialog says
 	// nothing about the parent's attachments.
 	in.IncludeParentAttachments = false
-	_, body, _ = sendApprovalDialog("mail_forward", forwardPromptBody(Deps{}, parent, in))
+	raw, addrs, err = forwardPromptBody(Deps{}, parent, in)
+	if err != nil {
+		t.Fatalf("forwardPromptBody: %v", err)
+	}
+	_, body, _ = sendApprovalDialog("mail_forward", raw, addrs)
 	if strings.Contains(body, "payroll.xlsx") {
 		t.Errorf("parent attachments shown without include_parent_attachments:\n%s", body)
 	}
 	// With the flag but a parent with no attachments, say so.
 	in.IncludeParentAttachments = true
 	parent.Attachments = nil
-	_, body, _ = sendApprovalDialog("mail_forward", forwardPromptBody(Deps{}, parent, in))
+	raw, addrs, err = forwardPromptBody(Deps{}, parent, in)
+	if err != nil {
+		t.Fatalf("forwardPromptBody: %v", err)
+	}
+	_, body, _ = sendApprovalDialog("mail_forward", raw, addrs)
 	if !strings.Contains(body, "Forwarded attachments: (none)") {
 		t.Errorf("flag set on a parent with no attachments not shown:\n%s", body)
 	}

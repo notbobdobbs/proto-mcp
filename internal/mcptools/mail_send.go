@@ -350,7 +350,11 @@ func sendPromptSnapshot(deps Deps, toolName string) func(context.Context, json.R
 	return func(_ context.Context, args json.RawMessage) (string, string, any, error) {
 		var in sendInput
 		_ = json.Unmarshal(args, &in)
-		title, body, err := sendApprovalDialog(toolName, sendPromptBody(deps, in))
+		raw, addrs, err := sendPromptBody(deps, in)
+		if err != nil {
+			return "", "", nil, err
+		}
+		title, body, err := sendApprovalDialog(toolName, raw, addrs)
 		if err != nil {
 			return "", "", nil, err
 		}
@@ -364,15 +368,29 @@ func sendPromptSnapshot(deps Deps, toolName string) func(context.Context, json.R
 // subject, and attachments are what matter at approval time. Phase
 // 8/B — also appends an attachment summary line; attachment
 // validation errors are swallowed here (the handler reports them).
-func sendPromptBody(deps Deps, in sendInput) string {
-	parts := recipientLines(promptAddrs(in.To), promptAddrs(in.CC), promptAddrs(in.BCC))
+// The returned slice is every address the send will use.
+func sendPromptBody(deps Deps, in sendInput) (string, []string, error) {
+	to, toA, err := promptAddrs(in.To)
+	if err != nil {
+		return "", nil, err
+	}
+	cc, ccA, err := promptAddrs(in.CC)
+	if err != nil {
+		return "", nil, err
+	}
+	bcc, bccA, err := promptAddrs(in.BCC)
+	if err != nil {
+		return "", nil, err
+	}
+	parts := recipientLines(to, cc, bcc)
 	parts = append(parts, "Subject: "+capField(in.Subject, promptSubjectMaxRunes))
 	if decoded, err := decodeAndValidateAttachments(deps, in.Attachments); err == nil {
 		if s := attachmentsSummary(decoded); s != "" {
 			parts = append(parts, s)
 		}
 	}
-	return strings.Join(parts, "\n")
+	addrs := append(append(append([]string{}, toA...), ccA...), bccA...)
+	return strings.Join(parts, "\n"), addrs, nil
 }
 
 // sendCompose is mail_send: create a draft, send it, return.
@@ -691,6 +709,15 @@ func finalizeSend(ctx mcp.Context, deps Deps, toolName string, addrKR *crypto.Ke
 	normalized := make([]string, 0, len(recipients))
 	for _, r := range recipients {
 		normalized = append(normalized, normalizeRecipientList(r)...)
+	}
+	// Issue #125 — the dialog is refused when an address would be
+	// rewritten for display. Policy can skip the dialog (decision:
+	// allow), so the send itself checks the same predicate and
+	// refuses rather than deliver to an address the user cannot read.
+	for _, r := range normalized {
+		if !addressShownAsSent(r) {
+			return mcp.ErrorResult("%s refused: recipient %q cannot be shown exactly as it would be sent. Nothing was sent.", toolName, r), nil
+		}
 	}
 	if deps.Policy != nil {
 		if _, pol := deps.Policy.Decide(toolName, nil, mcpCallerFromContext(ctx)); pol != nil && len(pol.AllowedRecipients) > 0 {

@@ -19,9 +19,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/pressly/goose/v3"
 	_ "modernc.org/sqlite"
+
+	"github.com/just-an-oldsalt/proto-mcp/internal/secret"
 )
 
 //go:embed migrations/*.sql
@@ -45,18 +48,47 @@ func DefaultPath() (string, error) {
 // migration. Concurrent use is safe — *sql.DB handles its own connection
 // pool — but callers should treat reads and writes as serialized at the
 // app level if they care about FTS5 trigger semantics.
+//
+// For a file path, Path is the sealed on-disk mirror (AES-256-GCM). The
+// database/sql handle talks to a plaintext working file that exists only
+// while at least one process has the store open. :memory: is unchanged.
 type Store struct {
 	DB   *sql.DB
 	Path string
+
+	// live is the plaintext working copy. Empty for :memory:.
+	live string
+	// key seals and unseals Path. Zeroed on Close.
+	key secret.Secret
+
+	sealStop  chan struct{}
+	sealDone  chan struct{}
+	sealMu    sync.Mutex
+	closeOnce sync.Once
 }
 
 // Open opens or creates the SQLite database at path, applies all
 // migrations, and returns a ready-to-use Store. Pass ":memory:" for an
 // ephemeral test database.
 //
-// The parent directory is created if missing. WAL mode and foreign-key
-// enforcement are enabled.
+// A file path is sealed with AES-256-GCM (see openSealed). The parent
+// directory is created if missing. WAL mode and foreign-key enforcement
+// are enabled on the working database.
 func Open(path string) (*Store, error) {
+	if path == ":memory:" {
+		db, err := openSQLite(path)
+		if err != nil {
+			return nil, err
+		}
+		return &Store{DB: db, Path: path}, nil
+	}
+	return openSealed(path)
+}
+
+// openSQLite opens path, applies migrations, and tightens file modes.
+// path is either ":memory:" or the plaintext working file — never the
+// sealed canonical file.
+func openSQLite(path string) (*sql.DB, error) {
 	if path != ":memory:" {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return nil, fmt.Errorf("create db dir: %w", err)
@@ -89,6 +121,7 @@ func Open(path string) (*Store, error) {
 				_ = os.Chmod(p, 0o600)
 			}
 		}
+		hideFromDump(path)
 	}
 
 	if err := migrate(db); err != nil {
@@ -96,7 +129,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
-	return &Store{DB: db, Path: path}, nil
+	return db, nil
 }
 
 // buildDSN constructs a modernc.org/sqlite DSN for the given path with
@@ -142,12 +175,16 @@ func buildDSN(path string) (string, error) {
 	return path + "?" + v.Encode(), nil
 }
 
-// Close closes the underlying database. Safe to call on a nil receiver.
+// Close checkpoints, and for a file store seals the working copy back
+// over Path and shreds it when this process is the last opener.
+// Safe to call on a nil receiver and safe to call twice.
 func (s *Store) Close() error {
-	if s == nil || s.DB == nil {
+	if s == nil {
 		return nil
 	}
-	return s.DB.Close()
+	var err error
+	s.closeOnce.Do(func() { err = s.close() })
+	return err
 }
 
 func migrate(db *sql.DB) error {

@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"fmt"
+	"net/mail"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -31,16 +32,39 @@ var fieldLineBreaks = strings.NewReplacer(
 	"\u0085", " ", "\u2028", " ", "\u2029", " ",
 )
 
-// joinAddrs sanitizes each address (PROTO-126) then comma-joins for
-// display in an approval prompt. Addresses are never shortened: a
-// cut-off address would misrepresent where the mail goes, so a list
-// too long to show is refused by sendApprovalDialog instead.
-func joinAddrs(addrs []string) string {
+// addressShownAsSent reports whether addr will survive the approval
+// dialog byte-for-byte. SanitizePromptTextStrict NFKC-normalizes the
+// whole dialog and drops bidi, zero-width, and line-separator
+// characters. Stripping those only on the way to the screen — while
+// the send path kept the original — showed the user one mailbox and
+// delivered to another (issue #125). A recipient that is not invariant
+// under that sanitizer is refused. Whitespace and commas are refused
+// too: they would either break a dialog line or split one address
+// into two when the line is joined with ", ".
+func addressShownAsSent(addr string) bool {
+	if addr == "" || strings.ContainsAny(addr, " \t\r\n,;") {
+		return false
+	}
+	if sanitizeField(addr) != addr {
+		return false
+	}
+	shown, err := mcp.SanitizePromptTextStrict(addr, promptBodyMaxRunes)
+	return err == nil && shown == addr
+}
+
+// joinAddrs checks each address (issue #125) then comma-joins it for
+// display. Addresses are never shortened or rewritten: a cut-off or
+// normalized address would misrepresent where the mail goes. A list
+// too long to show is refused by sendApprovalDialog.
+func joinAddrs(addrs []string) (string, error) {
 	out := make([]string, 0, len(addrs))
 	for _, a := range addrs {
-		out = append(out, sanitizeField(a))
+		if !addressShownAsSent(a) {
+			return "", fmt.Errorf("recipient %q cannot be shown exactly as it would be sent", a)
+		}
+		out = append(out, a)
 	}
-	return strings.Join(out, ", ")
+	return strings.Join(out, ", "), nil
 }
 
 // --- Issue #125: approval dialogs that can't misrepresent a send ---
@@ -80,18 +104,6 @@ func capField(s string, max int) string {
 	return string([]rune(s)[:max-3]) + "..."
 }
 
-// promptAddrs renders raw recipient arguments (as the LLM passed them)
-// as bare addresses, splitting any entry that holds several. An entry
-// that doesn't parse is shown as given, since the send would fail on
-// it anyway. An empty list renders as "(none)".
-func promptAddrs(entries []string) string {
-	var addrs []string
-	for _, e := range entries {
-		addrs = append(addrs, normalizeRecipientList(e)...)
-	}
-	return orNone(joinAddrs(addrs))
-}
-
 func orNone(s string) string {
 	if s == "" {
 		return "(none)"
@@ -99,16 +111,79 @@ func orNone(s string) string {
 	return s
 }
 
+// promptAddrs renders raw recipient arguments (as the LLM passed them)
+// as bare addresses, splitting any entry that holds several. The
+// returned slice is the exact addresses the send will use; the string
+// is their dialog line. An entry that doesn't parse, or an address
+// the dialog would rewrite, is an error — the call is refused.
+func promptAddrs(entries []string) (line string, addrs []string, err error) {
+	for _, e := range entries {
+		if strings.TrimSpace(e) == "" {
+			continue
+		}
+		list, perr := mail.ParseAddressList(e)
+		if perr != nil || len(list) == 0 {
+			return "", nil, fmt.Errorf("invalid recipient %q", e)
+		}
+		for _, a := range list {
+			if a == nil || a.Address == "" {
+				return "", nil, fmt.Errorf("invalid recipient %q", e)
+			}
+			addrs = append(addrs, a.Address)
+		}
+	}
+	line, err = joinAddrs(addrs)
+	if err != nil {
+		return "", nil, err
+	}
+	return orNone(line), addrs, nil
+}
+
 // sendApprovalDialog is the one exit for every send-family dialog. It
 // sanitizes the body without truncating it, and fails closed with an
 // error (so PromptSnapshot denies the call) when the body is too long
-// to show in full.
-func sendApprovalDialog(toolName, body string) (title, sanitized string, err error) {
+// to show in full or a recipient would not appear in it exactly.
+// addrs is every bare address the send will use.
+func sendApprovalDialog(toolName, body string, addrs []string) (title, sanitized string, err error) {
 	sanitized, err = mcp.SanitizePromptTextStrict(body, promptBodyMaxRunes)
 	if err != nil {
 		return "", "", fmt.Errorf("%w; nothing was sent. Send to fewer recipients or attachments per call", err)
 	}
+	if err := dialogShowsAddresses(sanitized, addrs); err != nil {
+		return "", "", err
+	}
 	return mcp.SanitizePromptText("Approve "+toolName+"?", 120), sanitized, nil
+}
+
+// dialogShowsAddresses checks that each address survived sanitization
+// as its own comma-separated token on a To, CC, or BCC line.
+func dialogShowsAddresses(body string, addrs []string) error {
+	got := map[string]struct{}{}
+	for _, line := range strings.Split(body, "\n") {
+		var rest string
+		switch {
+		case strings.HasPrefix(line, "To: "):
+			rest = strings.TrimPrefix(line, "To: ")
+		case strings.HasPrefix(line, "CC: "):
+			rest = strings.TrimPrefix(line, "CC: ")
+		case strings.HasPrefix(line, "BCC: "):
+			rest = strings.TrimPrefix(line, "BCC: ")
+		default:
+			continue
+		}
+		if rest == "" || rest == "(none)" {
+			continue
+		}
+		for _, a := range strings.Split(rest, ", ") {
+			got[a] = struct{}{}
+		}
+	}
+	for _, a := range addrs {
+		if _, ok := got[a]; !ok {
+			return fmt.Errorf("approval dialog would not show recipient %q exactly; nothing was sent", a)
+		}
+	}
+	return nil
 }
 
 // Phase 7/A — D36. Helpers that translate opaque IDs (message_id,

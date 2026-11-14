@@ -293,11 +293,10 @@ func (s *Store) InvalidateBodyCache(ctx context.Context, messageID string) error
 // on every row whose body_cached_at < cutoff. Returns the number of
 // rows updated.
 //
-// SECURITY D13 / C-1 mitigation. The audit's biggest residual risk
-// — three cycles open — is that decrypted message bodies live on
-// disk in cleartext until something explicitly removes them. This
-// is the explicit-removal helper: serve-stdio calls it at startup,
-// `protonmcp purge` calls it on demand.
+// SECURITY D13 / C-1. Decrypted bodies stay in the mirror until this
+// removes them. The canonical file is sealed; the working file is
+// plaintext while a process has the store open. serve-stdio calls
+// this at startup, `protonmcp purge` on demand.
 //
 // The FTS update trigger fires on every UPDATE, so messages_fts
 // re-indexes with the now-NULL body_text on the same statement.
@@ -347,9 +346,9 @@ const (
 // `protonmcp purge --dry-run` and by the serve-stdio startup
 // log so the user has a sense of what got cleaned.
 type PurgeStats struct {
-	TotalCached   int64
-	WouldPurge    int64
-	OldestCached  *time.Time
+	TotalCached  int64
+	WouldPurge   int64
+	OldestCached *time.Time
 }
 
 // CountCachedBodies returns purge planning info: total rows with
@@ -388,9 +387,10 @@ SELECT MIN(body_cached_at) FROM messages WHERE body_cached_at IS NOT NULL
 // LLM's working set survives a typical idle period, short enough
 // that a stolen laptop's exposure is bounded.
 //
-// SECURITY D13 / C-1: this is the only at-rest mitigation pending
-// SQLCipher / envelope encryption (Phase 6+). Tighten by overriding
-// via `protonmcp purge --older-than 7d`.
+// The sealed mirror (see openSealed) is the at-rest control. Retention
+// still bounds how long decrypted bodies stay in that mirror and in
+// the plaintext working file while a process has the store open.
+// Tighten with `protonmcp purge --older-than 7d`.
 const DefaultBodyRetention = 30 * 24 * time.Hour
 
 // BodyTTL is how long a cached body counts as fresh. After this, the

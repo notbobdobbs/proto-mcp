@@ -270,9 +270,10 @@ a note so we know the Phase 7/E re-enable shipped.
 ```
 
 **Expected.** Progress lines as pages drain. Final summary like
-`drained 14738 messages, 27 labels, 6 folders in 42s`. The SQLite
-store at `~/Library/Application Support/protonmcp/store.db` is now
-populated.
+`drained 14738 messages, 27 labels, 6 folders in 42s`. The mirror at
+`~/Library/Application Support/protonmcp/store.db` is populated and,
+once backfill exits, sealed. While it runs the working file is
+`store.db.live`.
 
 ### 3.4 — Daemon install
 
@@ -677,10 +678,21 @@ ships deny for permanent delete to prevent LLM-driven data loss.
 
 ## Section 7 — Audit log + observability (5 minutes)
 
+`store.db` is an AES-256-GCM sealed mirror. `sqlite3` opens the
+plaintext working file, and only while the daemon or a CLI command
+has the mirror open:
+
+```sh
+sqlite3 ~/Library/Application\ Support/protonmcp/store.db.live
+```
+
+After the last process exits, that file is shredded. The JSONL audit
+log (`audit.log`) is unchanged and does not need the working file.
+
 ### 7.1 — Audit log has rows for recent tool calls
 
 ```sh
-sqlite3 ~/Library/Application\ Support/protonmcp/store.db \
+sqlite3 ~/Library/Application\ Support/protonmcp/store.db.live \
   'SELECT tool, outcome, policy_decision, duration_ms FROM audit_log ORDER BY id DESC LIMIT 10;'
 ```
 
@@ -703,7 +715,7 @@ redacted call arguments.
 Send a draft with a memorable body. Then:
 
 ```sh
-sqlite3 ~/Library/Application\ Support/protonmcp/store.db \
+sqlite3 ~/Library/Application\ Support/protonmcp/store.db.live \
   "SELECT args_json FROM audit_log WHERE tool='mail_draft_create' ORDER BY id DESC LIMIT 1;"
 ```
 
@@ -747,12 +759,12 @@ might touch the relevant surface.
 
 | Defect | Surface | Quick check |
 |---|---|---|
-| **D1/D2** | `primaryFolder` | `sqlite3 store.db "SELECT DISTINCT folder FROM messages WHERE folder IS NOT NULL AND folder != ''"` — no `all` value should appear |
+| **D1/D2** | `primaryFolder` | `sqlite3 store.db.live "SELECT DISTINCT folder FROM messages WHERE folder IS NOT NULL AND folder != ''"` while the mirror is open — no `all` value should appear |
 | **D4** | Touch ID helper substitution | `unset PROTONMCP_TOUCHID; protonmcp daemon restart` — daemon should not silently use a different helper |
 | **D5** | Debug stderr token leak | `PROTONMCP_DEBUG=1 ./bin/protonmcpd` — refuses to start with "SECURITY D5" message |
 | **D7** | Recipient allowlist bypass | Set `allowed_recipients: ["alice@allowed.com"]`; try sending to `"Bob <bob@evil.com>, alice@allowed.com"` — must be denied |
 | **D8** | Audit ctx cancellation | Send SIGTERM mid-tool-call; audit row must still be Complete (no NULL outcome) |
-| **D11** | raw_json valid after truncation | `sqlite3 store.db "SELECT raw_json FROM messages WHERE LENGTH(raw_json) > 0 LIMIT 1" | jq .` — must parse |
+| **D11** | raw_json valid after truncation | `sqlite3 store.db.live "SELECT raw_json FROM messages WHERE LENGTH(raw_json) > 0 LIMIT 1" | jq .` while the mirror is open — must parse |
 | **D24** | Binary integrity | See section 3.6 + 3.7 |
 | **D26** | Audit args_json []byte bind | Smoke: any tool call writes a row without errors |
 | **D28** | Search LIMIT binding | `protonmcp search --limit 5 hello` — returns 5 results, no SQL errors |
