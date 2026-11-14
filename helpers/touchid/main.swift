@@ -57,7 +57,8 @@ if req.confirm == true {
     alert.alertStyle = .warning
     alert.addButton(withTitle: "Allow")
     alert.addButton(withTitle: "Cancel")
-    alert.accessoryView = scrollableBody(full)
+    let allowButton = alert.buttons[0]
+    alert.accessoryView = scrollableBody(full, allow: allowButton)
 
     NSApp.activate(ignoringOtherApps: true)
     if alert.runModal() != .alertFirstButtonReturn {
@@ -105,21 +106,14 @@ ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { succes
 sem.wait()
 exit(ok ? 0 : 1)
 
-// scrollableBody is an NSTextView in an NSScrollView sized to the
-// text, capped so a long recipient list scrolls instead of being cut
-// off. Selectable so the user can copy an address out of the alert.
-func scrollableBody(_ text: String) -> NSScrollView {
+// scrollableBody lays the approval text out at its real height and
+// shows as much of that as fits. A list that is taller than the
+// viewport starts with Allow disabled; scrolling to the end enables
+// it, so a Bcc past the first screen cannot be approved unseen.
+// The Go side labels each list "To (n)", "Cc (n)", and "Bcc (n)".
+func scrollableBody(_ text: String, allow: NSButton) -> NSScrollView {
     let width: CGFloat = 480
-    let lines = max(1, text.components(separatedBy: "\n").count)
-    let height = min(360, max(96, CGFloat(lines) * 18 + 24))
-
-    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: height))
-    scroll.hasVerticalScroller = true
-    scroll.autohidesScrollers = true
-    scroll.borderType = .bezelBorder
-    scroll.drawsBackground = false
-
-    let view = NSTextView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+    let view = NSTextView(frame: NSRect(x: 0, y: 0, width: width - 16, height: 10))
     view.isEditable = false
     view.isSelectable = true
     view.isRichText = false
@@ -127,12 +121,41 @@ func scrollableBody(_ text: String) -> NSScrollView {
     view.drawsBackground = false
     view.isVerticallyResizable = true
     view.isHorizontallyResizable = false
-    view.textContainerInset = NSSize(width: 4, height: 4)
-    view.maxSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+    view.textContainerInset = NSSize(width: 4, height: 6)
+    view.minSize = NSSize(width: 0, height: 0)
+    view.maxSize = NSSize(width: width - 16, height: CGFloat.greatestFiniteMagnitude)
     view.textContainer?.widthTracksTextView = true
-    view.textContainer?.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+    view.textContainer?.containerSize = NSSize(width: width - 16, height: CGFloat.greatestFiniteMagnitude)
     view.string = text
+    view.layoutManager?.ensureLayout(for: view.textContainer!)
+    let used = view.layoutManager?.usedRect(for: view.textContainer!) ?? .zero
+    let contentH = max(used.height + view.textContainerInset.height * 2 + 8, 48)
+    view.frame = NSRect(x: 0, y: 0, width: width - 16, height: contentH)
 
+    // Cap the viewport well above a single line. 96pt hid every
+    // recipient after the first wrapped To line, including Bcc.
+    let maxH: CGFloat = 440
+    let viewH = min(maxH, contentH)
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: viewH))
+    scroll.hasVerticalScroller = true
+    scroll.autohidesScrollers = contentH <= viewH + 1
+    scroll.borderType = .bezelBorder
+    scroll.drawsBackground = false
     scroll.documentView = view
+
+    if contentH > viewH + 1 {
+        allow.isEnabled = false
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scroll.contentView,
+            queue: .main
+        ) { _ in
+            let visible = scroll.contentView.bounds
+            if visible.maxY >= view.bounds.maxY - 8 {
+                allow.isEnabled = true
+            }
+        }
+    }
     return scroll
 }

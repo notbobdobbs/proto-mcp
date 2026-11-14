@@ -48,7 +48,7 @@ func checkDialog(t *testing.T, body string, want ...string) {
 	lines := strings.Split(body, "\n")
 	idx := map[string]int{}
 	for i, l := range lines {
-		for _, p := range []string{"To:", "CC:", "BCC:", "Subject:"} {
+		for _, p := range []string{"To (", "Cc (", "Bcc (", "Subject:"} {
 			if strings.HasPrefix(l, p) {
 				if _, dup := idx[p]; dup {
 					t.Errorf("more than one %q line:\n%s", p, body)
@@ -61,7 +61,7 @@ func checkDialog(t *testing.T, body string, want ...string) {
 	if !ok {
 		t.Fatalf("no Subject line:\n%s", body)
 	}
-	for _, p := range []string{"To:", "CC:", "BCC:"} {
+	for _, p := range []string{"To (", "Cc (", "Bcc ("} {
 		i, ok := idx[p]
 		if !ok {
 			t.Errorf("no %q line:\n%s", p, body)
@@ -89,7 +89,7 @@ func TestMailSendDialog_LongDisplayNameCantHideBCC(t *testing.T) {
 		t.Errorf("mail_send snapshot = %v, want nil", snap)
 	}
 	checkDialog(t, body, "alice@x.com", "bob@x.com", "carol@x.com", "dave@x.com", "hidden@evil.com")
-	if !strings.Contains(body, "\nBCC: hidden@evil.com") {
+	if !strings.Contains(body, "\nBcc (1): hidden@evil.com") {
 		t.Errorf("BCC line wrong:\n%s", body)
 	}
 	// Display names are not shown: they're free text and can claim to
@@ -114,7 +114,7 @@ func TestMailSendDialog_HostileSubjectAndFilename(t *testing.T) {
 		t.Fatalf("snapshot: %v", err)
 	}
 	checkDialog(t, body, "alice@x.com", "hidden@evil.com")
-	if !strings.Contains(body, "Attachments: a.txt") {
+	if !strings.Contains(body, "Attachments (1): a.txt") {
 		t.Errorf("attachment summary missing:\n%s", body)
 	}
 }
@@ -205,7 +205,7 @@ func TestSendDraftDialog_HostileSubject(t *testing.T) {
 	if strings.Contains(body, "boss@corp.com") {
 		t.Errorf("dialog shows a display name:\n%s", body)
 	}
-	if !strings.Contains(body, "To: attacker@evil.com\n") {
+	if !strings.Contains(body, "To (1): attacker@evil.com\n") {
 		t.Errorf("To line wrong:\n%s", body)
 	}
 }
@@ -228,9 +228,9 @@ func TestReplyDialog_HostileParentSubject(t *testing.T) {
 		if err != nil {
 			t.Fatalf("replyAll=%v: dialog: %v", all, err)
 		}
-		want := []string{"To: attacker@evil.com"}
+		want := []string{"To (1): attacker@evil.com"}
 		if all {
-			want = append(want, "CC: team@x.com, cc@x.com")
+			want = append(want, "Cc (2): team@x.com, cc@x.com")
 		}
 		checkDialog(t, body, want...)
 		if strings.Contains(body, "friend@good.com") {

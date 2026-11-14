@@ -42,14 +42,8 @@ var fieldLineBreaks = strings.NewReplacer(
 // too: they would either break a dialog line or split one address
 // into two when the line is joined with ", ".
 func addressShownAsSent(addr string) bool {
-	if addr == "" || strings.ContainsAny(addr, " \t\r\n,;") {
-		return false
-	}
-	if sanitizeField(addr) != addr {
-		return false
-	}
-	shown, err := mcp.SanitizePromptTextStrict(addr, promptBodyMaxRunes)
-	return err == nil && shown == addr
+	canon, err := canonicalAddress(addr)
+	return err == nil && canon == addr
 }
 
 // joinAddrs checks each address (issue #125) then comma-joins it for
@@ -129,7 +123,14 @@ func promptAddrs(entries []string) (line string, addrs []string, err error) {
 			if a == nil || a.Address == "" {
 				return "", nil, fmt.Errorf("invalid recipient %q", e)
 			}
-			addrs = append(addrs, a.Address)
+			if err := rejectHiddenText("display name", a.Name); err != nil {
+				return "", nil, fmt.Errorf("recipient %q: %w", e, err)
+			}
+			canon, err := canonicalAddress(a.Address)
+			if err != nil {
+				return "", nil, err
+			}
+			addrs = append(addrs, canon)
 		}
 	}
 	line, err = joinAddrs(addrs)
@@ -162,12 +163,12 @@ func dialogShowsAddresses(body string, addrs []string) error {
 	for _, line := range strings.Split(body, "\n") {
 		var rest string
 		switch {
-		case strings.HasPrefix(line, "To: "):
-			rest = strings.TrimPrefix(line, "To: ")
-		case strings.HasPrefix(line, "CC: "):
-			rest = strings.TrimPrefix(line, "CC: ")
-		case strings.HasPrefix(line, "BCC: "):
-			rest = strings.TrimPrefix(line, "BCC: ")
+		case strings.HasPrefix(line, "To ("):
+			rest = afterRecipientCount(line)
+		case strings.HasPrefix(line, "Cc ("):
+			rest = afterRecipientCount(line)
+		case strings.HasPrefix(line, "Bcc ("):
+			rest = afterRecipientCount(line)
 		default:
 			continue
 		}
@@ -184,6 +185,15 @@ func dialogShowsAddresses(body string, addrs []string) error {
 		}
 	}
 	return nil
+}
+
+// afterRecipientCount returns the addresses after "To (3): ".
+func afterRecipientCount(line string) string {
+	i := strings.Index(line, "): ")
+	if i < 0 {
+		return ""
+	}
+	return line[i+3:]
 }
 
 // Phase 7/A — D36. Helpers that translate opaque IDs (message_id,

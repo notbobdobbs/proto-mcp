@@ -121,7 +121,7 @@ func openSQLite(path string) (*sql.DB, error) {
 				_ = os.Chmod(p, 0o600)
 			}
 		}
-		hideFromDump(path)
+		hideWorkingFiles(path)
 	}
 
 	if err := migrate(db); err != nil {

@@ -121,6 +121,14 @@ func draftPromptSnapshot(deps Deps) func(context.Context, json.RawMessage) (stri
 // as bare addresses (issue #125). The returned slice is those
 // addresses, in To/CC/BCC order, for the post-sanitize exact-match check.
 func draftPromptBody(d gpa.Message) (string, []string, error) {
+	if err := rejectHiddenText("subject", d.Subject); err != nil {
+		return "", nil, err
+	}
+	for _, a := range d.Attachments {
+		if err := rejectHiddenText("attachment name", a.Name); err != nil {
+			return "", nil, err
+		}
+	}
 	to, cc, bcc := addressStrings(d.ToList), addressStrings(d.CCList), addressStrings(d.BCCList)
 	tj, err := joinAddrs(to)
 	if err != nil {
@@ -148,7 +156,18 @@ func draftPromptBody(d gpa.Message) (string, []string, error) {
 // already-joined bare-address lists. All three always appear, "(none)"
 // when empty, so the user can see there is no BCC.
 func recipientLines(to, cc, bcc string) []string {
-	return []string{"To: " + orNone(to), "CC: " + orNone(cc), "BCC: " + orNone(bcc)}
+	return []string{
+		fmt.Sprintf("To (%d): %s", addrCount(to), orNone(to)),
+		fmt.Sprintf("Cc (%d): %s", addrCount(cc), orNone(cc)),
+		fmt.Sprintf("Bcc (%d): %s", addrCount(bcc), orNone(bcc)),
+	}
+}
+
+func addrCount(joined string) int {
+	if joined == "" {
+		return 0
+	}
+	return strings.Count(joined, ", ") + 1
 }
 
 // messageAttachmentsList renders every attachment already on a server
@@ -252,6 +271,9 @@ func replyPromptBody(deps Deps, parent gpa.Message, parentID string, replyAll bo
 	if replyAll {
 		verb = "Reply-all to"
 	}
+	if err := rejectHiddenText("subject", parent.Subject); err != nil {
+		return "", nil, err
+	}
 	to, cc := replyRecipients(deps, parent, replyAll)
 	tj, err := joinAddrs(to)
 	if err != nil {
@@ -264,10 +286,12 @@ func replyPromptBody(deps Deps, parent gpa.Message, parentID string, replyAll bo
 	parts := []string{verb + " message " + capField(parentID, promptNameMaxRunes)}
 	parts = append(parts, recipientLines(orNone(tj), orNone(cj), "(none)")...)
 	parts = append(parts, "Subject: "+capField(replySubject(parent.Subject), promptSubjectMaxRunes))
-	if decoded, err := decodeAndValidateAttachments(deps, attachments); err == nil {
-		if s := attachmentsSummary(decoded); s != "" {
-			parts = append(parts, s)
-		}
+	decoded, err := decodeAndValidateAttachments(deps, attachments)
+	if err != nil {
+		return "", nil, err
+	}
+	if s := attachmentsSummary(decoded); s != "" {
+		parts = append(parts, s)
 	}
 	return strings.Join(parts, "\n"), append(append([]string{}, to...), cc...), nil
 }
@@ -316,13 +340,23 @@ func forwardPromptBody(deps Deps, parent gpa.Message, in forwardInput) (string, 
 	if err != nil {
 		return "", nil, err
 	}
+	if err := rejectHiddenText("subject", parent.Subject); err != nil {
+		return "", nil, err
+	}
+	for _, a := range parent.Attachments {
+		if err := rejectHiddenText("attachment name", a.Name); err != nil {
+			return "", nil, err
+		}
+	}
 	parts := []string{"Forward message " + capField(in.ForwardOf, promptNameMaxRunes)}
 	parts = append(parts, recipientLines(to, cc, bcc)...)
 	parts = append(parts, "Subject: "+capField(forwardSubject(parent.Subject), promptSubjectMaxRunes))
-	if decoded, err := decodeAndValidateAttachments(deps, in.Attachments); err == nil {
-		if s := attachmentsSummary(decoded); s != "" {
-			parts = append(parts, s)
-		}
+	decoded, err := decodeAndValidateAttachments(deps, in.Attachments)
+	if err != nil {
+		return "", nil, err
+	}
+	if s := attachmentsSummary(decoded); s != "" {
+		parts = append(parts, s)
 	}
 	if in.IncludeParentAttachments {
 		parts = append(parts, "Forwarded attachments: "+orNone(messageAttachmentsList(parent.Attachments)))

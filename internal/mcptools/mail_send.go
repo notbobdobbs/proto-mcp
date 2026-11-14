@@ -382,12 +382,17 @@ func sendPromptBody(deps Deps, in sendInput) (string, []string, error) {
 	if err != nil {
 		return "", nil, err
 	}
+	if err := rejectHiddenText("subject", in.Subject); err != nil {
+		return "", nil, err
+	}
 	parts := recipientLines(to, cc, bcc)
 	parts = append(parts, "Subject: "+capField(in.Subject, promptSubjectMaxRunes))
-	if decoded, err := decodeAndValidateAttachments(deps, in.Attachments); err == nil {
-		if s := attachmentsSummary(decoded); s != "" {
-			parts = append(parts, s)
-		}
+	decoded, err := decodeAndValidateAttachments(deps, in.Attachments)
+	if err != nil {
+		return "", nil, err
+	}
+	if s := attachmentsSummary(decoded); s != "" {
+		parts = append(parts, s)
 	}
 	addrs := append(append(append([]string{}, toA...), ccA...), bccA...)
 	return strings.Join(parts, "\n"), addrs, nil
@@ -441,6 +446,14 @@ func sendDraftByID(ctx mcp.Context, deps Deps, toolName, draftID string) (*mcp.T
 	draft, err := deps.Session.Client.GetMessage(ctx.Std, draftID)
 	if err != nil {
 		return mcp.ErrorResult("%s: fetch draft: %v", toolName, err), nil
+	}
+	if err := rejectHiddenText("subject", draft.Subject); err != nil {
+		return mcp.ErrorResult("%s refused: %v", toolName, err), nil
+	}
+	for _, a := range draft.Attachments {
+		if err := rejectHiddenText("attachment name", a.Name); err != nil {
+			return mcp.ErrorResult("%s refused: %v", toolName, err), nil
+		}
 	}
 	if approved, ok := ctx.Snapshot.(gpa.Message); ok {
 		if what := draftChange(approved, draft); what != "" {

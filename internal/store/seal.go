@@ -9,31 +9,47 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
-// On-disk mirror format (version 1).
+// On-disk mirror format (version 2).
 //
-//	[8]  magic "PMCPENC1"
-//	u32  version = 1
-//	u32  chunk size (plaintext bytes per chunk)
+//	[8]  magic "PMCPENC2"
+//	u32  version = 2
+//	u32  chunk size
 //	u64  plaintext size
+//	[12] header nonce
+//	[16] snapshot id (GCM plaintext; random per seal)
+//	[16] header tag over that id, bound to the prefix
 //	repeated chunk:
 //	  [12] random nonce
 //	  [16] GCM tag
 //	  [n]  ciphertext
 //
-// Each chunk's AAD is the header plus the chunk index and plaintext
-// length, so a reordered, truncated, or header-tampered file fails
-// authentication. The nonce is random per chunk write; chunks are
-// rewritten as a whole, so a rewrite does not reuse a nonce.
+// The header tag authenticates the size and the snapshot id, including
+// when the plaintext is empty. A short or zeroed header therefore fails
+// closed and is never renamed over an existing mirror. Each chunk's
+// AAD is the snapshot id, the chunk index, and the chunk's plaintext
+// length, so a chunk from another snapshot cannot be spliced in even
+// when the two plaintexts have the same size.
 
 const (
-	sealMagic     = "PMCPENC1"
-	sealVersion   = uint32(1)
-	sealChunkSize = 64 * 1024
-	sealHeaderLen = 8 + 4 + 4 + 8
+	sealMagic       = "PMCPENC2"
+	sealVersion     = uint32(2)
+	sealChunkSize   = 64 * 1024
+	sealPrefixLen   = 8 + 4 + 4 + 8 // magic, version, chunk size, plain size
+	sealSnapshotLen = 16
+	sealNonceLen    = 12
+	sealTagLen      = 16
+	sealHeaderLen   = sealPrefixLen + sealSnapshotLen + sealNonceLen + sealTagLen
 )
+
+type sealHeader struct {
+	prefix     []byte
+	snapshotID [sealSnapshotLen]byte
+	plainSize  uint64
+}
 
 func newAEAD(key []byte) (cipher.AEAD, error) {
 	if len(key) != 32 {
@@ -46,26 +62,61 @@ func newAEAD(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-func chunkAAD(header []byte, index uint64, plainLen int) []byte {
-	aad := make([]byte, len(header)+8+4)
-	copy(aad, header)
-	binary.LittleEndian.PutUint64(aad[len(header):], index)
-	binary.LittleEndian.PutUint32(aad[len(header)+8:], uint32(plainLen))
+func chunkAAD(snapshotID []byte, index uint64, plainLen int) []byte {
+	aad := make([]byte, len(snapshotID)+8+4)
+	copy(aad, snapshotID)
+	binary.LittleEndian.PutUint64(aad[len(snapshotID):], index)
+	binary.LittleEndian.PutUint32(aad[len(snapshotID)+8:], uint32(plainLen))
 	return aad
 }
 
-func encodeHeader(plainSize int64) []byte {
-	h := make([]byte, sealHeaderLen)
-	copy(h, sealMagic)
-	binary.LittleEndian.PutUint32(h[8:], sealVersion)
-	binary.LittleEndian.PutUint32(h[12:], sealChunkSize)
-	binary.LittleEndian.PutUint64(h[16:], uint64(plainSize))
-	return h
+// exclusiveTemp creates a new file in dir (which must be mode 0700)
+// with O_EXCL|O_NOFOLLOW. It never truncates an existing path.
+func exclusiveTemp(dir, prefix string) (*os.File, string, error) {
+	if err := ensureOwnerOnlyDir(dir); err != nil {
+		return nil, "", err
+	}
+	for range 100 {
+		var rnd [8]byte
+		if _, err := rand.Read(rnd[:]); err != nil {
+			return nil, "", err
+		}
+		name := filepath.Join(dir, fmt.Sprintf(".%s.%d.%x", prefix, os.Getpid(), rnd))
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("store: create temp in %s: %w", dir, err)
+		}
+		return f, name, nil
+	}
+	return nil, "", errors.New("store: could not create an exclusive temp file")
 }
 
-// sealFileAtomic encrypts src and replaces dst. dst is never left as a
-// partial ciphertext: the bytes land in dst+".tmp" and are renamed
-// over dst only after fsync.
+func ensureOwnerOnlyDir(dir string) error {
+	if dir == "" || dir == "." {
+		return errors.New("store: refusing to seal into the current directory")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("store: create %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("store: chmod %s: %w", dir, err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		return fmt.Errorf("store: %s must be a directory with mode 0700", dir)
+	}
+	return nil
+}
+
+// sealFileAtomic encrypts src and replaces dst only after the whole
+// ciphertext is fsynced. A failure leaves dst untouched. The temp file
+// is created with O_EXCL|O_NOFOLLOW in a 0700 directory.
 func sealFileAtomic(dst, src string, key []byte) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -80,10 +131,9 @@ func sealFileAtomic(dst, src string, key []byte) error {
 		return fmt.Errorf("store: %s is not a regular file", src)
 	}
 
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	out, tmp, err := exclusiveTemp(filepath.Dir(dst), "seal")
 	if err != nil {
-		return fmt.Errorf("store: create %s: %w", tmp, err)
+		return err
 	}
 	ok := false
 	defer func() {
@@ -97,13 +147,13 @@ func sealFileAtomic(dst, src string, key []byte) error {
 		return err
 	}
 	if err := out.Sync(); err != nil {
-		return fmt.Errorf("store: sync %s: %w", tmp, err)
+		return fmt.Errorf("store: sync sealed temp: %w", err)
 	}
 	if err := out.Close(); err != nil {
-		return fmt.Errorf("store: close %s: %w", tmp, err)
+		return fmt.Errorf("store: close sealed temp: %w", err)
 	}
 	if err := os.Chmod(tmp, 0o600); err != nil {
-		return fmt.Errorf("store: chmod %s: %w", tmp, err)
+		return err
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		return fmt.Errorf("store: rename sealed mirror: %w", err)
@@ -120,9 +170,34 @@ func sealStream(out io.Writer, in io.Reader, key []byte, plainSize int64) error 
 	if plainSize < 0 {
 		return fmt.Errorf("store: negative plaintext size %d", plainSize)
 	}
-	header := encodeHeader(plainSize)
-	if _, err := out.Write(header); err != nil {
+	var snapshotID [sealSnapshotLen]byte
+	if _, err := rand.Read(snapshotID[:]); err != nil {
+		return fmt.Errorf("store: snapshot id: %w", err)
+	}
+	prefix := make([]byte, sealPrefixLen)
+	copy(prefix, sealMagic)
+	binary.LittleEndian.PutUint32(prefix[8:], sealVersion)
+	binary.LittleEndian.PutUint32(prefix[12:], sealChunkSize)
+	binary.LittleEndian.PutUint64(prefix[16:], uint64(plainSize))
+
+	var nonce [sealNonceLen]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("store: header nonce: %w", err)
+	}
+	// Authenticate the prefix and the snapshot id. Empty plaintext
+	// still has this tag, so a zeroed header does not verify.
+	mac := aead.Seal(nil, nonce[:], snapshotID[:], prefix)
+	if len(mac) != sealSnapshotLen+sealTagLen {
+		return fmt.Errorf("store: unexpected header tag length %d", len(mac))
+	}
+	if _, err := out.Write(prefix); err != nil {
 		return fmt.Errorf("store: write seal header: %w", err)
+	}
+	if _, err := out.Write(nonce[:]); err != nil {
+		return err
+	}
+	if _, err := out.Write(mac); err != nil {
+		return err
 	}
 
 	buf := make([]byte, sealChunkSize)
@@ -137,19 +212,18 @@ func sealStream(out io.Writer, in io.Reader, key []byte, plainSize int64) error 
 		if err != nil {
 			return fmt.Errorf("store: read plaintext: %w", err)
 		}
-		var nonce [12]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
+		var cnonce [sealNonceLen]byte
+		if _, err := rand.Read(cnonce[:]); err != nil {
 			return fmt.Errorf("store: nonce: %w", err)
 		}
-		sealed := aead.Seal(nil, nonce[:], buf[:n], chunkAAD(header, index, n))
+		sealed := aead.Seal(nil, cnonce[:], buf[:n], chunkAAD(snapshotID[:], index, n))
 		if len(sealed) != n+aead.Overhead() {
 			return fmt.Errorf("store: unexpected ciphertext length %d", len(sealed))
 		}
-		tag := sealed[n:]
-		if _, err := out.Write(nonce[:]); err != nil {
+		if _, err := out.Write(cnonce[:]); err != nil {
 			return err
 		}
-		if _, err := out.Write(tag); err != nil {
+		if _, err := out.Write(sealed[n:]); err != nil {
 			return err
 		}
 		if _, err := out.Write(sealed[:n]); err != nil {
@@ -157,12 +231,14 @@ func sealStream(out io.Writer, in io.Reader, key []byte, plainSize int64) error 
 		}
 		done += int64(n)
 		index++
+		clear(buf[:n])
 	}
 	return nil
 }
 
-// unsealFile decrypts src and replaces dst with the plaintext. On
-// authentication failure dst is left untouched.
+// unsealFile decrypts src onto dst. The header is authenticated before
+// any output file is created. On failure dst is left untouched and src
+// is not removed.
 func unsealFile(dst, src string, key []byte) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -173,11 +249,14 @@ func unsealFile(dst, src string, key []byte) error {
 	if err != nil {
 		return err
 	}
-
-	tmp := dst + ".partial"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	hdr, err := readAndVerifyHeader(in, key, info.Size())
 	if err != nil {
-		return fmt.Errorf("store: create %s: %w", tmp, err)
+		return err
+	}
+
+	out, tmp, err := exclusiveTemp(filepath.Dir(dst), "unseal")
+	if err != nil {
+		return err
 	}
 	ok := false
 	defer func() {
@@ -186,9 +265,15 @@ func unsealFile(dst, src string, key []byte) error {
 			_ = os.Remove(tmp)
 		}
 	}()
-
-	if err := unsealStream(out, in, key, info.Size()); err != nil {
+	if err := unsealChunks(out, in, key, hdr); err != nil {
 		return err
+	}
+	var extra [1]byte
+	if n, err := in.Read(extra[:]); n > 0 || (err != nil && !errors.Is(err, io.EOF)) {
+		if err == nil {
+			err = errors.New("trailing bytes")
+		}
+		return fmt.Errorf("store: encrypted mirror has trailing data: %w", err)
 	}
 	if err := out.Sync(); err != nil {
 		return err
@@ -206,41 +291,65 @@ func unsealFile(dst, src string, key []byte) error {
 	return nil
 }
 
-func unsealStream(out io.Writer, in io.Reader, key []byte, fileSize int64) error {
+func readAndVerifyHeader(in io.Reader, key []byte, fileSize int64) (sealHeader, error) {
+	if fileSize < sealHeaderLen {
+		return sealHeader{}, errors.New("store: encrypted mirror header is truncated")
+	}
+	aead, err := newAEAD(key)
+	if err != nil {
+		return sealHeader{}, err
+	}
+	prefix := make([]byte, sealPrefixLen)
+	if _, err := io.ReadFull(in, prefix); err != nil {
+		return sealHeader{}, errors.New("store: encrypted mirror header is truncated")
+	}
+	if string(prefix[:8]) != sealMagic {
+		return sealHeader{}, errors.New("store: not an encrypted mirror")
+	}
+	version := binary.LittleEndian.Uint32(prefix[8:])
+	chunkSize := binary.LittleEndian.Uint32(prefix[12:])
+	plainSize := binary.LittleEndian.Uint64(prefix[16:])
+	if version != sealVersion {
+		return sealHeader{}, fmt.Errorf("store: encrypted mirror version %d, want %d", version, sealVersion)
+	}
+	if chunkSize != sealChunkSize {
+		return sealHeader{}, fmt.Errorf("store: encrypted mirror chunk size %d, want %d", chunkSize, sealChunkSize)
+	}
+	// A claimed size that cannot fit in this file is rejected before
+	// we trust it. The header tag then authenticates the size, so a
+	// zeroed or shortened header cannot verify.
+	if plainSize > uint64(fileSize-sealHeaderLen) {
+		return sealHeader{}, errors.New("store: encrypted mirror header is not authentic")
+	}
+	var nonce [sealNonceLen]byte
+	if _, err := io.ReadFull(in, nonce[:]); err != nil {
+		return sealHeader{}, errors.New("store: encrypted mirror header is truncated")
+	}
+	mac := make([]byte, sealSnapshotLen+sealTagLen)
+	if _, err := io.ReadFull(in, mac); err != nil {
+		return sealHeader{}, errors.New("store: encrypted mirror header is truncated")
+	}
+	opened, err := aead.Open(nil, nonce[:], mac, prefix)
+	if err != nil || len(opened) != sealSnapshotLen {
+		return sealHeader{}, errors.New("store: encrypted mirror failed authentication (wrong key or tampered file)")
+	}
+	var hdr sealHeader
+	hdr.prefix = prefix
+	copy(hdr.snapshotID[:], opened)
+	hdr.plainSize = plainSize
+	return hdr, nil
+}
+
+func unsealChunks(out io.Writer, in io.Reader, key []byte, hdr sealHeader) error {
 	aead, err := newAEAD(key)
 	if err != nil {
 		return err
 	}
-	header := make([]byte, sealHeaderLen)
-	if _, err := io.ReadFull(in, header); err != nil {
-		return fmt.Errorf("store: read seal header: %w", err)
-	}
-	if string(header[:8]) != sealMagic {
-		return errors.New("store: not an encrypted mirror")
-	}
-	version := binary.LittleEndian.Uint32(header[8:])
-	chunkSize := binary.LittleEndian.Uint32(header[12:])
-	plainSize := binary.LittleEndian.Uint64(header[16:])
-	if version != sealVersion {
-		return fmt.Errorf("store: encrypted mirror version %d, want %d", version, sealVersion)
-	}
-	if chunkSize != sealChunkSize {
-		return fmt.Errorf("store: encrypted mirror chunk size %d, want %d", chunkSize, sealChunkSize)
-	}
-	// plainSize is not authenticated until the first chunk (or, for an
-	// empty file, there is nothing to authenticate — version 1 empty
-	// files are header-only). Reject sizes that cannot fit in this file
-	// before trusting them for the loop bound. A flipped size still
-	// fails GCM because the header is in the AAD.
-	if fileSize < sealHeaderLen || plainSize > uint64(fileSize-sealHeaderLen) {
-		return errors.New("store: encrypted mirror header is not authentic")
-	}
-
 	buf := make([]byte, sealChunkSize)
 	var index uint64
 	var done uint64
-	for done < plainSize {
-		var nonce [12]byte
+	for done < hdr.plainSize {
+		var nonce [sealNonceLen]byte
 		if _, err := io.ReadFull(in, nonce[:]); err != nil {
 			return fmt.Errorf("store: truncated encrypted mirror: %w", err)
 		}
@@ -249,14 +358,14 @@ func unsealStream(out io.Writer, in io.Reader, key []byte, fileSize int64) error
 			return fmt.Errorf("store: truncated encrypted mirror: %w", err)
 		}
 		n := int(sealChunkSize)
-		if remain := plainSize - done; remain < uint64(n) {
+		if remain := hdr.plainSize - done; remain < uint64(n) {
 			n = int(remain)
 		}
 		if _, err := io.ReadFull(in, buf[:n]); err != nil {
 			return fmt.Errorf("store: truncated encrypted mirror: %w", err)
 		}
 		sealed := append(append([]byte{}, buf[:n]...), tag...)
-		plain, err := aead.Open(nil, nonce[:], sealed, chunkAAD(header, index, n))
+		plain, err := aead.Open(nil, nonce[:], sealed, chunkAAD(hdr.snapshotID[:], index, n))
 		if err != nil {
 			return errors.New("store: encrypted mirror failed authentication (wrong key or tampered file)")
 		}

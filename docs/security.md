@@ -192,19 +192,19 @@ verbatim:
 ┌──────────────────────────────────────────────┐
 │ Approve mail_send?                           │
 │                                              │
-│ To: alice@example.com                        │
-│ CC: charlie@example.com                      │
-│ BCC: (none)                                  │
+│ To (1): alice@example.com                    │
+│ Cc (1): charlie@example.com                  │
+│ Bcc (0): (none)                              │
 │ Subject: Re: gear list                       │
 │                                              │
 │ [ Cancel ]                           [ Allow ]│
 └──────────────────────────────────────────────┘
 ```
 
-Allow is followed by Touch ID (or the account password). That
-recipient list is the verification surface. It is bare addresses,
-every one of them, and a list that cannot be shown in full is refused
-instead of clipped. An address the dialog would have to rewrite —
-a hidden character, a line separator, a compatibility letter — is
-refused too, because the mailbox that receives the mail has to be
-the mailbox on the screen.
+Allow is followed by Touch ID (or the account password). Each list
+is labeled with its count, including Bcc. If the alert cannot show
+the whole body at once, Allow stays disabled until the list is
+scrolled to the end. Addresses are an ASCII allowlist; an IDN domain
+is shown and sent only as its UTS-46 punycode. Anything else, and a
+subject or attachment name that contains a hidden or bidirectional
+character, is refused.

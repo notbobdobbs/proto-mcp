@@ -28,6 +28,10 @@ func TestConfirmShowsScrollableAlertBeforeTouchID(t *testing.T) {
 		"NSScrollView",
 		"NSTextView",
 		"hasVerticalScroller = true",
+		"Bcc",
+		"allow.isEnabled = false",
+		"boundsDidChangeNotification",
+		"visible.maxY >= view.bounds.maxY",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("main.swift missing %q — confirm dialogs would not show the full body", want)

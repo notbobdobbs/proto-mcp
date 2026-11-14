@@ -111,6 +111,24 @@ func TestSanitizePromptText_StripsLineSeparatorsAndInvisibles(t *testing.T) {
 	}
 }
 
+func TestSanitizePromptText_DropsConfusables(t *testing.T) {
+	for _, r := range []rune{0x00ad, 0x034f, 0x115f, 0x1160, 0x3164, 0xffa0, 0x3002, 0xff0e, 0xff61, 0xfe0f} {
+		in := "a" + string(r) + "b"
+		if !ContainsDisallowedPromptRune(in) {
+			t.Errorf("%U not classified as disallowed", r)
+		}
+	}
+	// Characters NFKC folds into ASCII (fullwidth full stop -> '.')
+	// survive as that ASCII character. The ones it leaves alone are
+	// dropped so they cannot hide in a dialog.
+	for _, r := range []rune{0x00ad, 0x034f, 0x115f, 0x3002, 0xfe0f} {
+		in := "a" + string(r) + "b"
+		if got := SanitizePromptText(in, 100); strings.ContainsRune(got, r) {
+			t.Errorf("%U still present in %q", r, got)
+		}
+	}
+}
+
 // Issue #125 — the strict variant refuses rather than truncates, and
 // measures the text after normalization and stripping.
 func TestSanitizePromptTextStrict_RefusesOverCap(t *testing.T) {

@@ -158,7 +158,7 @@ func TestAttachmentsSummary(t *testing.T) {
 		{
 			name: "one",
 			in:   []decodedAttachment{{Filename: "report.pdf", Plain: make([]byte, 2400)}},
-			want: "Attachments: report.pdf (2 KB)",
+			want: "Attachments (1): report.pdf (2 KB)",
 		},
 		{
 			name: "exactly three",
@@ -167,10 +167,10 @@ func TestAttachmentsSummary(t *testing.T) {
 				{Filename: "b.pdf", Plain: make([]byte, 1024)},
 				{Filename: "c.pdf", Plain: make([]byte, 1024)},
 			},
-			want: "Attachments: a.pdf (1 KB), b.pdf (1 KB), c.pdf (1 KB)",
+			want: "Attachments (3): a.pdf (1 KB), b.pdf (1 KB), c.pdf (1 KB)",
 		},
 		{
-			name: "more than three truncates",
+			name: "more than three lists every name and the count",
 			in: []decodedAttachment{
 				{Filename: "a", Plain: make([]byte, 1024)},
 				{Filename: "b", Plain: make([]byte, 1024)},
@@ -178,7 +178,7 @@ func TestAttachmentsSummary(t *testing.T) {
 				{Filename: "d", Plain: make([]byte, 1024)},
 				{Filename: "e", Plain: make([]byte, 1024)},
 			},
-			want: "Attachments: a (1 KB), b (1 KB), c (1 KB) and 2 more",
+			want: "Attachments (5): a (1 KB), b (1 KB), c (1 KB), d (1 KB), e (1 KB)",
 		},
 	}
 	for _, tc := range cases {

@@ -63,12 +63,12 @@ func TestDraftPromptBody_ShowsEverythingAndResistsInjection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("draftPromptBody: %v", err)
 	}
-	for _, want := range []string{"Subject: hi BCC: evil@x.com", "To: alice@x.com", "CC: bob@x.com", "BCC: carol@x.com", "q3.pdf", "file5.txt"} {
+	for _, want := range []string{"Subject: hi BCC: evil@x.com", "To (1): alice@x.com", "Cc (1): bob@x.com", "Bcc (1): carol@x.com", "q3.pdf", "file5.txt"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("prompt body missing %q:\n%s", want, body)
 		}
 	}
-	if strings.Count(body, "\nBCC:") != 1 {
+	if strings.Count(body, "\nBcc (") != 1 {
 		t.Errorf("subject newline injected a fake BCC line:\n%s", body)
 	}
 }

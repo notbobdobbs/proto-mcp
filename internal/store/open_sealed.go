@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -75,7 +77,7 @@ func openSealed(path string) (st *Store, err error) {
 	// INTO, not a raw copy: the working file is in WAL mode and the
 	// main file alone can be behind the log.
 	if len(pids) == 0 {
-		if err := sealOpenDB(db, live, path, key.Bytes()); err != nil {
+		if err := sealOpenDBLocked(db, live, path, key.Bytes()); err != nil {
 			return nil, err
 		}
 	}
@@ -122,10 +124,12 @@ func (s *Store) close() error {
 
 	var err error
 	if s.DB != nil && s.live != "" {
-		// The sealed copy is the main file, not the WAL. A failed
-		// checkpoint must not be followed by shredding the log.
-		if _, cerr := s.DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); cerr != nil {
-			err = fmt.Errorf("store: checkpoint: %w", cerr)
+		// The sealed copy is the main file, not the WAL. A busy
+		// TRUNCATE checkpoint still returns no error from Exec; the
+		// row's busy count is what says the log was not fully
+		// copied. Shredding that log would drop committed pages.
+		if cerr := checkpointTruncate(s.DB); cerr != nil {
+			err = cerr
 		}
 	}
 	if s.DB != nil {
@@ -194,23 +198,83 @@ func (s *Store) finishLive() error {
 	return shredErr
 }
 
+// checkpointTruncate runs a TRUNCATE checkpoint and requires it to
+// finish. SQLite reports a blocked checkpoint as a successful query
+// whose first column is non-zero (busy). That is a failure: the WAL
+// still holds pages the main file does not.
+func checkpointTruncate(db *sql.DB) error {
+	var busy, logged, checkpointed int
+	err := db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logged, &checkpointed)
+	if err != nil {
+		return fmt.Errorf("store: checkpoint: %w", err)
+	}
+	if busy != 0 || logged != checkpointed {
+		return fmt.Errorf("store: checkpoint incomplete (busy=%d, wal=%d, checkpointed=%d); keeping the WAL", busy, logged, checkpointed)
+	}
+	return nil
+}
+
 // sealOpenDB writes a consistent snapshot of an open database to dst.
+// The caller must not already hold dst's lock in this process: taking
+// it again and unlocking would drop that lock. openSealed calls
+// sealOpenDBLocked while it holds the lock.
+// destSealMu serializes seals of one mirror inside this process.
+// flock is per-process, so two goroutines would not exclude each
+// other with the file lock alone.
+var (
+	destSealMu  sync.Mutex
+	destSealMus = map[string]*sync.Mutex{}
+)
+
+func mutexFor(dst string) *sync.Mutex {
+	destSealMu.Lock()
+	defer destSealMu.Unlock()
+	m := destSealMus[dst]
+	if m == nil {
+		m = &sync.Mutex{}
+		destSealMus[dst] = m
+	}
+	return m
+}
+
 func sealOpenDB(db *sql.DB, live, dst string, key []byte) error {
 	if db == nil {
 		return nil
 	}
-	snap := live + ".snapshot"
-	if fi, err := os.Lstat(snap); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("store: refusing snapshot path %s (symlink)", snap)
-	}
-	if err := shred(snap); err != nil && !errors.Is(err, os.ErrNotExist) {
+	mu := mutexFor(dst)
+	mu.Lock()
+	defer mu.Unlock()
+	lock, err := lockExclusive(dst + ".lock")
+	if err != nil {
 		return err
+	}
+	defer unlockExclusive(lock)
+	return sealOpenDBLocked(db, live, dst, key)
+}
+
+func sealOpenDBLocked(db *sql.DB, live, dst string, key []byte) error {
+	if db == nil {
+		return nil
+	}
+	// A private snapshot name per call. Two openers must not VACUUM
+	// INTO one shared temp, and the file lock above keeps the rename
+	// of the sealed mirror single-writer.
+	var rnd [6]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return err
+	}
+	snap := fmt.Sprintf("%s.snapshot.%d.%x", live, os.Getpid(), rnd)
+	if fi, err := os.Lstat(snap); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("store: refusing snapshot path %s (symlink)", snap)
+		}
+		return fmt.Errorf("store: snapshot path %s already exists", snap)
 	}
 	if _, err := db.Exec("VACUUM INTO " + sqlString(snap)); err != nil {
 		return fmt.Errorf("store: snapshot working copy: %w", err)
 	}
 	defer shred(snap)
-	hideFromDump(snap)
+	hideWorkingFiles(snap)
 	return sealFileAtomic(dst, snap, key)
 }
 
@@ -261,7 +325,10 @@ func checkpointAndCopy(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	_, _ = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	if err := checkpointTruncate(db); err != nil {
+		_ = db.Close()
+		return err
+	}
 	if err := db.Close(); err != nil {
 		return err
 	}
@@ -277,7 +344,7 @@ func copyFile(src, dst string) error {
 	if fi, err := os.Lstat(dst); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("store: refusing to write through symlink %s", dst)
 	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
 	}
