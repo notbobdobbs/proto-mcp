@@ -138,37 +138,114 @@ func scrollableBody(_ text: String, allow: NSButton) -> NSScrollView {
     view.string = text
     layout.ensureLayout(for: container)
     let used = layout.usedRect(for: container)
-    // Empty or non-positive height with text present means we do not
-    // know the size. Fail closed: Allow stays off until the user
-    // scrolls to the end.
-    let uncertain = !text.isEmpty && used.height < 1
-    let contentH = used.height + view.textContainerInset.height * 2 + 8
-    let laidOut = max(contentH, 48)
-    view.frame = NSRect(x: 0, y: 0, width: contentWidth, height: uncertain ? 200 : laidOut)
-
-    let maxH: CGFloat = 440
-    let viewH = min(maxH, view.frame.height)
-    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: viewH))
-    scroll.hasVerticalScroller = true
-    scroll.autohidesScrollers = !uncertain && contentH <= viewH + 1
-    scroll.borderType = .bezelBorder
-    scroll.drawsBackground = false
-    scroll.documentView = view
-
-    let mustScroll = uncertain || contentH > viewH + 1
-    if mustScroll {
+    // used.height < 1 with text present means the measurement failed.
+    // Do not invent a 200pt document: scrolling that fake end turned
+    // Allow on before the real last line, including Bcc, was visible.
+    // Allow stays disabled until a later layout reports a real height
+    // and that last line is inside the viewport.
+    if !text.isEmpty && used.height < 1 {
         allow.isEnabled = false
+        view.frame = NSRect(x: 0, y: 0, width: contentWidth, height: 220)
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: 220))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.drawsBackground = false
+        scroll.documentView = view
+        let gate = LineGate(view: view, layout: layout, container: container, allow: allow, text: text)
         scroll.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
             object: scroll.contentView,
             queue: .main
         ) { _ in
-            let visible = scroll.contentView.bounds
-            if visible.maxY >= view.bounds.maxY - 8 {
-                allow.isEnabled = true
-            }
+            gate.consider()
+        }
+        return scroll
+    }
+
+    let contentH = used.height + view.textContainerInset.height * 2 + 8
+    view.frame = NSRect(x: 0, y: 0, width: contentWidth, height: max(contentH, 48))
+
+    let maxH: CGFloat = 440
+    let viewH = min(maxH, view.frame.height)
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: viewH))
+    scroll.hasVerticalScroller = true
+    scroll.autohidesScrollers = contentH <= viewH + 1
+    scroll.borderType = .bezelBorder
+    scroll.drawsBackground = false
+    scroll.documentView = view
+
+    if contentH > viewH + 1 {
+        allow.isEnabled = false
+        let gate = LineGate(view: view, layout: layout, container: container, allow: allow, text: text)
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scroll.contentView,
+            queue: .main
+        ) { _ in
+            gate.consider()
         }
     }
     return scroll
+}
+
+// LineGate enables Allow only after the text has a real measured
+// height and the last line (the Bcc line, when the body has one) is
+// inside the viewport. A zero usedRect never enables Allow.
+final class LineGate: NSObject {
+    let view: NSTextView
+    let layout: NSLayoutManager
+    let container: NSTextContainer
+    weak var allow: NSButton?
+    let text: String
+
+    init(view: NSTextView, layout: NSLayoutManager, container: NSTextContainer, allow: NSButton, text: String) {
+        self.view = view
+        self.layout = layout
+        self.container = container
+        self.allow = allow
+        self.text = text
+    }
+
+    func consider() {
+        layout.ensureLayout(for: container)
+        let used = layout.usedRect(for: container)
+        if text.isEmpty == false && used.height < 1 {
+            allow?.isEnabled = false
+            return
+        }
+        let contentH = used.height + view.textContainerInset.height * 2 + 8
+        if contentH > view.frame.height + 1 {
+            view.frame.size.height = contentH
+        }
+        guard let scroll = view.enclosingScrollView else {
+            allow?.isEnabled = false
+            return
+        }
+        let ns = text as NSString
+        var charRange = NSRange(location: 0, length: 0)
+        let marker = ns.range(of: "Bcc (", options: .backwards)
+        if marker.location != NSNotFound {
+            charRange = marker
+        } else if ns.length > 0 {
+            charRange = NSRange(location: ns.length - 1, length: 1)
+        }
+        if charRange.length == 0 {
+            allow?.isEnabled = false
+            return
+        }
+        let glyphs = layout.glyphRange(forCharacterRange: charRange, actualCharacterRange: nil)
+        if glyphs.length == 0 {
+            allow?.isEnabled = false
+            return
+        }
+        let rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
+        if rect.height < 1 {
+            allow?.isEnabled = false
+            return
+        }
+        let visible = scroll.contentView.bounds
+        allow?.isEnabled = visible.minY <= rect.minY + 2 && visible.maxY >= rect.maxY - 2
+    }
 }

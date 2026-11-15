@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -306,7 +308,11 @@ func sealOpenDBLocked(db *sql.DB, live, dst string, key []byte) error {
 	if _, err := rand.Read(rnd[:]); err != nil {
 		return err
 	}
-	snap := fmt.Sprintf("%s.snapshot.%d.%x", live, os.Getpid(), rnd)
+	tmpDir, err := sealTempDir(filepath.Dir(dst))
+	if err != nil {
+		return err
+	}
+	snap := filepath.Join(tmpDir, fmt.Sprintf("snapshot.%d.%x", os.Getpid(), rnd))
 	if fi, err := os.Lstat(snap); err == nil {
 		if fi.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("store: refusing snapshot path %s (symlink)", snap)
@@ -357,10 +363,25 @@ func materialize(path, live string, key []byte) error {
 	}
 }
 
-// shredStaleSealTemps removes plaintext leftovers from a crash
-// during seal or unseal. Those names are `.unseal.<pid>.<hex>`,
-// `.seal.<pid>.<hex>`, and `*.snapshot.<pid>.<hex>`.
-func shredStaleSealTemps(dir string) error {
+// ourSealTemp matches only names exclusiveTemp and sealOpenDBLocked
+// create: .seal.<pid>.<hex>, .unseal.<pid>.<hex>, snapshot.<pid>.<hex>.
+var ourSealTemp = regexp.MustCompile(`^(\.(seal|unseal)|snapshot)\.[0-9]+\.[0-9a-f]+$`)
+
+// logSkippedTemp records a temp the sweep refused to touch. Tests
+// replace it. A symlink or a stray name must not fail Open.
+var logSkippedTemp = func(msg string) {
+	log.Printf("store: %s", msg)
+}
+
+// shredStaleSealTemps removes crash leftovers inside seal-tmp only.
+// The directory is mode 0700. Anything that is not a regular file
+// this process's user owns, with one of the exact names above, is
+// skipped and logged. Symlinks are never followed.
+func shredStaleSealTemps(storeDir string) error {
+	dir, err := sealTempDir(storeDir)
+	if err != nil {
+		return err
+	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -369,14 +390,38 @@ func shredStaleSealTemps(dir string) error {
 		return err
 	}
 	for _, e := range ents {
-		name := e.Name()
-		if strings.HasPrefix(name, ".unseal.") || strings.HasPrefix(name, ".seal.") || strings.Contains(name, ".snapshot.") {
-			if err := shred(filepath.Join(dir, name)); err != nil {
-				return err
-			}
+		full := filepath.Join(dir, e.Name())
+		fi, err := os.Lstat(full)
+		if err != nil {
+			logSkippedTemp(fmt.Sprintf("skipping %s (%v)", full, err))
+			continue
+		}
+		shredIt, why := tempSweepAction(e.Name(), fi)
+		if !shredIt {
+			logSkippedTemp(fmt.Sprintf("skipping %s (%s)", full, why))
+			continue
+		}
+		if err := shred(full); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func tempSweepAction(name string, fi os.FileInfo) (bool, string) {
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return false, "symlink"
+	}
+	if !fi.Mode().IsRegular() {
+		return false, "not a regular file"
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+		return false, "not owned by the current user"
+	}
+	if !ourSealTemp.MatchString(name) {
+		return false, "not a seal temp"
+	}
+	return true, ""
 }
 
 func shredSidecars(path string) error {

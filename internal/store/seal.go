@@ -70,6 +70,18 @@ func chunkAAD(snapshotID []byte, index uint64, plainLen int) []byte {
 	return aad
 }
 
+// sealTempDirName is the only directory the sweep may touch. It sits
+// next to the mirror and is mode 0700.
+const sealTempDirName = "seal-tmp"
+
+func sealTempDir(storeDir string) (string, error) {
+	d := filepath.Join(storeDir, sealTempDirName)
+	if err := ensureOwnerOnlyDir(d); err != nil {
+		return "", err
+	}
+	return d, nil
+}
+
 // exclusiveTemp creates a new file in dir (which must be mode 0700)
 // with O_EXCL|O_NOFOLLOW. It never truncates an existing path.
 func exclusiveTemp(dir, prefix string) (*os.File, string, error) {
@@ -131,7 +143,11 @@ func sealFileAtomic(dst, src string, key []byte) error {
 		return fmt.Errorf("store: %s is not a regular file", src)
 	}
 
-	out, tmp, err := exclusiveTemp(filepath.Dir(dst), "seal")
+	tmpDir, err := sealTempDir(filepath.Dir(dst))
+	if err != nil {
+		return err
+	}
+	out, tmp, err := exclusiveTemp(tmpDir, "seal")
 	if err != nil {
 		return err
 	}
@@ -254,7 +270,11 @@ func unsealFile(dst, src string, key []byte) error {
 		return err
 	}
 
-	out, tmp, err := exclusiveTemp(filepath.Dir(dst), "unseal")
+	tmpDir, err := sealTempDir(filepath.Dir(dst))
+	if err != nil {
+		return err
+	}
+	out, tmp, err := exclusiveTemp(tmpDir, "unseal")
 	if err != nil {
 		return err
 	}

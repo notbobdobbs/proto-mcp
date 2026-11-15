@@ -341,13 +341,22 @@ func TestCloseKeepsWALWrittenAfterCheckpoint(t *testing.T) {
 func TestOpenShredsStaleUnsealTemps(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "store.db")
-	stale := filepath.Join(dir, ".unseal.42.deadbeef")
+	tmp := filepath.Join(dir, sealTempDirName)
+	if err := os.MkdirAll(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(tmp, ".unseal.42.deadbeef")
 	const secret = "plaintext-left-by-a-crash"
 	if err := os.WriteFile(stale, []byte(secret), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	keep := filepath.Join(dir, "notes.txt")
-	if err := os.WriteFile(keep, []byte("keep"), 0o600); err != nil {
+	// A name that merely contains ".snapshot." is not one of ours.
+	stray := filepath.Join(dir, "notes.snapshot.bak")
+	if err := os.WriteFile(stray, []byte("leave-me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	strayInTmp := filepath.Join(tmp, "notes.snapshot.bak")
+	if err := os.WriteFile(strayInTmp, []byte("leave-me-too"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s, err := Open(path)
@@ -358,9 +367,48 @@ func TestOpenShredsStaleUnsealTemps(t *testing.T) {
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("stale unseal temp still present: %v", err)
 	}
-	got, err := os.ReadFile(keep)
-	if err != nil || string(got) != "keep" {
-		t.Fatalf("unrelated file changed: %q %v", got, err)
+	for _, p := range []string{stray, strayInTmp} {
+		got, err := os.ReadFile(p)
+		if err != nil || !bytes.HasPrefix(got, []byte("leave-me")) {
+			t.Fatalf("unrelated file %s changed: %q %v", p, got, err)
+		}
+	}
+}
+
+func TestTempSweepSkipsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	tmp := filepath.Join(dir, sealTempDirName)
+	if err := os.MkdirAll(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tmp, ".unseal.7.abcd")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	var logs []string
+	prev := logSkippedTemp
+	logSkippedTemp = func(msg string) { logs = append(logs, msg) }
+	t.Cleanup(func() { logSkippedTemp = prev })
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("symlink in seal-tmp failed open: %v", err)
+	}
+	_ = s.Close()
+	got, err := os.ReadFile(victim)
+	if err != nil || string(got) != "safe" {
+		t.Fatalf("symlink was followed: %q %v", got, err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("symlink was removed: %v", err)
+	}
+	if len(logs) == 0 {
+		t.Fatal("skipped symlink was not logged")
 	}
 }
 

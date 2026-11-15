@@ -129,13 +129,12 @@ func asciiDomainLabels(ascii string) bool {
 	return !allDigit
 }
 
-// rejectHiddenText refuses subject and attachment names that contain
-// bidi controls or invisible/confusable characters. The dialog
-// sanitizer would drop them, so sending the original would hide the
-// character from the person approving.
+// rejectHiddenText is the approval-dialog rule for a display name,
+// subject, or file name. It is exactField: the dialog sanitizer must
+// leave the text unchanged, or the call is refused before Allow is
+// shown. A narrower check here let a zero-width character through
+// the dialog and then fail the send.
 func rejectHiddenText(kind, s string) error {
-	if mcp.ContainsDisallowedPromptRune(s) {
-		return fmt.Errorf("%s contains a hidden or bidirectional character and was not sent", kind)
-	}
-	return nil
+	_, err := exactField(kind, s)
+	return err
 }

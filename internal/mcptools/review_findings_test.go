@@ -103,6 +103,54 @@ func TestAttachmentNameBidiIsStrippedBeforeSend(t *testing.T) {
 	}
 }
 
+func TestHiddenTextRejectedBeforeApproval(t *testing.T) {
+	// One rule for the dialog and the send: zero-width and bidi in a
+	// display name, any recipient field, or the subject refuse the
+	// snapshot, so Allow is never shown for text the send would reject.
+	zw, bidi := "\u200b", "\u202e"
+	cases := []struct {
+		name string
+		in   map[string]any
+	}{
+		{"display name zwsp", map[string]any{"to": []string{"\"Al" + zw + "ice\" <bob@example.com>"}, "subject": "hi"}},
+		{"display name bidi", map[string]any{"to": []string{"\"Al" + bidi + "ice\" <bob@example.com>"}, "subject": "hi"}},
+		{"to zwsp", map[string]any{"to": []string{"alic" + zw + "e@example.com"}, "subject": "hi"}},
+		{"to bidi", map[string]any{"to": []string{"alice@" + bidi + "example.com"}, "subject": "hi"}},
+		{"cc zwsp", map[string]any{"to": []string{"bob@example.com"}, "cc": []string{"alic" + zw + "e@example.com"}, "subject": "hi"}},
+		{"cc bidi", map[string]any{"to": []string{"bob@example.com"}, "cc": []string{"alice@" + bidi + "example.com"}, "subject": "hi"}},
+		{"bcc zwsp", map[string]any{"to": []string{"bob@example.com"}, "bcc": []string{"alic" + zw + "e@example.com"}, "subject": "hi"}},
+		{"bcc bidi", map[string]any{"to": []string{"bob@example.com"}, "bcc": []string{"alice@" + bidi + "example.com"}, "subject": "hi"}},
+		{"subject zwsp", map[string]any{"to": []string{"bob@example.com"}, "subject": "hi" + zw}},
+		{"subject bidi", map[string]any{"to": []string{"bob@example.com"}, "subject": "hi" + bidi + "there"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, body, _, err := sendPromptSnapshot(Deps{}, "mail_send")(context.Background(), args)
+			if err == nil {
+				t.Fatalf("dialog was shown:\n%s", body)
+			}
+			// The send gate uses the same exactField rule.
+			if name, _ := tc.in["subject"].(string); strings.Contains(tc.name, "subject") {
+				if _, ferr := exactField("subject", name); ferr == nil {
+					t.Fatal("exactField accepted a subject the dialog rejected")
+				}
+			}
+		})
+	}
+	// rejectHiddenText and exactField agree on a zero-width display name.
+	name := "Al\u200bice"
+	if err := rejectHiddenText("display name", name); err == nil {
+		t.Fatal("rejectHiddenText accepted a zero-width display name")
+	}
+	if _, err := exactField("display name", name); err == nil {
+		t.Fatal("exactField accepted a zero-width display name")
+	}
+}
+
 func TestEmptyCcAndBccCountZero(t *testing.T) {
 	lines := recipientLines("alice@example.com", "", "")
 	body := strings.Join(lines, "\n")

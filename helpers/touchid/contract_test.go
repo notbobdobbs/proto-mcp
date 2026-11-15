@@ -31,10 +31,11 @@ func TestConfirmShowsScrollableAlertBeforeTouchID(t *testing.T) {
 		"Bcc",
 		"allow.isEnabled = false",
 		"boundsDidChangeNotification",
-		"visible.maxY >= view.bounds.maxY",
 		"NSTextStorage()",
 		"NSLayoutManager()",
-		"uncertain",
+		"used.height < 1",
+		"Bcc (",
+		"boundingRect",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("main.swift missing %q — confirm dialogs would not show the full body", want)
@@ -44,5 +45,10 @@ func TestConfirmShowsScrollableAlertBeforeTouchID(t *testing.T) {
 	// string is the title on macOS and is where truncation comes back.
 	if strings.Contains(s, "localizedReason: req.body") {
 		t.Error("localizedReason is req.body; the Touch ID sheet would clip the recipient list")
+	}
+	// A zero measurement must not install a 200pt document whose
+	// scroll end enables Allow. This is a source check only.
+	if strings.Contains(s, "uncertain ? 200") || strings.Contains(s, "height: uncertain") {
+		t.Error("zero-height path still uses a fake document height that scrolling can finish")
 	}
 }
