@@ -226,6 +226,9 @@ func run() error {
 		"socket", sockPath,
 	)
 
+	httpDoor := startHTTPDoor(ctx, rt)
+	defer httpDoor.Close()
+
 	return acceptLoop(ctx, listener, rt)
 }
 

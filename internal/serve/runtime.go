@@ -91,6 +91,13 @@ type Runtime struct {
 
 	hupStop   chan struct{}
 	pidUnlink func()
+
+	// onReload runs after a successful policy reload so the HTTP
+	// door can open or close its loopback listener.
+	onReload func()
+	// onUnlockStamp runs after a Touch ID unlock succeeds. Idle
+	// bumps do not call it.
+	onUnlockStamp func()
 }
 
 // Locked reports whether the runtime is currently in the locked
@@ -215,7 +222,26 @@ func (r *Runtime) Unlock(ctx context.Context) error {
 
 	slog.Info("daemon unlocked")
 	r.publishLockState(false, "")
+	if r.onUnlockStamp != nil {
+		r.onUnlockStamp()
+	}
 	return nil
+}
+
+// SetOnReload registers a callback for a successful SIGHUP policy
+// reload. The HTTP door re-reads http.yaml from it.
+func (r *Runtime) SetOnReload(fn func()) {
+	r.mu.Lock()
+	r.onReload = fn
+	r.mu.Unlock()
+}
+
+// SetOnUnlockStamp registers a callback for a successful Touch ID
+// unlock. It is not called for an idle bump.
+func (r *Runtime) SetOnUnlockStamp(fn func()) {
+	r.mu.Lock()
+	r.onUnlockStamp = fn
+	r.mu.Unlock()
 }
 
 // SessionBundle is the cmd-side wrapper around a Proton session.
@@ -420,6 +446,9 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	resolver := caller.New()
 
 	// 9. SIGHUP handler — policy reload + approval cache drop.
+	// rt is assigned just below, before the process handles a
+	// signal in practice. The goroutine nil-checks it.
+	var rt *Runtime
 	hupCh := make(chan os.Signal, 1)
 	signal.Notify(hupCh, syscall.SIGHUP)
 	hupStop := make(chan struct{})
@@ -436,6 +465,14 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 					n = broker.Invalidate()
 				}
 				logger.Info("policy reloaded", "approvals_dropped", n)
+				if rt != nil {
+					rt.mu.RLock()
+					reload := rt.onReload
+					rt.mu.RUnlock()
+					if reload != nil {
+						reload()
+					}
+				}
 			case <-hupStop:
 				signal.Stop(hupCh)
 				return
@@ -447,7 +484,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	//
 	// rt is built post-srv so the lock-state callback closes over
 	// it. Done in two steps so the closure has a stable target.
-	rt := &Runtime{}
+	rt = &Runtime{}
 	rt.idleTracker = newIdleTracker()
 	opts := []mcp.Option{
 		mcp.WithPolicy(engine),

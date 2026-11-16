@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/caller"
@@ -60,6 +61,11 @@ type Broker struct {
 	cache         *cache
 	logger        *slog.Logger
 	helperTimeout time.Duration
+
+	// One helper process at a time, for the socket and HTTP together.
+	// A second prompted call returns immediately and does not queue.
+	helperMu   sync.Mutex
+	helperBusy bool
 }
 
 // New constructs a Broker. helperPath should resolve to an
@@ -131,6 +137,19 @@ func (b *Broker) Request(ctx context.Context, r Request) (string, error) {
 // Returns SourceTouchID on exit 0, ErrUserCanceled on exit 1,
 // ErrAuthFailed on exit 2 or any other non-zero exit.
 func (b *Broker) runHelper(ctx context.Context, r Request) (string, error) {
+	b.helperMu.Lock()
+	if b.helperBusy {
+		b.helperMu.Unlock()
+		return "", errors.New("an approval prompt is already waiting on this Mac")
+	}
+	b.helperBusy = true
+	b.helperMu.Unlock()
+	defer func() {
+		b.helperMu.Lock()
+		b.helperBusy = false
+		b.helperMu.Unlock()
+	}()
+
 	payload, err := json.Marshal(struct {
 		Title   string `json:"title"`
 		Body    string `json:"body"`

@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -16,10 +17,12 @@ import (
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/approval"
 	"github.com/just-an-oldsalt/proto-mcp/internal/httpconfig"
+	"github.com/just-an-oldsalt/proto-mcp/internal/httpmcp"
 	"github.com/just-an-oldsalt/proto-mcp/internal/keystore"
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcperrors"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
 	"github.com/just-an-oldsalt/proto-mcp/internal/secret"
+	"github.com/just-an-oldsalt/proto-mcp/internal/store"
 )
 
 // clipboardHold is how long a copied token is left on the clipboard
@@ -125,6 +128,8 @@ func runHTTPWith(ctx context.Context, args []string, deps httpDeps) error {
 		return deps.disable(args[1:])
 	case "status":
 		return deps.status(args[1:])
+	case "activity":
+		return runHTTPActivity(args[1:])
 	case "token":
 		return deps.token(ctx, args[1:])
 	default:
@@ -354,6 +359,68 @@ func (d *httpDeps) clearIfOurs(text string) {
 		return
 	}
 	_ = d.board.Clear()
+}
+
+func runHTTPActivity(args []string) error {
+	fs := flag.NewFlagSet("http activity", flag.ContinueOnError)
+	dbPath := fs.String("db", "", "path to the local mirror")
+	ids := fs.Bool("ids", false, "also print message ids")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := *dbPath
+	if path == "" {
+		var err error
+		path, err = store.DefaultPath()
+		if err != nil {
+			return err
+		}
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	text, err := httpmcp.ActivityText(st.DB, time.Now(), *ids)
+	if err != nil {
+		return err
+	}
+	fmt.Print(text)
+	return nil
+}
+
+// httpTokenPresent reports whether a 32-byte remote token is stored.
+// It never returns the token bytes. Tests replace it.
+var httpTokenPresent = func() bool {
+	tok, err := keystore.LoadHTTPToken()
+	if err != nil {
+		return false
+	}
+	defer tok.Zero()
+	return len(tok.Bytes()) == keystore.HTTPTokenLen
+}
+
+func checkHTTP(r *report) {
+	dir, err := appSupportDir()
+	if err != nil {
+		r.add("http", stateWarn, "cannot locate http.yaml", "")
+		return
+	}
+	cfg, err := httpconfig.Load(filepath.Join(dir, "http.yaml"))
+	if err != nil {
+		r.add("http", stateWarn, "http.yaml is not usable; the door stays off", "fix http.yaml")
+		return
+	}
+	line := "off"
+	if cfg.Enabled {
+		line = "on, listen " + cfg.Listen
+	}
+	if httpTokenPresent() {
+		line += ", token present"
+	} else {
+		line += ", token absent"
+	}
+	r.add("http", stateOK, line, "")
 }
 
 func checkScreenLock(r *report) {
