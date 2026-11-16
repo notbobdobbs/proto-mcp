@@ -293,6 +293,41 @@ func TestBrokerInvalidateDropsCache(t *testing.T) {
 	}
 }
 
+func TestBrokerOneHelperAtATime(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix helper fixture")
+	}
+	p := filepath.Join(t.TempDir(), "slow-touchid")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\nsleep 0.4\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := Request{
+		Tool:   "mail_trash",
+		Caller: caller.Caller{Transport: caller.TransportHTTP, Label: "remote", PID: 0},
+		Args:   json.RawMessage(`{"message_id":"synthetic-1"}`),
+		Policy: policy.ToolPolicy{Decision: policy.DecisionPrompt, TTL: "0", Confirm: true},
+		Title:  "Approve mail_trash?",
+		Body:   "synthetic",
+	}
+	errCh := make(chan error, 2)
+	go func() {
+		_, err := b.Request(context.Background(), req)
+		errCh <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	_, err = b.Request(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "already waiting") {
+		t.Fatalf("second prompt = %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBrokerInvalidateNilSafe(t *testing.T) {
 	var b *Broker
 	if got := b.Invalidate(); got != 0 {

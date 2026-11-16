@@ -5,12 +5,11 @@ import (
 	"net"
 )
 
-// init installs a "no TCP listen ever" invariant per SECURITY
-// Foundational #3. Phase 3 ships only the stdio transport; Phase 6's
-// daemon adds a Unix-domain socket. TCP is never the right answer
-// for a local-only MCP server (DNS rebinding, exposing to the local
-// network, etc.), so we forbid it structurally — any call to
-// net.Listen("tcp", …) or net.ListenTCP panics with a clear message.
+// init installs a "no TCP listen except the loopback door" invariant
+// per SECURITY Foundational #3. The stdio transport and the daemon's
+// Unix socket are the local doors. The only TCP listen in the repo is
+// httpmcp.Listen, which binds a literal loopback address and refuses
+// anything else. Any other net.Listen("tcp") is still forbidden.
 //
 // Implementation: monkey-patching net.Listen would require unsafe
 // tricks Go won't let us do. Instead, this file exposes a small

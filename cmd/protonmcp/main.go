@@ -227,6 +227,8 @@ Commands:
                disable                 Write enabled: false.
                status                  Print enabled, listen address, and
                                        whether a token exists. Never the token.
+               activity                Print remote call counts. Never a body.
+                                       --ids also prints message ids.
                token rotate            Replace the token and copy it to the
                                        clipboard for about 60 seconds. The
                                        token is not an argument and is not
