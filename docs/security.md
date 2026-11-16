@@ -180,8 +180,12 @@ The socket's peer checks stay; they simply do not apply to HTTP.
 - **The Grok Bot account holds a copy of the token.** You paste it
   into that account's connector settings, so the account is inside the
   trust boundary. Turn on a passkey or 2FA there before you paste.
-  Someone who can open the account can use the token until you revoke
-  it or take the tunnel down.
+  `token show` and `token rotate` leave the token on the clipboard for
+  about 60 seconds, with a countdown, and clear it on the way out or
+  when you press Ctrl-C. While it sits there, macOS Universal Clipboard
+  can copy it to your other Apple devices. Someone who can open the
+  Grok account can use the token until you revoke it or take the
+  tunnel down.
 - **The Keychain limit now includes the remote token.** A process
   running as you can read Keychain items without a fresh Touch ID.
   That includes `http-bearer`. The seal on `store.db` does not stop a
@@ -199,8 +203,20 @@ The socket's peer checks stay; they simply do not apply to HTTP.
   the shared auth-failure limit (10 failures a minute, then `429` for
   everyone, including the real bot, for the rest of that minute), the
   per-minute cap, the daily read cap (default 500, stored so a restart
-  does not zero it), and the audit log. Every HTTP tool call that
-  passes auth, reads included, writes a redacted row.
+  does not zero it), and the audit log. A bad or missing bearer counts,
+  including a bearer sent in the query string and a failed `DELETE`.
+  The token is never accepted from the query string. Every HTTP tool
+  call that passes auth, reads included, writes a redacted row.
+- **A present Origin is rejected unless you listed it.**
+  `allowed_hosts` checks the Host header only. `allowed_origins` is
+  empty by default, and a loopback Origin is not implied by a loopback
+  listen address. A missing Origin is allowed. There is no CORS header.
+- **An unusable `http.yaml` closes the listener.** A file that does
+  not parse, is writable by the group or by others, or is not owned by
+  you is treated as disabled. The daemon does not keep serving on the
+  last good config. `http disable` rewrites that file to
+  `enabled: false` and the listener closes. SIGHUP re-reads
+  `http.yaml` even when the policy file failed to reload.
 - **Prompt injection from mail the bot reads.** A hostile message can
   tell the bot to trash, download, or send. Download and recoverable
   trash are on the default remote list and still require Touch ID.

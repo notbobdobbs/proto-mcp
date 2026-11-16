@@ -87,18 +87,26 @@ caller_label: remote
 allowed_hosts:
   - 127.0.0.1:4765
   - localhost:4765
+allowed_origins: []            # empty: every present Origin is rejected
 max_requests_per_minute: 60    # 0 means 60, never unlimited; hard ceiling 600
 max_remote_reads_per_day: 500  # 0 means 500, never unlimited; hard ceiling 5000
 max_unlock_hours: 8            # 0 means 8; allowed 1–24; no unlimited value
 # remote_tools omitted means the built-in default, not every tool.
 ```
 
-`listen` must be `127.0.0.1` or `::1` with an explicit port. `0.0.0.0`,
-a LAN address, an empty host, and the name `localhost` are refused.
-Add the tunnel's public hostname to `allowed_hosts` when you turn the
-tunnel on. A Host or Origin that is not on the list is rejected before
-any tool runs. A missing Origin is allowed. The Origin value `null` is
-rejected.
+`listen` must be exactly `127.0.0.1` or `::1`, with a port from 1 to
+65535. Port 0, any other 127/8 address, an IPv4-mapped address,
+`0.0.0.0`, a LAN address, an empty host, and the name `localhost` are
+refused. Add the tunnel's public hostname to `allowed_hosts` when you
+turn the tunnel on. That list is the Host header only. It does not
+authorize an Origin.
+
+`allowed_origins` is a separate list, empty by default. Each entry is
+an exact `scheme://host:port` string, with no path. A missing Origin
+is allowed. A present Origin, including a loopback one such as
+`http://127.0.0.1:4765`, is rejected unless that exact string is on
+the list. The value `null` is present, so it is rejected unless you
+list it. The response has no CORS header.
 
 Omitted or empty `remote_tools` means the built-in default, not every
 tool. The default is search, read, draft, send, attachment download,
@@ -111,26 +119,43 @@ and recoverable trash: `account_whoami`, `mail_list`, `mail_search`,
 `mail_trash`. Setting the list replaces that default. `mail_draft_delete`
 and `mail_delete_permanent` are not on it. `*` or `all`, a number below
 0, `max_unlock_hours` above 24, or a rate above its hard ceiling makes
-the file unusable: the previous good file stays, and a first load does
-not enable the listener.
+the file unusable. A file that is group- or world-writable, or not
+owned by you, is unusable too. The daemon treats an unusable file as
+disabled and closes a listener it already has open. It does not keep
+the last good config. `protonmcp http disable` rewrites the file to
+`enabled: false` (mode `0600`) even when the old contents do not
+parse, then signals the daemon so that listener closes.
 
-`protonmcp policy reload` (SIGHUP) also re-reads `http.yaml` and opens
-or closes the listener. Each request reads the token from the Keychain,
-so revoke is immediate.
+`protonmcp policy reload` (SIGHUP) re-reads `http.yaml` even when
+`policy.yaml` failed to reload. The previous policy stays in that
+case. The HTTP reload still runs and opens or closes the listener.
+Each request reads the token from the Keychain. Rotate and revoke
+signal the daemon; a changed or missing token drops HTTP sessions
+immediately.
 
 ```sh
-protonmcp http token rotate    # new token on the clipboard for about 60 seconds; not printed
+protonmcp http token rotate    # new token on the clipboard; the command waits, then clears it
 protonmcp http token show      # same clipboard copy, only after Touch ID; decline copies nothing
-protonmcp http token revoke    # delete the token; logout does not do this
+protonmcp http token revoke    # delete the token and signal the daemon; logout does not do this
 protonmcp http enable          # refuses without a token; warns if screen lock is off, and still enables
-protonmcp http disable         # stop listening; the socket keeps working
-protonmcp http status          # enabled, listen address, whether a token exists; never the token
+protonmcp http disable         # writes enabled: false even if the file is broken, then closes the listener
+protonmcp http status          # enabled, listen address, token present or absent, live sessions, unlock age, listening
 protonmcp http activity        # remote call counts; --ids also prints message ids; never a body
 ```
 
-`token rotate` and `token show` clear the clipboard about 60 seconds
-later only if it still holds that token. Neither command takes the
-token as an argument. A Mac is required for show and rotate.
+`token rotate` and `token show` copy the token and then stay running
+for about 60 seconds. They print a countdown. Ctrl-C clears the
+clipboard early. The clear runs only if the clipboard still holds
+that token, and the token is not printed. macOS Universal Clipboard
+can copy the token to your other Apple devices while it sits there.
+Neither command takes the token as an argument. A Mac is required for
+show and rotate. Rotate signals the daemon before the wait, so old
+HTTP sessions drop. `http status` reads the session count, unlock
+age, and listening flag from the daemon's status file, and only while
+that process is still running. It never prints the token. `doctor`
+says the door is listening whenever that process still has the
+listener open, including when `http.yaml` is not usable. It does not
+say the door is off while the listener is up.
 
 Screen lock left off is an accepted risk. `http enable` and `doctor`
 warn. They do not block, and the warning does not fail `doctor`.
@@ -139,7 +164,7 @@ warn. They do not block, and the warning does not fail `doctor`.
 
 1. Leave macOS screen lock off. That is the accepted setting. `protonmcp doctor` and `protonmcp http enable` warn. They do not block. The backstops are the 8-hour HTTP unlock clock and the Tailscale admin console.
 2. On the Grok Bot account, turn on a passkey or 2FA. The token will live in that account's connector settings.
-3. `protonmcp http token rotate`. The token is on the clipboard for about 60 seconds. Paste it into the connector header `Authorization: Bearer <token>`.
+3. `protonmcp http token rotate`. The command puts the token on the clipboard and waits about 60 seconds, counting down. Ctrl-C clears it early. Paste it into the connector header `Authorization: Bearer <token>` before it clears. Universal Clipboard can copy it to your other Apple devices during that wait.
 4. `protonmcp http enable`. It refuses without a token. It warns if screen lock is off, and it still enables.
 5. Start Tailscale Funnel to `http://127.0.0.1:4765` and leave it on. Add that hostname to `allowed_hosts`. Scanners will hit the public name. The kill switch, when you need it, is the Tailscale admin console: disable Funnel, or disable the node.
 6. Leave `remote_tools` unset. The default includes `mail_download_attachment` and `mail_trash`. Adding `mail_draft_delete` means listing the default names plus that tool. Listing `mail_delete_permanent` does not enable it.
