@@ -30,36 +30,20 @@ func LoadHTTPToken() (secret.Secret, error) {
 	return s, nil
 }
 
-// SaveHTTPToken writes or replaces the remote token. data must be 32 bytes.
-func SaveHTTPToken(s secret.Secret) error {
-	if len(s.Bytes()) != HTTPTokenLen {
-		return errors.New("keystore: http token has the wrong length")
-	}
-	data := make([]byte, HTTPTokenLen)
-	copy(data, s.Bytes())
-	defer zero(data)
-
-	item := keychain.NewGenericPassword(Service, HTTPTokenAccount, HTTPTokenLabel, data, "")
-	item.SetSynchronizable(keychain.SynchronizableNo)
-	item.SetAccessible(keychain.AccessibleWhenUnlocked)
-	err := keychain.AddItem(item)
-	if errors.Is(err, keychain.ErrorDuplicateItem) {
-		query := keychain.NewItem()
-		query.SetSecClass(keychain.SecClassGenericPassword)
-		query.SetService(Service)
-		query.SetAccount(HTTPTokenAccount)
-		update := keychain.NewItem()
-		update.SetData(data)
-		update.SetLabel(HTTPTokenLabel)
-		if err := keychain.UpdateItem(query, update); err != nil {
-			return fmt.Errorf("keystore: replace http token: %w", err)
+func init() {
+	deleteHTTPTokenItem = func(service, account string) error {
+		err := keychain.DeleteGenericPasswordItem(service, account)
+		if err == nil || errors.Is(err, keychain.ErrorItemNotFound) {
+			return nil
 		}
-		return nil
+		return err
 	}
-	if err != nil {
-		return fmt.Errorf("keystore: save http token: %w", err)
+	addHTTPTokenItem = func(service, account, label string, data []byte) error {
+		item := keychain.NewGenericPassword(service, account, label, data, "")
+		item.SetSynchronizable(keychain.SynchronizableNo)
+		item.SetAccessible(keychain.AccessibleWhenUnlocked)
+		return keychain.AddItem(item)
 	}
-	return nil
 }
 
 // DeleteHTTPToken removes the remote token. Missing is success.

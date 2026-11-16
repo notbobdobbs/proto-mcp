@@ -117,6 +117,45 @@ func TestSaveIsOwnerOnlyAndRoundTrips(t *testing.T) {
 	}
 }
 
+func TestLoadRefusesGroupOrWorldWritable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "http.yaml")
+	if err := Save(path, Default()); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []os.FileMode{0o660, 0o606, 0o666} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); !errors.Is(err, ErrBadFile) {
+			t.Errorf("mode %o: err = %v, want ErrBadFile", mode, err)
+		}
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteDisabledIgnoresOldContents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "http.yaml")
+	if err := os.WriteFile(path, []byte("::::"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteDisabled(path); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Enabled {
+		t.Fatal("disabled file is enabled")
+	}
+}
+
 func assertDefaultTools(t *testing.T, cfg Config) {
 	t.Helper()
 	set := map[string]bool{}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"unicode"
 	"unicode/utf8"
 
@@ -246,15 +247,42 @@ func remoteTools(raw *[]string) ([]string, bool, error) {
 
 // Load reads path. A missing file is Default and a nil error.
 // A bad file is ErrBadFile and a zero Config, so enabled is false.
+// A file that is group- or world-writable, or not owned by this
+// user, is refused. The daemon must treat that as disabled.
 func Load(path string) (Config, error) {
-	data, err := os.ReadFile(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return Default(), nil
 		}
 		return Config{}, err
 	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return Config{}, fmt.Errorf("%w: http.yaml is writable by the group or by others", ErrBadFile)
+	}
+	if !ownedByUser(info) {
+		return Config{}, fmt.Errorf("%w: http.yaml is not owned by this user", ErrBadFile)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
 	return Parse(data)
+}
+
+func ownedByUser(info os.FileInfo) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return int(st.Uid) == os.Getuid()
+}
+
+// WriteDisabled replaces path with a minimal enabled:false file,
+// mode 0600. It does not parse the previous contents, so a broken
+// file can still be turned off.
+func WriteDisabled(path string) error {
+	return writeAtomic(path, []byte("enabled: false\n"))
 }
 
 // Save writes cfg as mode 0600. The directory is created mode 0700.
@@ -277,6 +305,10 @@ func Save(path string, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	return writeAtomic(path, data)
+}
+
+func writeAtomic(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
