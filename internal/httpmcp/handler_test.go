@@ -3,6 +3,7 @@ package httpmcp
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -68,7 +69,9 @@ func testService(t *testing.T) (*Service, *store.Store, string, *int) {
 	s := New(srv, filepath.Join(dir, "http.yaml"), token)
 	s.cfg = httpconfig.Default()
 	s.cfg.CallerLabel = "remote"
+	srv.UseHTTPUnlock(func(context.Context) error { return nil })
 	srv.UseRemoteAllow(s.Allows)
+	srv.UseTrashGuard(func(context.Context, json.RawMessage) error { return nil })
 	s.Reads = NewReadCap(st.DB, func() time.Time { return time.Now() }, func() int { return 2 })
 	srv.UseReadCap(s.Reads.Take)
 	return s, st, text, &calls
@@ -90,18 +93,34 @@ func post(s *Service, token, host, session, body string) *httptest.ResponseRecor
 }
 
 func TestListenRejectsNonLoopback(t *testing.T) {
-	for _, addr := range []string{"0.0.0.0:4765", "192.168.1.9:4765", ":4765", "localhost:4765", "example.com:4765"} {
+	for _, addr := range []string{
+		"0.0.0.0:4765", "192.168.1.9:4765", ":4765", "localhost:4765",
+		"example.com:4765", "127.0.0.2:4765", "127.0.0.1:0",
+		"[::ffff:127.0.0.1]:4765", "[::1]:0",
+	} {
 		if err := ValidateAddr(addr); err == nil {
 			t.Errorf("ValidateAddr(%s) succeeded", addr)
 		}
 	}
-	ln, err := Listen("127.0.0.1:0")
+	if err := ValidateAddr("[::1]:4765"); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	_ = probe.Close()
+	ln, err := Listen(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = ln.Close()
-	if !LoopbackRemote("127.0.0.1:9") || LoopbackRemote("192.0.2.1:9") {
-		t.Fatal("loopback check is wrong")
+	if !LoopbackRemote("127.0.0.1:9") || !LoopbackRemote("[::1]:9") {
+		t.Fatal("literal loopback was rejected")
+	}
+	if LoopbackRemote("192.0.2.1:9") || LoopbackRemote("127.0.0.2:9") || LoopbackRemote("[::ffff:127.0.0.1]:9") {
+		t.Fatal("non-exact loopback was accepted")
 	}
 }
 

@@ -97,13 +97,35 @@ type Middleware struct {
 	// Server.New.
 	lookupTool func(string) (Tool, bool)
 
-	// HTTP-only hooks. Nil on the Unix and stdio paths, which never
-	// call them. remoteAllow narrows; it cannot turn a deny into an
-	// allow. readCap and trashGuard run before the approval broker.
+	// HTTP-only hooks. The Unix and stdio paths never call them. A nil
+	// hook denies the HTTP call it guards, so a forgotten wire-up
+	// cannot skip the allowlist, the read cap, the trash check, or
+	// the unlock clock. remoteAllow narrows; it cannot turn a deny
+	// into an allow. readCap and trashGuard run before the approval
+	// broker.
 	httpUnlock  func(context.Context) error
 	remoteAllow func(tool string) bool
 	readCap     func(tool string) error
 	trashGuard  func(context.Context, json.RawMessage) error
+}
+
+// httpReadTools consume the daily remote read cap. Keep this in step
+// with httpmcp.readTools. mail_sync, drafts, sends, and mail_trash
+// are not in it.
+var httpReadTools = map[string]struct{}{
+	"account_whoami":           {},
+	"mail_list":                {},
+	"mail_search":              {},
+	"mail_read":                {},
+	"mail_read_thread":         {},
+	"mail_list_attachments":    {},
+	"mail_draft_list":          {},
+	"labels_list":              {},
+	"folders_list":             {},
+	"calendar_list":            {},
+	"calendar_events":          {},
+	"calendar_read_event":      {},
+	"mail_download_attachment": {},
 }
 
 // UseApproval installs the Touch ID broker after New. Tests use it
@@ -168,7 +190,10 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 	// Absolute HTTP unlock. Idle bumps do not move this clock, and
 	// a Unix caller never reads it. A decline returns before the
 	// idle bump and before the audit row, same as a lock refusal.
-	if callerInfo.Transport == caller.TransportHTTP && m.httpUnlock != nil {
+	if callerInfo.Transport == caller.TransportHTTP {
+		if m.httpUnlock == nil {
+			return ErrorResult("%s refused: the remote door is not configured", t.Name), nil
+		}
 		if err := m.httpUnlock(ctx); err != nil {
 			return ErrorResult("%s", err.Error()), nil
 		}
@@ -267,16 +292,25 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 
 	// Remote allowlist, HTTP only, after Decide. A policy deny is
 	// left for the switch below and cannot be undone by the list.
-	if callerInfo.Transport == caller.TransportHTTP && decision != policy.DecisionDeny && m.remoteAllow != nil && !m.remoteAllow(t.Name) {
-		outcome = audit.OutcomeDenied
-		errMsg = "not on the remote tool list"
-		return ErrorResult("tool %s is not available on the remote door", t.Name), nil
-	}
-	if callerInfo.Transport == caller.TransportHTTP && m.readCap != nil {
-		if err := m.readCap(t.Name); err != nil {
+	if callerInfo.Transport == caller.TransportHTTP && decision != policy.DecisionDeny {
+		if m.remoteAllow == nil || !m.remoteAllow(t.Name) {
 			outcome = audit.OutcomeDenied
-			errMsg = err.Error()
-			return ErrorResult("%s denied: %s", t.Name, err.Error()), nil
+			errMsg = "not on the remote tool list"
+			return ErrorResult("tool %s is not available on the remote door", t.Name), nil
+		}
+	}
+	if callerInfo.Transport == caller.TransportHTTP {
+		if _, read := httpReadTools[t.Name]; read {
+			if m.readCap == nil {
+				outcome = audit.OutcomeDenied
+				errMsg = "remote read cap is not configured"
+				return ErrorResult("%s denied: remote read cap is not configured", t.Name), nil
+			}
+			if err := m.readCap(t.Name); err != nil {
+				outcome = audit.OutcomeDenied
+				errMsg = err.Error()
+				return ErrorResult("%s denied: %s", t.Name, err.Error()), nil
+			}
 		}
 	}
 
@@ -316,7 +350,12 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 	// the handler when the mirror says the message is already in
 	// Trash, or when the mirror has no row. The Unix path does not
 	// call this.
-	if callerInfo.Transport == caller.TransportHTTP && t.Name == "mail_trash" && m.trashGuard != nil {
+	if callerInfo.Transport == caller.TransportHTTP && t.Name == "mail_trash" {
+		if m.trashGuard == nil {
+			outcome = audit.OutcomeDenied
+			errMsg = "mail_trash refused: the trash check is not configured"
+			return ErrorResult("%s", errMsg), nil
+		}
 		if err := m.trashGuard(ctx, args); err != nil {
 			outcome = audit.OutcomeDenied
 			errMsg = err.Error()

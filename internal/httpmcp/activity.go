@@ -88,13 +88,13 @@ func DailyNotice(db *sql.DB, now time.Time, notify func(string) error) error {
 		if err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(context.Background(), `INSERT INTO http_notified (day) VALUES (?)`, key); err != nil {
-			return err
-		}
 		if total == 0 {
 			continue
 		}
 		if err := notify(text); err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(context.Background(), `INSERT INTO http_notified (day) VALUES (?)`, key); err != nil {
 			return err
 		}
 	}

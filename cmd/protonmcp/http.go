@@ -406,21 +406,36 @@ func checkHTTP(r *report) {
 		r.add("http", stateWarn, "cannot locate http.yaml", "")
 		return
 	}
-	cfg, err := httpconfig.Load(filepath.Join(dir, "http.yaml"))
-	if err != nil {
-		r.add("http", stateWarn, "http.yaml is not usable; the door stays off", "fix http.yaml")
-		return
+	path := filepath.Join(dir, "http.yaml")
+	live := httpconfig.ReadLiveDoorState(httpconfig.DoorStatePath(path))
+	cfg, cfgErr := httpconfig.Load(path)
+	state, detail, hint := describeHTTPDoor(cfg, cfgErr, live, httpTokenPresent())
+	r.add("http", state, detail, hint)
+}
+
+// describeHTTPDoor is what doctor and the wording tests share. A live
+// listener is reported as listening even when http.yaml cannot be
+// parsed. It is never described as off while that process still listens.
+func describeHTTPDoor(cfg httpconfig.Config, cfgErr error, live httpconfig.DoorState, tokenPresent bool) (checkState, string, string) {
+	token := "token absent"
+	if tokenPresent {
+		token = "token present"
 	}
-	line := "off"
+	if live.Listening {
+		detail := fmt.Sprintf("listening, sessions %d, %s", live.Sessions, token)
+		if cfgErr != nil {
+			return stateWarn, detail + "; http.yaml is not usable", "fix http.yaml"
+		}
+		return stateOK, detail, ""
+	}
+	if cfgErr != nil {
+		return stateWarn, "http.yaml is not usable; the door is not listening", "fix http.yaml"
+	}
+	detail := "off"
 	if cfg.Enabled {
-		line = "on, listen " + cfg.Listen
+		detail = "enabled, not listening, listen " + cfg.Listen
 	}
-	if httpTokenPresent() {
-		line += ", token present"
-	} else {
-		line += ", token absent"
-	}
-	r.add("http", stateOK, line, "")
+	return stateOK, detail + ", " + token, ""
 }
 
 func checkScreenLock(r *report) {

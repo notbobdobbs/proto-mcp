@@ -3,12 +3,12 @@ package httpmcp
 import (
 	"fmt"
 	"net"
-	"strings"
+	"strconv"
 )
 
-// Listen is the only TCP listen in the process. It accepts a literal
-// loopback address with an explicit port: 127.0.0.1 or ::1. It refuses
-// 0.0.0.0, an empty host, a LAN address, and the name localhost.
+// Listen is the only TCP listen in the process. It accepts exactly
+// 127.0.0.1 or ::1 with an explicit non-zero port. Other 127/8
+// addresses, IPv4-mapped IPv6, localhost, and port 0 are refused.
 func Listen(addr string) (net.Listener, error) {
 	if err := ValidateAddr(addr); err != nil {
 		return nil, err
@@ -16,33 +16,31 @@ func Listen(addr string) (net.Listener, error) {
 	return net.Listen("tcp", addr)
 }
 
-// ValidateAddr reports whether addr is a literal loopback host and a port.
-// It does not listen.
+// ValidateAddr reports whether addr is exactly 127.0.0.1 or ::1 and a
+// port from 1 to 65535. It does not listen. It does not treat every
+// loopback IP as acceptable.
 func ValidateAddr(addr string) error {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil || port == "" || host == "" {
 		return fmt.Errorf("httpmcp: refusing listen address %q", addr)
 	}
-	if strings.EqualFold(host, "localhost") {
-		return fmt.Errorf("httpmcp: refusing hostname %q", host)
+	if host != "127.0.0.1" && host != "::1" {
+		return fmt.Errorf("httpmcp: refusing listen address %q", addr)
 	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("httpmcp: refusing non-loopback listen %q", addr)
-	}
-	if ip.IsUnspecified() {
-		return fmt.Errorf("httpmcp: refusing unspecified listen %q", addr)
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("httpmcp: refusing listen port %q", port)
 	}
 	return nil
 }
 
-// LoopbackRemote reports whether a connection's RemoteAddr is loopback.
-// X-Forwarded-For is not consulted.
+// LoopbackRemote reports whether a connection's RemoteAddr is exactly
+// 127.0.0.1 or ::1. X-Forwarded-For is not consulted. 127.0.0.2 and
+// ::ffff:127.0.0.1 are not accepted.
 func LoopbackRemote(remote string) bool {
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil {
 		host = remote
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return host == "127.0.0.1" || host == "::1"
 }

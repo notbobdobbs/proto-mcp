@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -50,10 +51,19 @@ func startHTTPDoor(ctx context.Context, rt *serve.Runtime) *httpmcp.Service {
 			return err
 		})
 	})
-	rt.SetOnUnlockStamp(func() { svc.Clock.Stamp(time.Now()) })
-	rt.SetOnReload(func() { _ = svc.Reload() })
+	rt.SetOnUnlockStamp(func() {
+		svc.Clock.Stamp(time.Now())
+		svc.Publish()
+	})
+	rt.SetOnReload(func() {
+		if err := svc.Reload(); err != nil {
+			slog.Warn("remote door reload failed", "err", httpmcp.SafeError(err))
+		}
+	})
 	svc.Clock.Stamp(time.Now())
-	_ = svc.Reload()
+	if err := svc.Reload(); err != nil {
+		slog.Warn("remote door reload failed", "err", httpmcp.SafeError(err))
+	}
 	go func() {
 		tick := time.NewTicker(time.Hour)
 		defer tick.Stop()

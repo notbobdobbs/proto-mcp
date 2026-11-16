@@ -28,6 +28,19 @@ func NewUnlockClock(now func() time.Time) *UnlockClock {
 	return &UnlockClock{now: now, cooldown: 60 * time.Second}
 }
 
+// Unix is the stamp as seconds since the epoch, or 0 when unset.
+func (c *UnlockClock) Unix() int64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.at.IsZero() {
+		return 0
+	}
+	return c.at.Unix()
+}
+
 // Stamp records a successful Touch ID that unlocks the session.
 func (c *UnlockClock) Stamp(t time.Time) {
 	if c == nil {

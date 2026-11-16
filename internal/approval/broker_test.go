@@ -107,7 +107,11 @@ func TestBrokerHelperTimeoutIsNotAuthFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if b.helperTimeout != 30*time.Second {
+		t.Fatalf("helper timeout = %s, want 30s", b.helperTimeout)
+	}
 	b.helperTimeout = 100 * time.Millisecond
+	start := time.Now()
 	_, err = b.Request(context.Background(), Request{
 		Tool:   "test_tool",
 		Caller: caller.Caller{PID: 1},
@@ -121,6 +125,9 @@ func TestBrokerHelperTimeoutIsNotAuthFailure(t *testing.T) {
 	}
 	if errors.Is(err, mcperrors.ErrAuthFailed) {
 		t.Fatalf("timeout reported as auth failure: %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("sleeping helper was not canceled well before the 45s HTTP request limit")
 	}
 }
 

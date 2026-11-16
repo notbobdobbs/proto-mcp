@@ -10,6 +10,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -122,56 +125,124 @@ func (s *Service) now() time.Time {
 	return time.Now()
 }
 
-// Reload re-reads http.yaml. A bad file keeps the previous config and
-// does not start a listener. Disabled, or no token, closes the listener.
+// Reload re-reads http.yaml. A bad file, a disabled file, or a missing
+// token closes the listener and drops sessions. The previous enabled
+// config is not kept. A changed token drops sessions immediately.
+// The returned error never includes the token; callers should still
+// pass it through SafeError before logging.
 func (s *Service) Reload() error {
-	cfg, err := httpconfig.Load(s.Path)
-	if err != nil {
-		return err
-	}
+	cfg, loadErr := httpconfig.Load(s.Path)
+	fp, have := s.currentFP()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cfg = cfg
-	if !cfg.Enabled || !s.tokenPresent() {
+	var ret error
+	if loadErr != nil {
+		s.cfg.Enabled = false
+		s.sessions = map[string]*hsess{}
+		s.haveFP = false
 		s.stopLocked()
-		return nil
+		ret = loadErr
+	} else {
+		s.cfg = cfg
+		if !cfg.Enabled || !have {
+			s.sessions = map[string]*hsess{}
+			s.haveFP = false
+			s.stopLocked()
+		} else {
+			if s.haveFP && s.tokenFP != fp {
+				s.sessions = map[string]*hsess{}
+			}
+			s.tokenFP = fp
+			s.haveFP = true
+			if s.ln == nil {
+				ln, lerr := Listen(cfg.Listen)
+				if lerr != nil {
+					ret = lerr
+				} else {
+					srv := &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second}
+					s.ln = ln
+					s.httpSrv = srv
+					go func() { _ = srv.Serve(ln) }()
+				}
+			}
+		}
 	}
-	if s.ln != nil {
-		return nil
-	}
-	ln, err := Listen(cfg.Listen)
-	if err != nil {
-		return err
-	}
-	s.ln = ln
-	s.httpSrv = &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second}
-	go s.httpSrv.Serve(ln)
-	return nil
+	st, path := s.snapshotLocked()
+	s.mu.Unlock()
+	writeDoor(path, st)
+	return ret
 }
 
-func (s *Service) tokenPresent() bool {
+func (s *Service) currentFP() (fp [32]byte, ok bool) {
 	if s.Token == nil {
-		return false
+		return fp, false
 	}
 	tok, err := s.Token()
 	if err != nil {
-		return false
+		return fp, false
 	}
 	defer tok.Zero()
-	return len(tok.Bytes()) == keystore.HTTPTokenLen
+	if len(tok.Bytes()) != keystore.HTTPTokenLen {
+		return fp, false
+	}
+	return sha256.Sum256(tok.Bytes()), true
 }
 
 func (s *Service) stopLocked() {
 	if s.httpSrv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = s.httpSrv.Shutdown(ctx)
+		err := s.httpSrv.Shutdown(ctx)
 		cancel()
+		if err != nil {
+			_ = s.httpSrv.Close()
+		}
 		s.httpSrv = nil
 	}
 	if s.ln != nil {
 		_ = s.ln.Close()
 		s.ln = nil
 	}
+}
+
+func (s *Service) snapshotLocked() (httpconfig.DoorState, string) {
+	st := httpconfig.DoorState{
+		PID:       os.Getpid(),
+		Listening: s.ln != nil,
+		Sessions:  len(s.sessions),
+	}
+	if s.Clock != nil {
+		st.UnlockUnix = s.Clock.Unix()
+	}
+	if s.Path == "" {
+		return st, ""
+	}
+	return st, httpconfig.DoorStatePath(s.Path)
+}
+
+func writeDoor(path string, st httpconfig.DoorState) {
+	if path == "" {
+		return
+	}
+	_ = httpconfig.WriteDoorState(path, st)
+}
+
+// Publish writes the live door file for status and doctor.
+func (s *Service) Publish() {
+	s.mu.Lock()
+	st, path := s.snapshotLocked()
+	s.mu.Unlock()
+	writeDoor(path, st)
+}
+
+// tokenHex matches the clipboard encoding of the bearer token.
+var tokenHex = regexp.MustCompile(`[0-9a-fA-F]{64}`)
+
+// SafeError is err's text with any 64-hex token replaced. Log this,
+// not the raw error, when a reload or listen failure is reported.
+func SafeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return tokenHex.ReplaceAllString(err.Error(), "[redacted]")
 }
 
 // Close stops the listener.
@@ -247,25 +318,33 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "", http.StatusForbidden)
 		return
 	}
+	now := s.now()
+	if s.authFails.over(now, authFailLimit) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		return
+	}
+	// A bearer in the query is never accepted, even when the
+	// Authorization header is also present. It counts as a failure
+	// for every method, including GET and DELETE. The query is not logged.
+	if hasBearerQuery(r) {
+		s.authFails.add(now)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodOptions:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
-	case http.MethodDelete:
-		s.deleteSession(w, r)
-		return
-	case http.MethodPost:
+	case http.MethodDelete, http.MethodPost:
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if r.URL.RawQuery != "" && hasTokenQuery(r) {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	now := s.now()
-	if s.authFails.over(now, authFailLimit) {
-		w.WriteHeader(http.StatusTooManyRequests)
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	if !hostOK(r.Host, cfg.AllowedHosts) || !originOK(r.Header.Get("Origin"), cfg.AllowedOrigins) {
+		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 	tok, ok := s.bearer(r)
@@ -276,16 +355,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer zero(tok)
 	s.noteToken(tok)
+	if r.Method == http.MethodDelete {
+		s.deleteSession(w, r)
+		return
+	}
 
 	if proto := r.Header.Get("MCP-Protocol-Version"); proto != "" && proto != "2025-06-18" && proto != "2025-03-26" {
 		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	s.mu.Lock()
-	cfg := s.cfg
-	s.mu.Unlock()
-	if !hostOK(r.Host, cfg.AllowedHosts) || !originOK(r.Header.Get("Origin"), cfg.AllowedHosts) {
-		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 	if r.ContentLength > bodyCap {
@@ -362,19 +438,17 @@ func (s *Service) serveInitialize(w http.ResponseWriter, ctx context.Context, re
 	}
 	s.sessions[id] = &hsess{conn: conn, claimed: clientName(req.Params), last: s.now()}
 	s.mu.Unlock()
+	s.Publish()
 	w.Header().Set("Mcp-Session-Id", id)
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Service) deleteSession(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.bearer(r); !ok {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
 	id := r.Header.Get("Mcp-Session-Id")
 	s.mu.Lock()
 	delete(s.sessions, id)
 	s.mu.Unlock()
+	s.Publish()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -383,22 +457,28 @@ func (s *Service) session(id string) *hsess {
 		return nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sweepLocked(s.now())
+	dropped := s.sweepLocked(s.now())
 	sess := s.sessions[id]
-	if sess == nil {
-		return nil
+	if sess != nil {
+		sess.last = s.now()
 	}
-	sess.last = s.now()
+	st, path := s.snapshotLocked()
+	s.mu.Unlock()
+	if dropped {
+		writeDoor(path, st)
+	}
 	return sess
 }
 
-func (s *Service) sweepLocked(now time.Time) {
+func (s *Service) sweepLocked(now time.Time) bool {
+	dropped := false
 	for id, sess := range s.sessions {
 		if now.Sub(sess.last) > sessionIdle {
 			delete(s.sessions, id)
+			dropped = true
 		}
 	}
+	return dropped
 }
 
 func (s *Service) dropOldestLocked() {
@@ -452,9 +532,48 @@ func (s *Service) noteToken(raw []byte) {
 	s.haveFP = true
 }
 
-func hasTokenQuery(r *http.Request) bool {
-	q := r.URL.Query()
-	return q.Has("token") || q.Has("access_token") || q.Has("authorization")
+func hasBearerQuery(r *http.Request) bool {
+	if r == nil || r.URL == nil || r.URL.RawQuery == "" {
+		return false
+	}
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return true
+	}
+	for key, vals := range q {
+		switch strings.ToLower(key) {
+		case "token", "access_token", "authorization", "bearer":
+			return true
+		}
+		for _, v := range vals {
+			if looksLikeBearer(v) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func looksLikeBearer(v string) bool {
+	v = strings.TrimSpace(v)
+	if strings.HasPrefix(strings.ToLower(v), "bearer ") {
+		return true
+	}
+	if len(v) == 64 && isHex(v) {
+		return true
+	}
+	return false
+}
+
+func isHex(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func hostOK(host string, allowed []string) bool {
@@ -467,15 +586,16 @@ func hostOK(host string, allowed []string) bool {
 	return false
 }
 
+// originOK allows a missing Origin. A present Origin, including a
+// loopback one, must be an exact allowed_origins entry. allowed_hosts
+// is not consulted. "null" is present and is rejected unless listed.
 func originOK(origin string, allowed []string) bool {
+	origin = strings.TrimSpace(origin)
 	if origin == "" {
 		return true
 	}
-	if origin == "null" {
-		return false
-	}
 	for _, a := range allowed {
-		if strings.EqualFold(a, origin) || strings.HasSuffix(strings.ToLower(origin), "://"+strings.ToLower(a)) {
+		if a == origin {
 			return true
 		}
 	}

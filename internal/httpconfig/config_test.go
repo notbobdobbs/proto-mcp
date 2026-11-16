@@ -139,6 +139,44 @@ func TestLoadRefusesGroupOrWorldWritable(t *testing.T) {
 	}
 }
 
+func TestAllowedOriginsAreExactAndNotDerivedFromHosts(t *testing.T) {
+	cfg, err := Parse([]byte("allowed_hosts: [127.0.0.1:4765]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AllowedOrigins) != 0 {
+		t.Fatalf("hosts filled origins: %v", cfg.AllowedOrigins)
+	}
+	cfg, err = Parse([]byte("allowed_origins: [\"http://127.0.0.1:4765\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AllowedOrigins) != 1 || cfg.AllowedOrigins[0] != "http://127.0.0.1:4765" {
+		t.Fatalf("origins = %v", cfg.AllowedOrigins)
+	}
+	for _, body := range []string{
+		"allowed_origins: [\"127.0.0.1:4765\"]\n",
+		"allowed_origins: [\"http://127.0.0.1:4765/\"]\n",
+		"allowed_origins: [\"http://127.0.0.1\"]\n",
+	} {
+		if _, err := Parse([]byte(body)); !errors.Is(err, ErrBadFile) {
+			t.Errorf("%q err = %v, want ErrBadFile", body, err)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "http.yaml")
+	cfg.Enabled = false
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.AllowedOrigins) != 1 || got.AllowedOrigins[0] != "http://127.0.0.1:4765" {
+		t.Fatalf("reloaded origins = %v", got.AllowedOrigins)
+	}
+}
+
 func TestWriteDisabledIgnoresOldContents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "http.yaml")
 	if err := os.WriteFile(path, []byte("::::"), 0o600); err != nil {

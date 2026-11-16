@@ -6,6 +6,7 @@ package httpconfig
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,18 +99,24 @@ var knownTools = map[string]struct{}{
 	"folders_delete":           {},
 }
 
-// ErrBadFile means the file must not be applied. The previous good
-// file stays in effect, and a first load stays off.
+// ErrBadFile means the file must not be applied. Callers treat the
+// door as disabled and close a listener they already opened. A bad
+// file does not keep the previous enabled config.
 var ErrBadFile = errors.New("http.yaml is not usable")
 
 // Config is the effective remote-door config. Zero values for the
 // caps have already been replaced with the defaults. There is no
 // value here that means unlimited.
 type Config struct {
-	Enabled              bool
-	Listen               string
-	CallerLabel          string
-	AllowedHosts         []string
+	Enabled      bool
+	Listen       string
+	CallerLabel  string
+	AllowedHosts []string
+	// AllowedOrigins is an exact list of Origin values
+	// (scheme://host:port). Empty means every present Origin is
+	// rejected, including a loopback one. AllowedHosts does not
+	// fill this list and does not authorize an Origin.
+	AllowedOrigins       []string
 	MaxRequestsPerMinute int
 	MaxRemoteReadsPerDay int
 	MaxUnlockHours       int
@@ -140,6 +147,7 @@ type rawFile struct {
 	Listen               *string   `yaml:"listen"`
 	CallerLabel          *string   `yaml:"caller_label"`
 	AllowedHosts         *[]string `yaml:"allowed_hosts"`
+	AllowedOrigins       *[]string `yaml:"allowed_origins"`
 	MaxRequestsPerMinute *int      `yaml:"max_requests_per_minute"`
 	MaxRemoteReadsPerDay *int      `yaml:"max_remote_reads_per_day"`
 	MaxUnlockHours       *int      `yaml:"max_unlock_hours"`
@@ -169,6 +177,11 @@ func Parse(data []byte) (Config, error) {
 	if raw.AllowedHosts != nil {
 		cfg.AllowedHosts = append([]string(nil), (*raw.AllowedHosts)...)
 	}
+	origins, err := normalizeOrigins(raw.AllowedOrigins)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AllowedOrigins = origins
 	rpm, err := capOrDefault(raw.MaxRequestsPerMinute, DefaultMaxRequestsPerMinute, maxRequestsPerMinuteCeiling, "max_requests_per_minute")
 	if err != nil {
 		return Config{}, err
@@ -245,6 +258,25 @@ func remoteTools(raw *[]string) ([]string, bool, error) {
 	return out, true, nil
 }
 
+// normalizeOrigins keeps an explicit list as exact Origin values.
+// Nil means the key was omitted, which stays empty: no Origin is
+// accepted. A present Origin is never derived from allowed_hosts.
+func normalizeOrigins(in *[]string) ([]string, error) {
+	if in == nil {
+		return nil, nil
+	}
+	out := make([]string, 0, len(*in))
+	for _, raw := range *in {
+		o := strings.TrimSpace(raw)
+		u, err := url.Parse(o)
+		if err != nil || u.Scheme == "" || u.Host == "" || u.Port() == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+			return nil, fmt.Errorf("%w: allowed_origins entry %q must be scheme://host:port", ErrBadFile, raw)
+		}
+		out = append(out, o)
+	}
+	return out, nil
+}
+
 // Load reads path. A missing file is Default and a nil error.
 // A bad file is ErrBadFile and a zero Config, so enabled is false.
 // A file that is group- or world-writable, or not owned by this
@@ -294,6 +326,7 @@ func Save(path string, cfg Config) error {
 		"listen":                   cfg.Listen,
 		"caller_label":             cfg.CallerLabel,
 		"allowed_hosts":            cfg.AllowedHosts,
+		"allowed_origins":          cfg.AllowedOrigins,
 		"max_requests_per_minute":  cfg.MaxRequestsPerMinute,
 		"max_remote_reads_per_day": cfg.MaxRemoteReadsPerDay,
 		"max_unlock_hours":         cfg.MaxUnlockHours,
