@@ -9,10 +9,10 @@ maintenance. When something isn't working, start with `protonmcp doctor`.
 | Command | What it does |
 |---|---|
 | `setup` | Run first-time setup end to end: sign in, copy the mailbox index, start the background service, connect Claude, then verify. Skips any step already complete, so it doubles as a repair command. Flags: `--db`, `--force`. |
-| `doctor` | Check every part of the install — binaries and version skew, Touch ID / lockwatch helpers, keychain session, local mirror, daemon, recorded binary hash, and Claude client registration — then print the exact command to fix anything broken. Never prompts for Touch ID. Exits non-zero if something is wrong. Flags: `--db`. |
+| `doctor` | Check every part of the install — binaries and version skew, Touch ID / lockwatch helpers, keychain session, local mirror, daemon, recorded binary hash, Claude client registration, and whether the remote door is on and a token exists. Never prints the token. Warns when screen lock is off; that warning does not fail the run. Never prompts for Touch ID. Exits non-zero if something is broken. Flags: `--db`. |
 | `version` | Print the build version, commit, and platform. `protonmcpd --version` and `protonmcp-shim --version` do the same, which is how `doctor` detects a partial upgrade. |
 | `login` | Run the full Proton login flow (SRP password + TOTP + key unlock) and save the session to the macOS Keychain. |
-| `logout` | Revoke the server-side session and delete the Keychain entry. |
+| `logout` | Revoke the server-side session and delete the Keychain session item. The remote-door token and the mailbox-mirror key stay. |
 | `whoami` | Print an account summary. Resumes the saved session, or falls back to a one-time login. |
 | `backfill` | Drain message metadata into the local SQLite mirror. Flags: `--db`, `--yes`, `--limit`. |
 | `calendar-backfill` | Mirror calendars + event metadata. Pass `--decrypt` to decrypt every event now (warms `calendar_events` full-text search). Flags: `--db`, `--decrypt`. |
@@ -23,6 +23,7 @@ maintenance. When something isn't working, start with `protonmcp doctor`.
 | `install` | Register proto-mcp with Claude Desktop and/or Claude Code. Flags: `--client {desktop\|code\|all}`, `--dry-run`. Only the `protonmcp` entry under `mcpServers` is changed; other servers and top-level keys are kept as they are. Before each write, the previous file is saved as `<config>.bak-<UTC timestamp>` (e.g. `~/.claude.json.bak-20260926T101500.000000000Z`), and the newest 5 backups are kept. |
 | `uninstall` | Remove proto-mcp from the selected client config(s). Same guarantees and backups as `install`. |
 | `daemon` | `install` / `uninstall` / `start` / `stop` / `restart` / `status` — manage the LaunchAgent. |
+| `http` | The remote door. `enable` writes `enabled: true` and refuses when no token is stored; it warns if screen lock is off and still enables. `disable` closes the listener; the Unix socket keeps working. `status` prints enabled, the listen address, and whether a token exists — never the token. `token rotate` replaces the 32-byte token, copies it to the clipboard for about 60 seconds, and does not print it or take it as an argument. `token show` does the same copy only after Touch ID; decline copies nothing. `token revoke` deletes the token. `activity` prints remote call counts for today and the previous 7 days; `--ids` also prints message ids; a body is never printed. Show and rotate need a Mac. See [configuration.md](./configuration.md#the-remote-door). |
 | `policy` | `reload` / `show` / `validate` — see [configuration.md](./configuration.md). |
 | `lock` / `unlock` | Lock or Touch-ID-unlock the running daemon. |
 | `purge` | Trim the cached plaintext window (message bodies, attachments, decrypted calendar events). Flags: `--older-than`, `--vacuum`. |
@@ -112,4 +113,7 @@ same keyring as mail. Notes & limitations:
 > call destroys mail irrecoverably. `internal/policy/default.yaml`
 > reserves a `mail_delete_permanent: deny` stanza so the name is spoken
 > for if it is ever implemented — setting it to `prompt` today does
-> nothing, because no such tool exists.
+> nothing, because no such tool exists. On the remote door, `mail_trash`
+> is still only a move to Trash, and it is refused when the message is
+> already in Trash or the mirror cannot say. `mail_draft_delete` and
+> permanent delete stay off that door's default list.

@@ -57,15 +57,30 @@ Plus, around the binaries themselves:
 
 The daemon runs as **you**, on **your** Mac, and talks to two parties:
 the local MCP clients (Claude Desktop / Code, via the shim over a `0600`
-Unix socket) and Proton's servers (over TLS, via `go-proton-api`). Mail
-content fetched from Proton is **untrusted input** — it can contain
-anything a sender chose to put in it.
+Unix socket) and Proton's servers (over TLS, via `go-proton-api`). When
+you turn it on, it can also answer one loopback HTTP port for a remote
+MCP client. That door is off until `http.yaml` says `enabled: true` and
+a token is in the Keychain. Mail content fetched from Proton is
+**untrusted input** — it can contain anything a sender chose to put in
+it.
 
 ## Defended
 
 - **Local IPC isolation.** The socket is `0600` inside a `0700`
   directory; every connection is peer-credential checked and cross-UID
-  connections are refused.
+  connections are refused. The socket path and those checks are
+  unchanged by the HTTP door. The HTTP door, when enabled, binds only
+  a literal loopback address (`127.0.0.1` or `::1`), requires a bearer
+  token on every request, ignores `X-Forwarded-For`, and sends no CORS
+  headers. Its tool list can only remove tools. It cannot turn a
+  policy `deny` into `allow` or `prompt`.
+- **Remote trash is recoverable only.** HTTP `mail_trash` moves a
+  message to Trash. If the mirror says the message is already in
+  Trash, or the mirror has no row to decide, the call is refused
+  before Touch ID and before any Proton call. Permanent delete and
+  `mail_draft_delete` are not on the default remote list. Listing
+  `mail_delete_permanent` does not enable it, because policy stays
+  `deny`.
 - **Session at rest.** The Proton session lives in the macOS Keychain;
   the daemon re-prompts for Touch ID on every startup and every unlock
   after a manual/auto lock (screen lock, sleep, idle timer).
@@ -140,6 +155,84 @@ anything a sender chose to put in it.
   security (SRP password + 2FA). It does not defend against a
   compromised Proton account or a malicious server response beyond
   ordinary input sanitization.
+
+## The remote door
+
+This is what changes when the loopback HTTP listener is on. Writes are
+still default-deny plus a Touch ID prompt that shows the literal
+recipients. Sends stay `ttl: 0`. Sleep and idle lock still drop the
+in-memory session. A screen unlock still does not unlock the daemon.
+The socket's peer checks stay; they simply do not apply to HTTP.
+
+- **A bearer holder can read the mailbox without Touch ID, until the
+  unlock clock runs out.** Reads on the remote list are `allow` on
+  purpose. That used to require a same-user process on the Mac. With
+  the door on, it requires the token, a path through the tunnel, the
+  Mac awake, the daemon unlocked, and an HTTP stamp younger than
+  `max_unlock_hours` (default 8, allowed 1–24, no unlimited value).
+  The stamp is wall-clock time since the last successful Touch ID. A
+  bot that keeps reading does not move it. Decline leaves the stamp
+  and the local session as they were. The text a bot reads passes
+  through that bot's servers. That is the accepted trade-off. A leaked
+  token is a remote read until the stamp expires, you revoke, or you
+  take the tunnel down. The mirror seal does not cover mail text after
+  it leaves the daemon.
+- **The Grok Bot account holds a copy of the token.** You paste it
+  into that account's connector settings, so the account is inside the
+  trust boundary. Turn on a passkey or 2FA there before you paste.
+  Someone who can open the account can use the token until you revoke
+  it or take the tunnel down.
+- **The Keychain limit now includes the remote token.** A process
+  running as you can read Keychain items without a fresh Touch ID.
+  That includes `http-bearer`. The seal on `store.db` does not stop a
+  local process from copying the token and using it from outside the
+  house. Revoke, and turning Funnel off, are the responses. There is
+  no new Keychain entitlement; the restricted-entitlement wall above
+  still applies.
+- **Screen lock is off.** That is an accepted risk, not a precondition.
+  `protonmcp doctor` and `protonmcp http enable` warn when screen lock
+  is off, and they do not block. Sleep still locks the daemon. The
+  backstops are the 8-hour HTTP stamp, which idle cannot move, and the
+  Tailscale admin console.
+- **Funnel stays on.** That is an accepted risk: a permanent public
+  name, and scanners will hit it. The controls are the bearer token,
+  the shared auth-failure limit (10 failures a minute, then `429` for
+  everyone, including the real bot, for the rest of that minute), the
+  per-minute cap, the daily read cap (default 500, stored so a restart
+  does not zero it), and the audit log. Every HTTP tool call that
+  passes auth, reads included, writes a redacted row.
+- **Prompt injection from mail the bot reads.** A hostile message can
+  tell the bot to trash, download, or send. Download and recoverable
+  trash are on the default remote list and still require Touch ID.
+  A second trash, of a message already in Trash, is refused before
+  any Proton call. Permanent delete, empty Trash, and
+  `mail_draft_delete` are not on the list, and adding a name cannot
+  beat a policy `deny`. Sends still require Touch ID showing the real
+  recipients, `ttl` 0. Filing stays off the default list.
+- **The off-site kill switch is the Tailscale admin console.** Disable
+  Funnel, or disable this Mac's node. That cuts the network when you
+  are not at the Mac. The daemon may still be listening on loopback.
+  The token is unchanged until you revoke it, and revoke still needs
+  the Mac. Logout does not revoke the token and does not disable
+  Funnel.
+- **A tunnel that terminates TLS in the wrong place reads everything.**
+  Tailscale Funnel ends TLS in `tailscaled` on the Mac, so the relay
+  sees ciphertext. Cloudflare Tunnel and ngrok terminate TLS at the
+  vendor and can read the token and the mail. Do not use them. Point
+  Funnel only at `http://127.0.0.1:4765`, not at the Unix socket and
+  not at a mode that serves files from disk.
+
+The approval dialog for an HTTP call says `Requested by: http:<label>`.
+There is no request field that skips the prompt. If the helper is
+missing, a `prompt` tool is denied, as it is for a local caller. One
+approval dialog can be up at a time. A second call is told a prompt is
+already waiting. An approval cached for the Unix socket is not reused
+by HTTP, and the reverse is not reused either. Rate-limit buckets are
+per tool, shared by every caller.
+
+Turn the door on only after a passkey or 2FA is on the Grok Bot
+account. The steps are in
+[configuration.md](./configuration.md#the-remote-door).
 
 ## Reducing your exposure
 

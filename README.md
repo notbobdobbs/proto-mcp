@@ -128,8 +128,12 @@ never a *liability*. The guarantees that make that true:
 - **🧾 Honest, redacted audit log.** Every call is logged — secrets
   scrubbed, bodies reduced to `{sha256, bytes}`, recipients kept literal
   so the verification chain stays truthful.
-- **🏠 Local-only.** The daemon listens on a `0600` Unix socket, never a
-  network port. Mail content goes to Proton over TLS; nothing else leaves.
+- **🏠 Local socket, optional loopback door.** The daemon listens on a
+  `0600` Unix socket. It also listens on `127.0.0.1` (or `::1`) only
+  when `http.yaml` is enabled and a Keychain token exists. It does not
+  open a public port. Mail content goes to Proton over TLS. A remote
+  bot sees the mail it reads; that trade-off is in
+  [docs/security.md](docs/security.md).
 
 What a prompt actually looks like:
 
