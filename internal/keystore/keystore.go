@@ -40,6 +40,30 @@ const (
 // ErrNotFound is returned by Load and Delete when no session is stored.
 var ErrNotFound = errors.New("keystore: no stored session")
 
+// errKeychainItemNotFound is the platform "no such item" signal.
+// Delete treats it as success so logout is idempotent.
+var errKeychainItemNotFound = errors.New("keystore: item not found")
+
+// deleteKeychainItem removes one item under Service. The macOS
+// build replaces this with the real Keychain call. Logout passes
+// only the session account, so the mirror key and the remote token
+// stay. Tests replace it with a fake.
+var deleteKeychainItem = func(service, account string) error {
+	return errors.New("keystore: session storage requires the macOS Keychain")
+}
+
+// Delete removes the stored session. Returns nil if no entry exists.
+// It deletes only the session account. The mailbox-mirror key and
+// the remote HTTP token are separate Keychain items and are left
+// in place.
+func Delete() error {
+	err := deleteKeychainItem(Service, Account)
+	if err == nil || errors.Is(err, errKeychainItemNotFound) {
+		return nil
+	}
+	return err
+}
+
 // Live is the in-memory shape of a stored session. SaltedKeyPass is a
 // secret.Secret because it's the binary used to re-unlock the user's
 // PGP keyring — just as sensitive as the mailbox password.
