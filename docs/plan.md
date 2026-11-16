@@ -9,7 +9,8 @@ search, read, file, draft, and send Proton mail through proto-mcp on
 your Mac. Grok Bot can only connect to a remote HTTPS MCP endpoint.
 It cannot open the Unix socket, and nothing in this plan runs on
 Grok Bot's computer. The remote door is narrower than that goal on
-purpose: filing, trash, and delete stay off it until you add them.
+purpose: filing stays off it, and so do permanent delete and draft
+delete, until you add them.
 
 ## 1. For the owner
 
@@ -23,19 +24,25 @@ public HTTPS address to that door. The door is locked with a long
 random password (a bearer token) kept in the macOS Keychain. It is
 off until you turn it on.
 
-Through that door the bot can search, read, draft, and ask to send.
-It cannot download attachments, trash mail, or delete anything unless
-you add that tool yourself. Sending still stops for the same approval
-prompt on the Mac screen, and the prompt names the real recipients.
-A remote caller cannot skip that prompt, pre-approve it, or loosen
-the rules.
+Through that door the bot can search, read, draft, download an
+attachment, move mail to Trash, and ask to send. Trash here means
+the recoverable Trash folder, not a permanent delete. It cannot
+empty Trash, delete a draft, or permanently delete a message unless
+you add that tool, and a permanent delete stays denied by policy
+even then. Downloading, trashing, and sending still stop for the
+same approval prompt on the Mac screen. A send prompt names the real
+recipients. A remote caller cannot skip a prompt, pre-approve it, or
+loosen the rules. Trashing a message that is already in Trash is
+refused and does not touch Proton.
 
 Reading does not ask for Touch ID on every call. A bot that keeps
 polling would hold the idle timer open forever, so the remote door
 also has a hard limit: 8 hours after the last Touch ID, the next
-remote call asks again, even if the bot never went quiet. Turn on
-macOS screen lock before you open the door. Walking away then locks
-the session as well.
+remote call asks again, even if the bot never went quiet. You are
+leaving macOS screen lock off. That is an accepted risk. Walking
+away does not lock the session by itself. The 8-hour clock and the
+Tailscale admin console are the backstops. `protonmcp doctor` warns
+when screen lock is off. It does not block.
 
 The token you paste lives in Grok Bot's connector settings, so that
 account is part of the trust boundary. Turn on a passkey or 2FA
@@ -50,11 +57,11 @@ that mail.
 
 ## Owner decisions
 
-Pending. Until you pick, implement the recommendation on each line.
+Decided 16 Nov 2026. Implement these values.
 
-- (a) Pending. Require macOS screen lock to be on before `protonmcp http enable` will turn the listener on. Recommended: yes.
-- (b) Pending. Run Tailscale Funnel only while a bot needs it, and turn it off after, rather than leaving it up. Recommended: on-demand.
-- (c) Pending. Default remote tools are search, read, draft, and send, excluding attachment download, trash, delete, and draft delete unless you add them. Recommended: that default.
+- (a) Decided. macOS screen lock stays off. Accepted risk, not a precondition. The 8-hour HTTP unlock clock and the Tailscale off-site kill switch are the backstops. `protonmcp doctor` and turn-on warn when screen lock is off, and they do not block.
+- (b) Decided. Tailscale Funnel stays always on. Accepted risk: a permanent public endpoint and scanner traffic. Token auth, the auth-failure limit, the per-minute and daily caps, and the audit log are the controls.
+- (c) Decided. Default remote tools are search, read, draft, send, `mail_download_attachment`, and `mail_trash` (move to Trash, recoverable). Permanent delete, empty Trash, and `mail_draft_delete` stay excluded unless you add them. The remote path refuses `mail_trash` when the message is already in Trash.
 
 ## 2. Design
 
@@ -156,6 +163,8 @@ max_unlock_hours: 8           # wall clock since last Touch ID, for HTTP only; 0
 #   - mail_reply
 #   - mail_reply_all
 #   - mail_forward
+#   - mail_download_attachment
+#   - mail_trash
 ```
 
 You add the tunnel's public hostname to `allowed_hosts` when you
@@ -195,28 +204,43 @@ It does not widen.
   tool, list the default names plus that tool. Deleting a line
   narrows further.
 
-Built-in default (search, read, draft, send):
+Built-in default (search, read, draft, send, attachment download,
+recoverable trash):
 
 `account_whoami`, `mail_list`, `mail_search`, `mail_read`,
 `mail_read_thread`, `mail_list_attachments`, `mail_sync`,
 `labels_list`, `folders_list`, `calendar_list`, `calendar_events`,
 `calendar_read_event`, `mail_draft_list`, `mail_draft_create`,
 `mail_draft_update`, `mail_send`, `mail_send_draft`, `mail_reply`,
-`mail_reply_all`, `mail_forward`.
+`mail_reply_all`, `mail_forward`, `mail_download_attachment`,
+`mail_trash`.
 
-Off the remote door unless you add them: `mail_download_attachment`,
-`mail_save_attachment`, `mail_trash`, `mail_draft_delete`,
-`labels_delete`, `folders_delete`, `mail_move`, `mail_label`,
-`mail_mark_read`, `mail_mark_unread`, and the label and folder
-create/update tools. `mail_delete_permanent` stays denied by policy
-even if listed.
+Off the remote door unless you add them: `mail_save_attachment`,
+`mail_draft_delete`, `labels_delete`, `folders_delete`, `mail_move`,
+`mail_label`, `mail_mark_read`, `mail_mark_unread`, and the label
+and folder create/update tools. There is no empty-Trash tool. If
+one is added later, it stays off this list and `deny` in policy.
+`mail_delete_permanent` stays denied by policy even if listed.
+`mail_draft_delete` stays off even though today's handler only
+applies the Trash label.
 
-The reason is prompt injection. Mail the bot reads is untrusted, and
-a hostile message can tell the bot to trash, delete, or download an
-attachment. Those tools are not on the remote list, so the message
-cannot drive them. Sends stay on the list and still require Touch ID
-with the real recipients. Draft create and update have no external
-effect; draft delete does not, so it stays off.
+`mail_trash` on the remote path is move-to-Trash only. Today's
+handler calls `LabelMessages` with the Trash label and does not call
+`DeleteMessage`. The HTTP path still refuses, before the approval
+cache and before the handler, when the mirror shows the message is
+already in Trash, or when the mirror has no row to decide. That
+refusal makes no Proton call. A later change that permanently
+deleted on a second trash cannot be reached over HTTP. The Unix
+socket does not gain this extra refusal.
+
+The reason the destructive tools stay off is prompt injection. Mail
+the bot reads is untrusted, and a hostile message can tell the bot
+to delete a draft or destroy a message. Those tools are not on the
+remote list. Download and recoverable trash are on the list and
+still require Touch ID (`ttl` 5 minutes, cache key includes
+transport). Sends stay on the list and still require Touch ID with
+the real recipients, `ttl` 0. Draft create and update have no
+external effect.
 
 ### Auth
 
@@ -249,12 +273,11 @@ Commands, all local:
 
 - `protonmcp http enable` / `http disable` — write `enabled` and
   signal the daemon. Enable refuses to start the listener if the
-  Keychain item is absent. It also refuses, while decision (a) is
-  the recommendation, when a best-effort read of
-  `com.apple.screensaver` `askForPassword` is not `1`. The check is
-  not a runtime guarantee; screen lock can be turned off later. The
-  error text names the precondition. There is no flag that skips it
-  while (a) stands.
+  Keychain item is absent. It does not refuse when screen lock is
+  off. A best-effort read of `com.apple.screensaver`
+  `askForPassword` that is not `1` prints a warning and still
+  enables. `protonmcp doctor` prints the same warning. Neither
+  blocks. Screen lock off is the accepted risk in decision (a).
 - `protonmcp http token rotate` — replace the 32 bytes, copy the new
   token to the clipboard, and clear the clipboard about 60 seconds
   later if it still holds that token. Do not write it to stdout,
@@ -390,10 +413,11 @@ raise any policy cap:
   `account_whoami`, `mail_list`, `mail_search`, `mail_read`,
   `mail_read_thread`, `mail_list_attachments`, `mail_draft_list`,
   `labels_list`, `folders_list`, `calendar_list`, `calendar_events`,
-  `calendar_read_event`. `mail_sync`, drafts, and sends do not
-  consume it. Over the cap the call is `outcome=denied`, the handler
-  does not run, and the Unix socket is unaffected. `0` in the file
-  means the default, not unlimited.
+  `calendar_read_event`, `mail_download_attachment`. `mail_sync`,
+  drafts, sends, and `mail_trash` do not consume it. Over the cap
+  the call is `outcome=denied`, the handler does not run, and the
+  Unix socket is unaffected. `0` in the file means the default, not
+  unlimited.
 - Failed auth: 10 per minute, then `429`, one bucket for the whole
   listener. A scanner must not be able to hold a Touch ID dialog
   open. The same bucket locks the real bot out for the rest of the
@@ -415,7 +439,7 @@ raise any policy cap:
 | Cut off the network from the Mac but keep the token | `protonmcp http disable`, and turn Funnel off | Listener closes. Local socket still works. |
 | Invalidate the secret, listener may stay up | `protonmcp http token revoke` | Keychain item deleted. Further HTTP requests are `401`. Sessions dropped. The copy in Grok Bot's connector dies with it. |
 | Replace a token you pasted into a bot | `protonmcp http token rotate` | New 32 bytes on the clipboard for about 60 seconds, old value dead on the next request. Update the bot's header. |
-| Pause without deleting | `protonmcp http disable` | Nothing is listening. `http enable` needs the token to still be there, and screen lock on. |
+| Pause without deleting | `protonmcp http disable` | Nothing is listening. `http enable` needs the token to still be there. Screen lock off does not block it. |
 
 Use the Tailscale admin console when you cannot reach the Mac. That
 is the off-site kill switch for the recommended tunnel. Disabling
@@ -446,6 +470,7 @@ still record the outcome.
 | Screen re-locks during the prompt | `resolveLock` sees the new lock | `daemon re-locked (<reason>) before the call could run; retry` | Not sent |
 | Prompt tool while another prompt is up | Second helper is not started | Tool error that a prompt is already waiting | Not sent |
 | Tool not on `remote_tools` | No prompt | Tool error, audit `denied` | Unchanged |
+| `mail_trash` and the message is already in Trash, or the mirror cannot say | No prompt, no Proton call | Tool error, audit `denied` | Unchanged |
 | Daily read cap exceeded | No prompt | Tool error, audit `denied` | Not read by this call |
 
 A timeout or a cancel is audit `outcome=denied` when the call had
@@ -458,22 +483,25 @@ handler.
 
 ### Turn-on steps
 
-1. Turn on macOS screen lock so the screen asks for a password.
-   Decision (a), recommended required. `http enable` checks it.
+1. Leave macOS screen lock off. That is decision (a). `protonmcp
+   doctor` and `http enable` warn. They do not block. The backstops
+   are the 8-hour HTTP unlock clock and the Tailscale admin console.
 2. On the Grok Bot account, turn on a passkey or 2FA. The token will
    live in that account's connector settings.
 3. `protonmcp http token rotate`. The token is on the clipboard for
    about 60 seconds. Paste it into the connector header
    `Authorization: Bearer <token>`.
-4. `protonmcp http enable`. Refuses without a token, and refuses
-   without screen lock while (a) stands.
-5. When a bot needs the door, start Tailscale Funnel to
-   `http://127.0.0.1:4765` and add that hostname to `allowed_hosts`.
-   Decision (b), recommended on-demand: turn Funnel off when you are
-   done, from the Mac or from the Tailscale admin console.
-6. Leave `remote_tools` unset unless you have decided (c) differently
-   or you mean to add a tool. Adding `mail_trash` means listing the
-   default names plus `mail_trash`.
+4. `protonmcp http enable`. Refuses without a token. Warns if screen
+   lock is off, and still enables.
+5. Start Tailscale Funnel to `http://127.0.0.1:4765` and leave it on.
+   That is decision (b). Add the hostname to `allowed_hosts`. The
+   public name stays up, so scanner traffic is expected. The kill
+   switch, when you need it, is the Tailscale admin console: disable
+   Funnel, or disable the node.
+6. Leave `remote_tools` unset. The default includes
+   `mail_download_attachment` and `mail_trash`. Adding
+   `mail_draft_delete` means listing the default names plus that
+   tool. Listing `mail_delete_permanent` does not enable it.
 
 ## 3. Tunnel
 
@@ -506,9 +534,11 @@ mode that serves files from disk.
 - **A Google front end (Cloud Run, Identity-Aware Proxy, and
   similar).** Ruled out.
 
-Use Tailscale Funnel, on demand (decision (b)). It adds no second
-machine, it does not hand plaintext to the relay, and it is not
-Google. `tailscaled` on the Mac does see plaintext, because it
+Use Tailscale Funnel, and leave it on (decision (b)). That is a
+permanent public endpoint. Scanners will hit it. The controls are
+the bearer token, the auth-failure limit, the per-minute and daily
+caps, and the audit log. Funnel adds no second machine, it does not
+hand plaintext to the relay, and it is not Google. `tailscaled` on the Mac does see plaintext, because it
 terminates TLS before proxying to localhost; that process is inside
 the trust boundary `docs/security.md` already accepts for code
 running on your Mac. Check Certificate Transparency if you want to
@@ -534,8 +564,10 @@ parts into `docs/security.md` when the code exists.
   are. This plan does not touch SRP, 2FA, or `go-proton-api`.
 - Writes stay default-deny plus a Touch ID prompt that shows the
   literal recipients. Sends stay `ttl: 0`.
-- Screen lock, sleep, and idle lock still drop the in-memory
-  session. A screen unlock still does not unlock the daemon.
+- Sleep and idle lock still drop the in-memory session when they
+  fire. A screen unlock still does not unlock the daemon. Screen
+  lock itself is off by owner decision, so it will not be the thing
+  that fires.
 - The sealed `store.db` still does nothing for someone holding the
   Keychain, and nothing for a process running as you. It also does
   not cover tool results after they leave the daemon.
@@ -584,16 +616,20 @@ parts into `docs/security.md` when the code exists.
    `mail_draft_delete`, `mail_download_attachment` are 5 minutes).
    A per-PID rate bucket would give HTTP its own copy of a cap you
    thought was global. Mitigations: cache key includes transport
-   and label; rate buckets are per tool. Those tools are also off
-   the default remote allowlist, which is a second brake, not a
-   substitute for the cache key.
+   and label; rate buckets are per tool. `mail_move`,
+   `mail_label`, and `mail_draft_delete` stay off the default
+   remote list. `mail_trash` and `mail_download_attachment` are on
+   it, so the cache key is what stops a local approval covering
+   them. The list is not a substitute for the cache key.
 6. **Prompt injection from mail the bot reads.** A hostile message
    can instruct the bot to trash, delete, download an attachment,
-   or send. Mitigation for the first three: they are not on
-   `remote_tools` unless you add them, and adding them still cannot
-   beat a policy `deny`. Mitigation for send: Touch ID showing the
-   real recipients, `ttl: 0`. The allowlist is why the default is
-   narrower than "file and delete".
+   or send. Download and recoverable trash are on the default list
+   and still require Touch ID. A second trash, of a message already
+   in Trash, is refused before any Proton call. Permanent delete,
+   empty Trash, and `mail_draft_delete` are not on the list, and
+   adding a name cannot beat a policy `deny`. Sends require Touch
+   ID showing the real recipients, `ttl` 0. Filing stays off the
+   default list.
 7. **Prompt fatigue from the network.** A token holder, or a
    hostile message steering the bot, can ask for unlock and send
    dialogs while you are not in the Claude window. The sensor still
@@ -602,11 +638,13 @@ parts into `docs/security.md` when the code exists.
    approval dialog at a time; auth failure limit so strangers
    without the token cannot raise dialogs; the dialog says
    `Requested by: http:<label>`.
-8. **The public name is guessable enough to be scanned.** Funnel
-   publishes DNS. Unauthenticated requests get an empty `401` and
-   hit the failure limit. The hostname is not the secret. The
-   shared failure bucket will also `429` the real bot for the rest
-   of that minute. Accepted.
+8. **The public name stays up.** Decision (b) leaves Funnel always
+   on, so the endpoint is permanent and scanners will hit it. That
+   is accepted. Unauthenticated requests get an empty `401` and hit
+   the failure limit. The hostname is not the secret. A live token
+   still has to pass the per-minute cap, the daily read cap, the
+   allowlist, and the audit log. The shared failure bucket will
+   also `429` the real bot for the rest of that minute. Accepted.
 9. **A tunnel that terminates TLS in the wrong place reads
    everything.** Cloudflare Tunnel and ngrok can see the token and
    the mail. That is why section 3 rejects them. A mis-set Funnel
@@ -624,16 +662,20 @@ parts into `docs/security.md` when the code exists.
     working if you disable HTTP. Funnel also has its own bandwidth
     cap. Disabling Funnel from the admin console stops the flood
     without touching the daemon.
-12. **Idle lock vs a polling bot.** Successful tool calls bump
-    activity, so a bot that keeps reading holds the idle timer off.
-    That is why HTTP has a wall-clock stamp idle cannot move.
-    Screen lock and sleep still lock the whole daemon, which is why
-    screen lock is a turn-on precondition and not only a wish.
+12. **Screen lock is off, and a polling bot holds idle open.**
+    Successful tool calls bump activity, so a bot that keeps reading
+    holds the idle timer off. Screen lock will not fire, because
+    decision (a) leaves it off. That is an accepted risk. Sleep
+    still locks the daemon. The stated backstops are the HTTP
+    wall-clock stamp, which idle cannot move, and the Tailscale
+    admin console. `protonmcp doctor` warns. It does not block.
 
 `docs/security.md` should gain, when this ships: the HTTP listener
 under Defended (loopback, bearer, allowlist that only narrows,
-absolute unlock lifetime), the read-via-token risk, the Grok account
-as a trust boundary, the Tailscale admin-console kill switch, the
+absolute unlock lifetime, remote trash that refuses a message
+already in Trash), the read-via-token risk, the Grok account as a
+trust boundary, the Tailscale admin-console kill switch, the
+accepted risks of screen lock off and an always-on Funnel, the
 accepted auth-failure lockout, and a line that the mirror seal does
 not cover bot-visible mail text.
 
@@ -666,9 +708,10 @@ notification tests use fakes, not the real pasteboard.
   fake pasteboard and do not write stdout. A helper that exits 1
   leaves the pasteboard untouched. The clear runs only when the
   pasteboard still holds the token after about 60 seconds.
-- **Screen lock precondition.** With the screensaver check faked
-  off, `http enable` does not write `enabled: true`. With it faked
-  on, and a token present, it does.
+- **Screen lock warning.** With the screensaver check faked off
+  and a token present, `http enable` still writes `enabled: true`
+  and the output warns. `doctor` warns. Neither refuses. With the
+  check faked on, there is no screen-lock warning.
 - **Protocol.** `initialize` returns `2025-06-18` and a session id.
   `tools/call` without the initialized notification is an error.
   GET and OPTIONS are `405` and set no CORS header. A bad
@@ -681,11 +724,16 @@ notification tests use fakes, not the real pasteboard.
   helper, even if listed in `remote_tools`. A listed `prompt` tool
   does. No header or argument flips the decision. A dummy
   send-shaped tool with `ttl: 0` calls the helper on every request.
-  With the default list, HTTP calls to `mail_download_attachment`,
-  `mail_trash`, and `mail_draft_delete` are denied and do not start
-  the helper; the same calls on the Unix socket still follow
-  policy. Adding `mail_trash` to the list makes the HTTP call reach
-  the prompt. `*` is a bad file and does not enable the listener.
+  With the default list, HTTP `mail_download_attachment` and
+  `mail_trash` of a message the mirror says is not in Trash reach
+  the prompt. HTTP `mail_draft_delete` and `mail_delete_permanent`
+  are denied and do not start the helper. The same calls on the
+  Unix socket still follow policy. `mail_trash` over HTTP, when the
+  mirror says the message is already in Trash or has no row, is
+  denied before the approval cache and before the handler: no
+  helper, no `LabelMessages`, no `DeleteMessage`. A Unix
+  `mail_trash` of that same message still follows today's handler.
+  `*` is a bad file and does not enable the listener.
 - **Cache and rate.** An approval recorded for `transport=unix`
   does not hit for `transport=http` with the same tool, PID, and
   args. Two callers share one per-tool rate bucket; the second
@@ -731,8 +779,8 @@ notification tests use fakes, not the real pasteboard.
 Do these in order. Each is one PR. Do not open the issues from this
 file until you mean to build them. 1–3 leave the listener off, so
 merging them does not expose a mailbox. Do not turn the tunnel on
-until 4 has updated `docs/security.md`. While the owner decisions
-above are pending, implement the recommendation on each line.
+until 4 has updated `docs/security.md`. Implement the decided
+values in the Owner decisions section.
 
 ### 1. Record transport and caller, and stop cross-caller reuse
 
@@ -770,10 +818,13 @@ Constant-time compare helper. CLI subcommands from section 2
 (`enable`, `disable`, `status`, `token rotate`, `token revoke`,
 `token show`). `http.yaml` read and written mode `0600`, including
 `max_unlock_hours`, `max_remote_reads_per_day`, and omitted
-`remote_tools` meaning the default list. Enable refuses when the
-item is absent, and refuses when the screensaver check is off
-(decision (a)). `token show` and `token rotate` copy to a pasteboard
-interface and schedule a compare-and-clear at about 60 seconds.
+`remote_tools` meaning the default list, which includes
+`mail_download_attachment` and `mail_trash` and excludes
+`mail_draft_delete` and `mail_delete_permanent`. Enable refuses
+when the item is absent. When the screensaver check is off it
+warns and still writes `enabled: true` (decision (a)). `token show`
+and `token rotate` copy to a pasteboard interface and schedule a
+compare-and-clear at about 60 seconds.
 They do not write the secret to stdout. Decline copies nothing.
 Rotate and revoke do not take the secret on argv. Logout stays on
 `keystore.Delete` and must not remove the new item.
@@ -782,8 +833,10 @@ Files: `internal/keystore/`, `cmd/protonmcp/main.go`, a new
 `cmd/protonmcp/http.go`, tests with a fake pasteboard.
 
 **Acceptance.** The Keychain and screen-lock bullets in section 5.
-Status output has no secret. The fake pasteboard receives the token
-and is cleared only while it still holds it. A non-macOS run of
+Enable with screen lock faked off still enables, and the warning
+is present. Status output has no secret. The fake pasteboard
+receives the token and is cleared only while it still holds it. A
+non-macOS run of
 show/rotate returns an error and prints nothing. Still no TCP
 listener.
 
@@ -799,13 +852,20 @@ session and pass it as `claimed_client` on later tool audits. Apply
 the HTTP request limit, the shared auth-failure limit, the daily
 remote read cap, the two-request cap, and the single global approval
 helper. Enforce `remote_tools` inside the middleware after `Decide`:
-default list as in section 2, Unix path ignores it, a listed `deny`
-stays denied. Enforce `max_unlock_hours` as a wall-clock stamp that
-idle bumps do not move, prompting Touch ID for HTTP only. SIGHUP
+default list as in section 2, including `mail_download_attachment`
+and `mail_trash`, Unix path ignores it, a listed `deny` stays
+denied. On HTTP, `mail_trash` refuses before the approval cache
+when the message is already in Trash or the mirror cannot say, and
+that path calls neither `LabelMessages` nor `DeleteMessage`.
+`mail_draft_delete` and any permanent-delete or empty-Trash tool
+stay off the default list. Enforce `max_unlock_hours` as a
+wall-clock stamp that idle bumps do not move, prompting Touch ID
+for HTTP only. SIGHUP
 re-reads `http.yaml` and starts or stops the listener. Each request
 loads the token from the Keychain. `protonmcp doctor` gains a line
-for HTTP on/off and whether a token exists, never the token.
-`protonmcp http activity` prints the counts from section 2.
+for HTTP on/off, whether a token exists, and a warning when screen
+lock is off. Never the token. The warning does not fail the doctor
+run. `protonmcp http activity` prints the counts from section 2.
 A daily `osascript` notification posts counts only, and skips a day
 with no remote calls. Update the `trustguard.go` comment. Add the
 new package to `.github/CODEOWNERS` next to `internal/mcp/`.
@@ -822,8 +882,10 @@ daily-cap, auth-failure lockout, lock, timeout, idle, audit,
 activity, notification, and dialog bullets in section 5. Disabled
 config opens no port. Wrong token does not run a tool and does not
 start the helper. A polling sequence does not extend the 8-hour
-stamp. Unix socket tests still pass, including a tool the remote
-list excludes.
+stamp. A default-list `mail_trash` of a message already in Trash
+does not call Proton. Unix socket tests still pass, including
+`mail_draft_delete` and a `mail_trash` of a message already in
+Trash, which keep today's local behavior.
 
 ### 4. Document the door in the security model
 
@@ -832,20 +894,25 @@ delta in section 4, including the absolute unlock lifetime, the
 allowlist and the prompt-injection reason, the Grok Bot account as
 a trust boundary with passkey or 2FA required, the Tailscale admin
 console (disable Funnel, or disable the node) as the off-site kill
-switch, the shared auth-failure lockout as accepted, and the daily
-read cap. Update `docs/configuration.md`, `docs/cli-reference.md`,
-and `docs/architecture.md` so they no longer say the daemon never
+switch, the shared auth-failure lockout as accepted, the daily
+read cap, screen lock left off as an accepted risk with a doctor
+warning, and always-on Funnel as an accepted risk controlled by
+the token, the auth-failure limit, the caps, and the audit log.
+Say that remote `mail_trash` is recoverable only and refuses a
+message already in Trash, and that permanent delete and
+`mail_draft_delete` stay off the remote list. Update
+`docs/configuration.md`, `docs/cli-reference.md`, and
+`docs/architecture.md` so they no longer say the daemon never
 listens on a network port: it listens on loopback only when this is
-enabled, and the socket is unchanged. Include the turn-on steps,
-with screen lock as a precondition and Funnel on-demand. Adjust the
-README "never a network port" line the same way. Do not weaken the
-write-approval or lock wording. Leave the pending owner decisions
-in this plan; the shipped docs describe the recommendation that
-was implemented, and they do not mark those lines decided.
+enabled, and the socket is unchanged. Include the turn-on steps.
+Adjust the README "never a network port" line the same way. Do not
+weaken the write-approval or lock wording. The owner decisions are
+decided; the shipped docs state those values.
 
 **Acceptance.** A reader of `docs/security.md` can see the new read
-risk, the 8-hour stamp, the tunnel-termination risk, the off-site
-kill switch, and the Grok account boundary without opening this
-plan. The commands in section 2 match the CLI reference, including
-clipboard show/rotate and `http activity`. No code change beyond
-comments that those docs require.
+risk, the 8-hour stamp, screen lock off and always-on Funnel as
+accepted risks, the tunnel-termination risk, the off-site kill
+switch, the remote trash refusal, and the Grok account boundary
+without opening this plan. The commands in section 2 match the CLI
+reference, including clipboard show/rotate and `http activity`. No
+code change beyond comments that those docs require.
