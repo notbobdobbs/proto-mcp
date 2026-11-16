@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -133,17 +132,17 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 		started        = time.Now()
 	)
 
-	// SECURITY D20 — per-connection caller takes precedence over
-	// the process-wide Resolver. The daemon's accept loop stashes
-	// the peer's PID/UID/binary via caller.WithCaller(ctx, peer)
-	// after LOCAL_PEERCRED / LOCAL_PEERPID lookups, so each
-	// connection's audit row records the real connecting client
-	// rather than the daemon's own PID.
+	// SECURITY D20 — a caller stashed on the context is
+	// authoritative, including when PID is 0. The daemon's accept
+	// loop stashes the socket peer (transport unix). The HTTP door
+	// stashes a caller with PID 0, transport http, and a label.
+	// Treating PID 0 as absent used to fall through to the
+	// process-wide Resolver and audit that call as the daemon's
+	// parent (launchd).
 	//
-	// Resolver remains as the fallback for serve-stdio, where
-	// there's exactly one parent (the spawning Claude client)
-	// and the process-lifetime cache is the right semantics.
-	if c := caller.FromContext(ctx); c.PID != 0 {
+	// Resolver remains the fallback only when no caller was
+	// stashed: serve-stdio, where the parent is the client.
+	if c, ok := caller.FromContext(ctx); ok {
 		callerInfo = c
 	} else if m.resolver != nil {
 		callerInfo = m.resolver.Resolve()
@@ -240,7 +239,11 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 	// rate → recipients → broker → handler.
 	if pol != nil && pol.RateLimit != "" {
 		m.ensureRate()
-		key := t.Name + "|" + strconv.Itoa(callerInfo.PID)
+		// One bucket per tool. A per-PID key gave every new process
+		// — and an HTTP caller, whose PID is 0 — its own copy of a
+		// cap that was meant to be global. Old tool|pid rows in
+		// rate_limit_state are left behind and are not read.
+		key := t.Name
 		if ok, reason := m.rate.Allow(key, pol.RateLimit); !ok {
 			outcome = audit.OutcomeDenied
 			errMsg = reason

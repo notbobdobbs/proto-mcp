@@ -50,14 +50,19 @@ func (m *jsonlMirror) Close() error { return m.w.Close() }
 //
 // Now each line includes tool / caller_binary / caller_pid /
 // policy_decision / args_json (the redactor's output, so it's
-// already body-as-sha256 and password-as-[REDACTED]). Same line-
-// length budget for `tail -f`.
+// already body-as-sha256 and password-as-[REDACTED]), plus the
+// door (transport), the configured caller label, and the
+// untrusted initialize client name. Same line-length budget for
+// `tail -f`.
 type jsonlEntry struct {
 	ID             int64           `json:"id"`
 	CompletedAt    time.Time       `json:"completed_at"`
 	Tool           string          `json:"tool"`
 	CallerPID      int64           `json:"caller_pid,omitempty"`
 	CallerBinary   string          `json:"caller_binary,omitempty"`
+	Transport      string          `json:"transport"`
+	CallerLabel    string          `json:"caller_label"`
+	ClaimedClient  string          `json:"claimed_client"`
 	PolicyDecision string          `json:"policy_decision,omitempty"`
 	Outcome        string          `json:"outcome"`
 	ApprovalSource string          `json:"approval_source,omitempty"`
@@ -76,6 +81,9 @@ func (m *jsonlMirror) WriteCompleted(_ context.Context, id int64, outcome, appro
 		Tool:           row.Tool,
 		CallerPID:      row.CallerPID,
 		CallerBinary:   row.CallerBinary,
+		Transport:      row.Transport,
+		CallerLabel:    row.CallerLabel,
+		ClaimedClient:  row.ClaimedClient,
 		PolicyDecision: row.PolicyDecision,
 		Outcome:        outcome,
 		ApprovalSource: approvalSource,

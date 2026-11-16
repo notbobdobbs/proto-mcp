@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"sync"
 	"time"
+
+	"github.com/just-an-oldsalt/proto-mcp/internal/caller"
 )
 
 // cache stores per-(tool, pid, args) approval entries with an
@@ -65,17 +67,29 @@ func (c *cache) purge() int {
 	return n
 }
 
-// cacheKey computes sha256(tool || pid || args). PID is included so
-// concurrent Claude Desktop sessions (Phase 6 multi-process scenario)
-// can't piggyback on each other's approvals. args is included so
-// changing the recipient list invalidates a cached approval — the
-// safe answer for write tools.
-func cacheKey(tool string, pid int, args []byte) string {
+// cacheKey computes sha256 over the tool, the caller's pid,
+// transport, and label, and the args. Each field is length-prefixed
+// so values cannot slide into each other ("ab"+"c" is not "a"+"bc").
+//
+// PID stays in the key so two socket clients cannot share an
+// approval. Transport and label stay in the key so a unix approval
+// is not a hit for HTTP, and two HTTP labels are not a hit for
+// each other. args stays in the key so a different recipient list
+// is a different approval. The cache is in memory only; entries
+// from before this key miss and the user is prompted again.
+func cacheKey(tool string, c caller.Caller, args []byte) string {
 	h := sha256.New()
-	h.Write([]byte(tool))
-	var pidBuf [8]byte
-	binary.LittleEndian.PutUint64(pidBuf[:], uint64(pid))
-	h.Write(pidBuf[:])
-	h.Write(args)
+	var n [8]byte
+	write := func(b []byte) {
+		binary.LittleEndian.PutUint64(n[:], uint64(len(b)))
+		h.Write(n[:])
+		h.Write(b)
+	}
+	write([]byte(tool))
+	binary.LittleEndian.PutUint64(n[:], uint64(c.PID))
+	h.Write(n[:])
+	write([]byte(c.Transport))
+	write([]byte(c.Label))
+	write(args)
 	return hex.EncodeToString(h.Sum(nil))
 }

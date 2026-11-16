@@ -20,7 +20,8 @@ type RateLimitState struct {
 }
 
 // LoadRateLimitState returns every persisted bucket, keyed by the
-// composite (tool|pid) string the in-memory limiter uses.
+// string the in-memory limiter stored. New rows use the tool name.
+// Older rows may still use "tool|pid"; those are left behind.
 // Returns nil + nil if the table is empty.
 func (s *Store) LoadRateLimitState(ctx context.Context) (map[string]RateLimitState, error) {
 	rows, err := s.DB.QueryContext(ctx, `

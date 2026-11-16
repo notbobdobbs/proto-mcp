@@ -239,3 +239,85 @@ func TestJSONLLineIncludesToolAndCaller(t *testing.T) {
 		}
 	}
 }
+
+func TestBeginWritesTransportLabelAndClaimedClient(t *testing.T) {
+	st := openTestStore(t)
+	jpath := filepath.Join(t.TempDir(), "audit.log")
+	w, err := New(st.DB, jpath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	httpID := w.Begin(ctx, &Entry{
+		Caller: caller.Caller{
+			Transport: caller.TransportHTTP,
+			Label:     "remote",
+			PID:       0,
+			UID:       501,
+		},
+		Tool:           "mail_read",
+		ArgsJSON:       json.RawMessage(`{"message_id":"synthetic-1"}`),
+		PolicyDecision: "allow",
+		ClaimedClient:  "synthetic-client",
+	})
+	if httpID == 0 {
+		t.Fatal("http Begin returned 0")
+	}
+	w.Complete(ctx, httpID, OutcomeOK, "policy", "", time.Millisecond)
+
+	unixID := w.Begin(ctx, &Entry{
+		Caller: caller.Caller{
+			Transport: caller.TransportUnix,
+			PID:       42,
+			UID:       501,
+			Binary:    "/synthetic/client",
+		},
+		Tool:           "mail_list",
+		ArgsJSON:       json.RawMessage(`{}`),
+		PolicyDecision: "allow",
+	})
+	if unixID == 0 {
+		t.Fatal("unix Begin returned 0")
+	}
+	w.Complete(ctx, unixID, OutcomeOK, "policy", "", time.Millisecond)
+
+	var transport, label, claimed string
+	var pid int
+	if err := st.DB.QueryRow(`SELECT caller_pid, transport, caller_label, claimed_client FROM audit_log WHERE id = ?`, httpID).
+		Scan(&pid, &transport, &label, &claimed); err != nil {
+		t.Fatal(err)
+	}
+	if pid != 0 || transport != "http" || label != "remote" || claimed != "synthetic-client" {
+		t.Errorf("http row pid=%d transport=%q label=%q claimed=%q", pid, transport, label, claimed)
+	}
+
+	if err := st.DB.QueryRow(`SELECT transport, caller_label, claimed_client FROM audit_log WHERE id = ?`, unixID).
+		Scan(&transport, &label, &claimed); err != nil {
+		t.Fatal(err)
+	}
+	if transport != "unix" || label != "" || claimed != "" {
+		t.Errorf("unix row transport=%q label=%q claimed=%q, want unix and empty claimed client", transport, label, claimed)
+	}
+
+	data, err := os.ReadFile(jpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("jsonl lines = %d, want 2: %s", len(lines), data)
+	}
+	for _, want := range []string{`"transport":"http"`, `"caller_label":"remote"`, `"claimed_client":"synthetic-client"`} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("http jsonl missing %q: %s", want, lines[0])
+		}
+	}
+	if !strings.Contains(lines[1], `"transport":"unix"`) || !strings.Contains(lines[1], `"claimed_client":""`) {
+		t.Errorf("unix jsonl = %s", lines[1])
+	}
+	if strings.Contains(lines[1], "synthetic-client") {
+		t.Errorf("unix jsonl picked up a claimed client: %s", lines[1])
+	}
+}
