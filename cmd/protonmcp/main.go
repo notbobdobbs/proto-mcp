@@ -118,6 +118,8 @@ func main() {
 		err = runSetup(ctx, args)
 	case "doctor":
 		err = runDoctor(ctx, args)
+	case "http":
+		err = runHTTP(ctx, args)
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -216,6 +218,22 @@ Commands:
              acquire the session from the saved Keychain blob. Failure
              (denied biometric, missing Keychain entry) leaves the
              daemon locked; check audit log for the outcome.
+  http       Configure the remote door. The door stays off until you
+             enable it, and this command does not open a port.
+             Subcommands:
+               enable                  Write enabled: true. Refuses when no
+                                       token is stored. Warns if screen lock
+                                       is off, and still enables.
+               disable                 Write enabled: false.
+               status                  Print enabled, listen address, and
+                                       whether a token exists. Never the token.
+               token rotate            Replace the token and copy it to the
+                                       clipboard for about 60 seconds. The
+                                       token is not an argument and is not
+                                       printed.
+               token revoke            Delete the token.
+               token show              Copy the token to the clipboard after
+                                       Touch ID. Decline copies nothing.
   daemon     Manage the launchd LaunchAgent that runs protonmcpd.
              Subcommands:
                install                 Write the plist + bootstrap. Idempotent.

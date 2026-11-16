@@ -22,7 +22,3 @@ func Load() (Live, error) {
 func Exists() (bool, error) {
 	return false, errors.New("keystore: session storage requires the macOS Keychain")
 }
-
-func Delete() error {
-	return errors.New("keystore: session storage requires the macOS Keychain")
-}
