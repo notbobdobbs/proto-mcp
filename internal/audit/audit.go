@@ -144,13 +144,27 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.ClaimedClient,
 	)
 	if err != nil {
-		w.logger.Warn("audit Begin failed; tool call proceeds without audit row",
-			"tool", e.Tool, "err", err.Error())
+		// HTTP must fail closed: a remote call with no audit row is
+		// refused by the middleware. A socket or stdio call still
+		// proceeds, because losing the local tool is worse than a
+		// missing row.
+		if e.Caller.Transport == caller.TransportHTTP {
+			w.logger.Warn("audit Begin failed; HTTP call must not proceed",
+				"tool", e.Tool, "err", err.Error())
+		} else {
+			w.logger.Warn("audit Begin failed; tool call proceeds without audit row",
+				"tool", e.Tool, "err", err.Error())
+		}
 		return 0
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		w.logger.Warn("audit Begin: LastInsertId failed", "tool", e.Tool, "err", err.Error())
+		if e.Caller.Transport == caller.TransportHTTP {
+			w.logger.Warn("audit Begin: LastInsertId failed; HTTP call must not proceed",
+				"tool", e.Tool, "err", err.Error())
+		} else {
+			w.logger.Warn("audit Begin: LastInsertId failed", "tool", e.Tool, "err", err.Error())
+		}
 		return 0
 	}
 	e.ID = id

@@ -196,6 +196,11 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 			ArgsJSON:       redact.JSON(args),
 			PolicyDecision: "",
 		})
+		// A remote call that was not recorded must not run. Begin
+		// returns 0 when the write fails.
+		if auditID == 0 && callerInfo.Transport == caller.TransportHTTP {
+			return ErrorResult("%s refused: the audit log did not record this call", t.Name), nil
+		}
 	}
 
 	defer func() {

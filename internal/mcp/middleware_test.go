@@ -669,3 +669,47 @@ tools:
 		t.Fatalf("bucket key = %#v, want mail_read", persisted.saved)
 	}
 }
+
+func TestMiddlewareHTTPAuditWriteFailureRefusesTheTool(t *testing.T) {
+	w, st := newTestAudit(t)
+	pol := newTestPolicy(t, "{}\n")
+	if err := st.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var httpCalls, unixCalls int
+	srv := New(nil, WithPolicy(pol), WithAudit(w))
+	srv.Register(Tool{
+		Name:        "mail_read",
+		Description: "read",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Handler: func(ctx Context, _ json.RawMessage) (*ToolResult, error) {
+			if ctx.Caller.PID == 0 {
+				httpCalls++
+			} else {
+				unixCalls++
+			}
+			return StructuredResult(map[string]string{"ok": "yes"})
+		},
+	})
+	httpCtx := caller.WithCaller(context.Background(), caller.Caller{
+		Transport: caller.TransportHTTP, Label: "remote", PID: 0, UID: 501,
+	})
+	resps := serveAs(t, srv, httpCtx, toolCallLines("mail_read", `{}`)...)
+	if len(resps) < 2 {
+		t.Fatalf("responses %d", len(resps))
+	}
+	text := resps[1]["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "audit log") {
+		t.Fatalf("HTTP text = %q", text)
+	}
+	if httpCalls != 0 {
+		t.Fatal("HTTP tool ran without an audit row")
+	}
+	unixCtx := caller.WithCaller(context.Background(), caller.Caller{
+		Transport: caller.TransportUnix, PID: 42, UID: 501, Binary: "/synthetic/client",
+	})
+	resps = serveAs(t, srv, unixCtx, toolCallLines("mail_read", `{}`)...)
+	if unixCalls != 1 {
+		t.Fatalf("unix calls = %d, responses %+v", unixCalls, resps)
+	}
+}
