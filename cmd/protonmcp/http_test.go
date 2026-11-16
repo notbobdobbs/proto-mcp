@@ -182,6 +182,51 @@ func TestHTTPDisableRewritesUnparseableFile(t *testing.T) {
 	}
 }
 
+func TestHTTPEnableResetsTodayAuthFailures(t *testing.T) {
+	deps, vault, _, stdout, _ := testDeps(t)
+	tok, err := keystore.GenerateHTTPToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Zero()
+	if err := vault.Save(tok); err != nil {
+		t.Fatal(err)
+	}
+	if err := httpconfig.Save(deps.configPath, httpconfig.Default()); err != nil {
+		t.Fatal(err)
+	}
+	path := httpconfig.AuthStatePath(deps.configPath)
+	for i := 0; i < 3; i++ {
+		if _, err := httpconfig.AddAuthFailure(path, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := httpconfig.MarkAutoDisabled(path, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runHTTPWith(context.Background(), []string{"enable"}, deps); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := httpconfig.Load(deps.configPath)
+	if err != nil || !cfg.Enabled {
+		t.Fatalf("enabled %+v %v", cfg.Enabled, err)
+	}
+	got := httpconfig.ReadAuthDay(path, time.Now())
+	if got.Failures != 0 || !got.AutoDisabled || got.AutoDisabledAt == "" {
+		t.Fatalf("auth day after enable = %+v", got)
+	}
+	if !strings.Contains(stdout.String(), "enabled") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if err := runHTTPWith(context.Background(), []string{"status"}, deps); err != nil {
+		t.Fatal(err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "auth failures today: 0") || !strings.Contains(out, "auto-disabled: "+got.AutoDisabledAt) {
+		t.Fatalf("status = %q", out)
+	}
+}
+
 func TestHTTPEnableDoesNotEchoArguments(t *testing.T) {
 	deps, _, _, _, _ := testDeps(t)
 	secretArg := "not-a-real-token-value"
@@ -505,14 +550,14 @@ func TestTokenShowHelperExitCodes(t *testing.T) {
 func TestDoctorReportsALiveDoorEvenWhenTheFileIsBad(t *testing.T) {
 	_, detail, _ := describeHTTPDoor(httpconfig.Config{}, errors.New("bad"), httpconfig.DoorState{
 		Listening: true, Sessions: 2,
-	}, true)
+	}, true, httpconfig.AuthDay{})
 	if !strings.Contains(detail, "listening") || strings.Contains(detail, "off") {
 		t.Fatalf("live door described as off: %q", detail)
 	}
 	if !strings.Contains(detail, "not usable") || !strings.Contains(detail, "sessions 2") {
 		t.Fatalf("detail = %q", detail)
 	}
-	_, quiet, _ := describeHTTPDoor(httpconfig.Config{Enabled: false}, nil, httpconfig.DoorState{}, false)
+	_, quiet, _ := describeHTTPDoor(httpconfig.Config{Enabled: false}, nil, httpconfig.DoorState{}, false, httpconfig.AuthDay{})
 	if !strings.Contains(quiet, "off") || strings.Contains(quiet, "listening") {
 		t.Fatalf("idle door = %q", quiet)
 	}

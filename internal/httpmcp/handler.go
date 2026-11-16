@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/just-an-oldsalt/proto-mcp/internal/audit"
 	"github.com/just-an-oldsalt/proto-mcp/internal/httpconfig"
 	"github.com/just-an-oldsalt/proto-mcp/internal/keystore"
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
@@ -46,8 +47,14 @@ type Service struct {
 	Now   func() time.Time
 	Clock *UnlockClock
 	Reads *ReadCap
+	// Audit records the auto-disable row. Nil skips that row.
+	Audit *audit.Writer
+	// Notify posts the auto-disable notice. Nil uses OSNotify.
+	// A returned error does not undo the disable.
+	Notify func(string) error
 
 	mu        sync.Mutex
+	failMu    sync.Mutex
 	cfg       httpconfig.Config
 	ln        net.Listener
 	httpSrv   *http.Server
@@ -328,6 +335,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// for every method, including GET and DELETE. The query is not logged.
 	if hasBearerQuery(r) {
 		s.authFails.add(now)
+		s.recordAuthFailure(r.Context(), now)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -350,6 +358,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tok, ok := s.bearer(r)
 	if !ok {
 		s.authFails.add(now)
+		s.recordAuthFailure(r.Context(), now)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}

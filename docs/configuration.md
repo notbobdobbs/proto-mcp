@@ -91,6 +91,7 @@ allowed_origins: []            # empty: every present Origin is rejected
 max_requests_per_minute: 60    # 0 means 60, never unlimited; hard ceiling 600
 max_remote_reads_per_day: 500  # 0 means 500, never unlimited; hard ceiling 5000
 max_unlock_hours: 8            # 0 means 8; allowed 1–24; no unlimited value
+auto_disable_after_auth_failures: 50  # 0 means 50; allowed 1–10000; cannot be turned off
 # remote_tools omitted means the built-in default, not every tool.
 ```
 
@@ -152,10 +153,23 @@ Neither command takes the token as an argument. A Mac is required for
 show and rotate. Rotate signals the daemon before the wait, so old
 HTTP sessions drop. `http status` reads the session count, unlock
 age, and listening flag from the daemon's status file, and only while
-that process is still running. It never prints the token. `doctor`
-says the door is listening whenever that process still has the
-listener open, including when `http.yaml` is not usable. It does not
-say the door is off while the listener is up.
+that process is still running. It also prints today's auth-failure
+count and an auto-disable time from today, when there is one. It
+never prints the token. `doctor` says the door is listening whenever
+that process still has the listener open, including when `http.yaml`
+is not usable. It does not say the door is off while the listener is
+up. It shows the same auth-failure count and auto-disable event.
+
+Failed HTTP sign-ins are counted per local day: a missing bearer, a
+wrong bearer, and any bearer in the query string, including
+`DELETE`. At `auto_disable_after_auth_failures` the daemon writes
+`enabled: false` (mode `0600`, other settings kept when the file
+still parses), closes the listener, and drops HTTP sessions. It
+writes an audit row with the count and not the token, then posts a
+notification. If that notification fails, the door stays off. The
+count resets at local midnight and when you run `protonmcp http
+enable`. The door does not turn itself back on. There is no idle
+lock and no away lock in this counter.
 
 Screen lock left off is an accepted risk. `http enable` and `doctor`
 warn. They do not block, and the warning does not fail `doctor`.

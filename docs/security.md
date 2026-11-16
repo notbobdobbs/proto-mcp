@@ -217,6 +217,16 @@ The socket's peer checks stay; they simply do not apply to HTTP.
   last good config. `http disable` rewrites that file to
   `enabled: false` and the listener closes. SIGHUP re-reads
   `http.yaml` even when the policy file failed to reload.
+- **Repeated auth failures turn the door off for the day.** A bad
+  bearer, a missing bearer, and a bearer in the query string count,
+  including `DELETE`. The default is 50 in a local calendar day.
+  `0` means 50. There is no value that turns the counter off. At the
+  threshold the daemon writes `enabled: false`, closes the listener,
+  drops HTTP sessions, writes an audit row that does not contain the
+  token, and posts a notification. A failed notification leaves the
+  door off. Midnight resets the count and does not turn the door
+  back on. The only re-enable is `protonmcp http enable`, which also
+  zeros today's count. This is not an idle lock.
 - **Prompt injection from mail the bot reads.** A hostile message can
   tell the bot to trash, download, or send. Download and recoverable
   trash are on the default remote list and still require Touch ID.

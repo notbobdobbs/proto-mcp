@@ -158,6 +158,9 @@ func (d httpDeps) enable(args []string) error {
 	if err := httpconfig.Save(d.configPath, cfg); err != nil {
 		return err
 	}
+	if err := httpconfig.ResetAuthFailures(httpconfig.AuthStatePath(d.configPath), time.Now()); err != nil {
+		fmt.Fprintf(d.stderr, "warning: could not reset today's auth-failure count: %v\n", err)
+	}
 	if !d.screenLock() {
 		fmt.Fprintln(d.stderr, screenLockOffWarning)
 	}
@@ -207,8 +210,13 @@ func (d httpDeps) status(args []string) error {
 	} else {
 		enabled = "unreadable"
 	}
-	fmt.Fprintf(d.stdout, "enabled: %s\nlisten: %s\ntoken: %s\nsessions: %d\nunlock age: %s\nlistening: %t\n",
-		enabled, listen, tokenLine, live.Sessions, httpconfig.FormatUnlockAge(live.UnlockUnix, time.Now()), live.Listening)
+	auth := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(d.configPath), time.Now())
+	auto := "none"
+	if auth.AutoDisabled {
+		auto = auth.AutoDisabledAt
+	}
+	fmt.Fprintf(d.stdout, "enabled: %s\nlisten: %s\ntoken: %s\nsessions: %d\nunlock age: %s\nlistening: %t\nauth failures today: %d\nauto-disabled: %s\n",
+		enabled, listen, tokenLine, live.Sessions, httpconfig.FormatUnlockAge(live.UnlockUnix, time.Now()), live.Listening, auth.Failures, auto)
 	return cfgErr
 }
 
@@ -409,33 +417,46 @@ func checkHTTP(r *report) {
 	path := filepath.Join(dir, "http.yaml")
 	live := httpconfig.ReadLiveDoorState(httpconfig.DoorStatePath(path))
 	cfg, cfgErr := httpconfig.Load(path)
-	state, detail, hint := describeHTTPDoor(cfg, cfgErr, live, httpTokenPresent())
+	auth := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(path), time.Now())
+	state, detail, hint := describeHTTPDoor(cfg, cfgErr, live, httpTokenPresent(), auth)
 	r.add("http", state, detail, hint)
 }
 
 // describeHTTPDoor is what doctor and the wording tests share. A live
 // listener is reported as listening even when http.yaml cannot be
 // parsed. It is never described as off while that process still listens.
-func describeHTTPDoor(cfg httpconfig.Config, cfgErr error, live httpconfig.DoorState, tokenPresent bool) (checkState, string, string) {
+func describeHTTPDoor(cfg httpconfig.Config, cfgErr error, live httpconfig.DoorState, tokenPresent bool, auth httpconfig.AuthDay) (checkState, string, string) {
 	token := "token absent"
 	if tokenPresent {
 		token = "token present"
 	}
+	detail := ""
+	var state checkState
+	var hint string
 	if live.Listening {
-		detail := fmt.Sprintf("listening, sessions %d, %s", live.Sessions, token)
+		detail = fmt.Sprintf("listening, sessions %d, %s", live.Sessions, token)
+		state = stateOK
 		if cfgErr != nil {
-			return stateWarn, detail + "; http.yaml is not usable", "fix http.yaml"
+			detail += "; http.yaml is not usable"
+			state = stateWarn
+			hint = "fix http.yaml"
 		}
-		return stateOK, detail, ""
+	} else if cfgErr != nil {
+		detail = "http.yaml is not usable; the door is not listening"
+		state = stateWarn
+		hint = "fix http.yaml"
+	} else if cfg.Enabled {
+		detail = "enabled, not listening, listen " + cfg.Listen + ", " + token
+		state = stateOK
+	} else {
+		detail = "off, " + token
+		state = stateOK
 	}
-	if cfgErr != nil {
-		return stateWarn, "http.yaml is not usable; the door is not listening", "fix http.yaml"
+	detail += fmt.Sprintf(", auth failures today %d", auth.Failures)
+	if auth.AutoDisabled && auth.AutoDisabledAt != "" {
+		detail += ", auto-disabled " + auth.AutoDisabledAt
 	}
-	detail := "off"
-	if cfg.Enabled {
-		detail = "enabled, not listening, listen " + cfg.Listen
-	}
-	return stateOK, detail + ", " + token, ""
+	return state, detail, hint
 }
 
 func checkScreenLock(r *report) {

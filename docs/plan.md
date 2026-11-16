@@ -924,3 +924,42 @@ switch, the remote trash refusal, and the Grok account boundary
 without opening this plan. The commands in section 2 match the CLI
 reference, including clipboard show/rotate and `http activity`. No
 code change beyond comments that those docs require.
+
+### 5. Auto-disable remote access after repeated auth failures
+
+**Scope.** After the door is documented. Count HTTP auth failures
+per local calendar day: a bad bearer, a missing bearer, and any
+bearer in the query string, including `DELETE`. When the count
+reaches `auto_disable_after_auth_failures` in `http.yaml`, turn the
+door off. The default is 50. `0` means that default. The minimum is
+1. There is no value that turns the counter off. A number below 0
+or above the hard ceiling makes the file unusable. The exact
+default and ceiling can be confirmed at review; the code ships 50
+and a ceiling of 10000.
+
+Reaching the count atomically writes `enabled: false` to
+`http.yaml` (mode `0600`, other settings kept when the file still
+parses), closes the listener, and drops HTTP sessions. It writes an
+audit row that names the count and not the token, then posts a
+macOS notification through the existing `OSNotify` path. The
+notification has no token and no caller secret. If the notification
+fails, the door still stays off.
+
+The door does not turn itself back on. Not at midnight, and not
+when the count is reset. The only re-enable is `protonmcp http
+enable`. That command also zeros today's failure count. The count
+resets by itself at local midnight. `http status` and `doctor`
+show today's failure count and an auto-disable event from today.
+
+This is not an idle lock and not an away lock. It does not add a
+daily remote-read notification. The count notification that
+already exists for completed days stays as it is.
+
+**Acceptance.** A threshold of N bad, missing, or query-string
+attempts, including `DELETE`, writes `enabled: false` at mode
+`0600`, and a listener that was open no longer accepts a
+connection. A notification error does not leave the listener up.
+After that, a new local day does not listen again. `protonmcp http
+enable` is what listens again, and it zeros the count. `http
+status` and `doctor` show the count and the event. Unix socket
+behavior is unchanged.

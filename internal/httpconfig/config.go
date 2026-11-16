@@ -23,11 +23,16 @@ const (
 	DefaultMaxRequestsPerMinute = 60
 	DefaultMaxRemoteReadsPerDay = 500
 	DefaultMaxUnlockHours       = 8
+	// DefaultAutoDisableAfterAuthFailures is the day's auth-failure
+	// count that turns the door off. 0 in the file means this value.
+	// There is no setting that disables the counter.
+	DefaultAutoDisableAfterAuthFailures = 50
 
-	maxRequestsPerMinuteCeiling = 600
-	maxRemoteReadsPerDayCeiling = 5000
-	maxUnlockHoursCeiling       = 24
-	maxCallerLabelLen           = 64
+	maxRequestsPerMinuteCeiling     = 600
+	maxRemoteReadsPerDayCeiling     = 5000
+	maxUnlockHoursCeiling           = 24
+	maxAutoDisableAfterAuthFailures = 10000
+	maxCallerLabelLen               = 64
 )
 
 // DefaultRemoteTools is the remote door's tool list when http.yaml
@@ -120,6 +125,9 @@ type Config struct {
 	MaxRequestsPerMinute int
 	MaxRemoteReadsPerDay int
 	MaxUnlockHours       int
+	// AutoDisableAfterAuthFailures is the local-day count of failed
+	// HTTP auths that writes enabled:false. It is never 0.
+	AutoDisableAfterAuthFailures int
 	// RemoteTools is the effective allowlist. It is never "every tool".
 	RemoteTools []string
 	// RemoteToolsSet is true when the file named a non-empty list.
@@ -131,27 +139,29 @@ type Config struct {
 // built-in caps and tool list.
 func Default() Config {
 	return Config{
-		Enabled:              false,
-		Listen:               DefaultListen,
-		CallerLabel:          DefaultCallerLabel,
-		AllowedHosts:         []string{DefaultListen, "localhost:4765"},
-		MaxRequestsPerMinute: DefaultMaxRequestsPerMinute,
-		MaxRemoteReadsPerDay: DefaultMaxRemoteReadsPerDay,
-		MaxUnlockHours:       DefaultMaxUnlockHours,
-		RemoteTools:          append([]string(nil), DefaultRemoteTools...),
+		Enabled:                      false,
+		Listen:                       DefaultListen,
+		CallerLabel:                  DefaultCallerLabel,
+		AllowedHosts:                 []string{DefaultListen, "localhost:4765"},
+		MaxRequestsPerMinute:         DefaultMaxRequestsPerMinute,
+		MaxRemoteReadsPerDay:         DefaultMaxRemoteReadsPerDay,
+		MaxUnlockHours:               DefaultMaxUnlockHours,
+		AutoDisableAfterAuthFailures: DefaultAutoDisableAfterAuthFailures,
+		RemoteTools:                  append([]string(nil), DefaultRemoteTools...),
 	}
 }
 
 type rawFile struct {
-	Enabled              *bool     `yaml:"enabled"`
-	Listen               *string   `yaml:"listen"`
-	CallerLabel          *string   `yaml:"caller_label"`
-	AllowedHosts         *[]string `yaml:"allowed_hosts"`
-	AllowedOrigins       *[]string `yaml:"allowed_origins"`
-	MaxRequestsPerMinute *int      `yaml:"max_requests_per_minute"`
-	MaxRemoteReadsPerDay *int      `yaml:"max_remote_reads_per_day"`
-	MaxUnlockHours       *int      `yaml:"max_unlock_hours"`
-	RemoteTools          *[]string `yaml:"remote_tools"`
+	Enabled                      *bool     `yaml:"enabled"`
+	Listen                       *string   `yaml:"listen"`
+	CallerLabel                  *string   `yaml:"caller_label"`
+	AllowedHosts                 *[]string `yaml:"allowed_hosts"`
+	AllowedOrigins               *[]string `yaml:"allowed_origins"`
+	MaxRequestsPerMinute         *int      `yaml:"max_requests_per_minute"`
+	MaxRemoteReadsPerDay         *int      `yaml:"max_remote_reads_per_day"`
+	MaxUnlockHours               *int      `yaml:"max_unlock_hours"`
+	AutoDisableAfterAuthFailures *int      `yaml:"auto_disable_after_auth_failures"`
+	RemoteTools                  *[]string `yaml:"remote_tools"`
 }
 
 // Parse interprets file bytes. A bad file returns ErrBadFile and a
@@ -197,6 +207,11 @@ func Parse(data []byte) (Config, error) {
 		return Config{}, err
 	}
 	cfg.MaxUnlockHours = hours
+	disableAfter, err := capOrDefault(raw.AutoDisableAfterAuthFailures, DefaultAutoDisableAfterAuthFailures, maxAutoDisableAfterAuthFailures, "auto_disable_after_auth_failures")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AutoDisableAfterAuthFailures = disableAfter
 	tools, set, err := remoteTools(raw.RemoteTools)
 	if err != nil {
 		return Config{}, err
@@ -317,19 +332,35 @@ func WriteDisabled(path string) error {
 	return writeAtomic(path, []byte("enabled: false\n"))
 }
 
+// SetEnabled writes enabled and keeps the other settings when the
+// file still parses. Turning the door off still succeeds when the
+// file does not parse, by replacing it with a minimal disabled file.
+func SetEnabled(path string, enabled bool) error {
+	cfg, err := Load(path)
+	if err != nil {
+		if enabled {
+			return err
+		}
+		return WriteDisabled(path)
+	}
+	cfg.Enabled = enabled
+	return Save(path, cfg)
+}
+
 // Save writes cfg as mode 0600. The directory is created mode 0700.
 // The default tool list is omitted so an absent remote_tools key
 // keeps meaning "the default", not "every tool".
 func Save(path string, cfg Config) error {
 	doc := map[string]any{
-		"enabled":                  cfg.Enabled,
-		"listen":                   cfg.Listen,
-		"caller_label":             cfg.CallerLabel,
-		"allowed_hosts":            cfg.AllowedHosts,
-		"allowed_origins":          cfg.AllowedOrigins,
-		"max_requests_per_minute":  cfg.MaxRequestsPerMinute,
-		"max_remote_reads_per_day": cfg.MaxRemoteReadsPerDay,
-		"max_unlock_hours":         cfg.MaxUnlockHours,
+		"enabled":                          cfg.Enabled,
+		"listen":                           cfg.Listen,
+		"caller_label":                     cfg.CallerLabel,
+		"allowed_hosts":                    cfg.AllowedHosts,
+		"allowed_origins":                  cfg.AllowedOrigins,
+		"max_requests_per_minute":          cfg.MaxRequestsPerMinute,
+		"max_remote_reads_per_day":         cfg.MaxRemoteReadsPerDay,
+		"max_unlock_hours":                 cfg.MaxUnlockHours,
+		"auto_disable_after_auth_failures": cfg.AutoDisableAfterAuthFailures,
 	}
 	if cfg.RemoteToolsSet {
 		doc["remote_tools"] = cfg.RemoteTools
