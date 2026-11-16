@@ -104,6 +104,43 @@ func TestHTTPTokenMatchesRejectsBadTextWithoutComparing(t *testing.T) {
 	}
 }
 
+func TestSaveHTTPTokenDeletesThenAdds(t *testing.T) {
+	var order []string
+	prevDelete, prevAdd := deleteHTTPTokenItem, addHTTPTokenItem
+	t.Cleanup(func() {
+		deleteHTTPTokenItem = prevDelete
+		addHTTPTokenItem = prevAdd
+	})
+	deleteHTTPTokenItem = func(service, account string) error {
+		order = append(order, "delete")
+		if service != Service || account != HTTPTokenAccount {
+			t.Errorf("delete %s %s", service, account)
+		}
+		return nil
+	}
+	addHTTPTokenItem = func(service, account, label string, data []byte) error {
+		order = append(order, "add")
+		if service != Service || account != HTTPTokenAccount || label != HTTPTokenLabel {
+			t.Errorf("add %s %s %s", service, account, label)
+		}
+		if len(data) != HTTPTokenLen {
+			t.Errorf("len %d", len(data))
+		}
+		return nil
+	}
+	tok, err := GenerateHTTPToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Zero()
+	if err := SaveHTTPToken(tok); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 2 || order[0] != "delete" || order[1] != "add" {
+		t.Fatalf("order = %v, want delete then add", order)
+	}
+}
+
 func TestGenerateHTTPTokenIs32Bytes(t *testing.T) {
 	a, err := GenerateHTTPToken()
 	if err != nil {

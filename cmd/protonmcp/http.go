@@ -74,7 +74,10 @@ type httpDeps struct {
 	configPath string
 	stdout     io.Writer
 	stderr     io.Writer
-	after      func(time.Duration, func())
+	// hold is how long the process stays up after copying the token.
+	// Zero means clipboardHold. Tests set a short real wait; they do
+	// not replace the wait with a callback.
+	hold time.Duration
 }
 
 func (d *httpDeps) fill() {
@@ -90,8 +93,8 @@ func (d *httpDeps) fill() {
 	if d.signal == nil {
 		d.signal = signalDaemons
 	}
-	if d.after == nil {
-		d.after = func(wait time.Duration, fn func()) { time.AfterFunc(wait, fn) }
+	if d.hold <= 0 {
+		d.hold = clipboardHold
 	}
 	if d.approve == nil {
 		d.approve = approveTokenShow
@@ -131,7 +134,7 @@ func runHTTPWith(ctx context.Context, args []string, deps httpDeps) error {
 
 func (d httpDeps) enable(args []string) error {
 	if len(args) > 0 {
-		return fmt.Errorf("http enable takes no arguments; got %v", args)
+		return errors.New("http enable takes no arguments")
 	}
 	if d.configPath == "" {
 		return errors.New("http enable: no config path")
@@ -162,17 +165,14 @@ func (d httpDeps) enable(args []string) error {
 
 func (d httpDeps) disable(args []string) error {
 	if len(args) > 0 {
-		return fmt.Errorf("http disable takes no arguments; got %v", args)
+		return errors.New("http disable takes no arguments")
 	}
 	if d.configPath == "" {
 		return errors.New("http disable: no config path")
 	}
-	cfg, err := httpconfig.Load(d.configPath)
-	if err != nil {
-		return err
-	}
-	cfg.Enabled = false
-	if err := httpconfig.Save(d.configPath, cfg); err != nil {
+	// Do not parse the old file. A broken http.yaml must still become
+	// enabled: false so the daemon can close the listener.
+	if err := httpconfig.WriteDisabled(d.configPath); err != nil {
 		return err
 	}
 	if err := d.signal(); err != nil {
@@ -184,21 +184,27 @@ func (d httpDeps) disable(args []string) error {
 
 func (d httpDeps) status(args []string) error {
 	if len(args) > 0 {
-		return fmt.Errorf("http status takes no arguments; got %v", args)
+		return errors.New("http status takes no arguments")
 	}
-	cfg, err := httpconfig.Load(d.configPath)
-	if err != nil {
-		return err
-	}
+	cfg, cfgErr := httpconfig.Load(d.configPath)
 	tokenLine := "absent"
 	tok, err := d.vault.Load()
 	if err == nil && len(tok.Bytes()) == keystore.HTTPTokenLen {
 		tokenLine = "present"
 	}
 	tok.Zero()
-	fmt.Fprintf(d.stdout, "enabled: %t\nlisten: %s\ntoken: %s\nsessions: 0\nunlock age: none\n",
-		cfg.Enabled, cfg.Listen, tokenLine)
-	return nil
+	live := httpconfig.ReadLiveDoorState(httpconfig.DoorStatePath(d.configPath))
+	enabled := "false"
+	listen := ""
+	if cfgErr == nil {
+		enabled = fmt.Sprintf("%t", cfg.Enabled)
+		listen = cfg.Listen
+	} else {
+		enabled = "unreadable"
+	}
+	fmt.Fprintf(d.stdout, "enabled: %s\nlisten: %s\ntoken: %s\nsessions: %d\nunlock age: %s\nlistening: %t\n",
+		enabled, listen, tokenLine, live.Sessions, httpconfig.FormatUnlockAge(live.UnlockUnix, time.Now()), live.Listening)
+	return cfgErr
 }
 
 func (d *httpDeps) token(ctx context.Context, args []string) error {
@@ -207,7 +213,7 @@ func (d *httpDeps) token(ctx context.Context, args []string) error {
 	}
 	switch args[0] {
 	case "rotate":
-		return d.rotate(args[1:])
+		return d.rotate(ctx, args[1:])
 	case "revoke":
 		return d.revoke(args[1:])
 	case "show":
@@ -229,7 +235,7 @@ func (d *httpDeps) needBoard() error {
 	return nil
 }
 
-func (d *httpDeps) rotate(args []string) error {
+func (d *httpDeps) rotate(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		return errors.New("http token rotate takes no arguments and does not accept the token on the command line")
 	}
@@ -244,14 +250,17 @@ func (d *httpDeps) rotate(args []string) error {
 	if err := d.vault.Save(tok); err != nil {
 		return err
 	}
+	if err := d.signal(); err != nil {
+		fmt.Fprintf(d.stderr, "warning: could not signal the daemon: %v\n", err)
+	}
 	text, err := keystore.EncodeHTTPToken(tok.Bytes())
 	if err != nil {
 		return err
 	}
-	if err := d.copyToken(text); err != nil {
+	fmt.Fprintln(d.stdout, "Remote token replaced. It is on the clipboard.")
+	if err := d.copyToken(ctx, text); err != nil {
 		return errors.New("remote token was replaced but the clipboard copy failed")
 	}
-	fmt.Fprintln(d.stdout, "Remote token replaced. It is on the clipboard for about 60 seconds.")
 	return nil
 }
 
@@ -261,6 +270,9 @@ func (d *httpDeps) revoke(args []string) error {
 	}
 	if err := d.vault.Delete(); err != nil {
 		return err
+	}
+	if err := d.signal(); err != nil {
+		fmt.Fprintf(d.stderr, "warning: could not signal the daemon: %v\n", err)
 	}
 	fmt.Fprintln(d.stdout, "Remote token revoked.")
 	return nil
@@ -285,28 +297,63 @@ func (d *httpDeps) show(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := d.copyToken(text); err != nil {
+	fmt.Fprintln(d.stdout, "Remote token copied to the clipboard.")
+	if err := d.copyToken(ctx, text); err != nil {
 		return errors.New("could not copy the remote token to the clipboard")
 	}
-	fmt.Fprintln(d.stdout, "Remote token copied to the clipboard for about 60 seconds.")
 	return nil
 }
 
-func (d *httpDeps) copyToken(text string) error {
+// copyToken writes the token and then blocks until the hold elapses
+// or ctx is cancelled (Ctrl-C). The clear runs in this process. A
+// timer scheduled after return would die when main exits.
+func (d *httpDeps) copyToken(ctx context.Context, text string) error {
 	if err := d.board.Write(text); err != nil {
 		return err
 	}
-	d.after(clipboardHold, func() {
-		cur, err := d.board.Read()
-		if err != nil || len(cur) != len(text) {
-			return
+	hold := d.hold
+	if hold <= 0 {
+		hold = clipboardHold
+	}
+	fmt.Fprintf(d.stderr, "The token is on the clipboard. It will be cleared in %s. Press Ctrl-C to clear it now.\n", hold.Round(time.Second))
+	timer := time.NewTimer(hold)
+	defer timer.Stop()
+	var tick *time.Ticker
+	var tickC <-chan time.Time
+	if hold >= time.Second {
+		tick = time.NewTicker(time.Second)
+		defer tick.Stop()
+		tickC = tick.C
+	}
+	left := hold
+	for {
+		select {
+		case <-ctx.Done():
+			d.clearIfOurs(text)
+			fmt.Fprintln(d.stderr, "Clipboard cleared.")
+			return nil
+		case <-tickC:
+			left -= time.Second
+			if left >= time.Second {
+				fmt.Fprintf(d.stderr, "Clipboard clears in %s.\n", left.Round(time.Second))
+			}
+		case <-timer.C:
+			d.clearIfOurs(text)
+			fmt.Fprintln(d.stderr, "Clipboard cleared.")
+			return nil
 		}
-		if subtle.ConstantTimeCompare([]byte(cur), []byte(text)) != 1 {
-			return
-		}
-		_ = d.board.Clear()
-	})
-	return nil
+	}
+}
+
+func (d *httpDeps) clearIfOurs(text string) {
+	cur, err := d.board.Read()
+	if err != nil || len(cur) != len(text) {
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(cur), []byte(text)) != 1 {
+		return
+	}
+	_ = d.board.Clear()
 }
 
 func checkScreenLock(r *report) {

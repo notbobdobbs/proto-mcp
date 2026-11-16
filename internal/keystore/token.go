@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/secret"
@@ -40,6 +41,37 @@ var ErrHTTPTokenNotFound = errors.New("keystore: no remote token")
 // to prove equal-length tokens are compared that way, and that a
 // different length never reaches it. Not a timing measurement.
 var constantTimeCompare = subtle.ConstantTimeCompare
+
+// deleteHTTPTokenItem and addHTTPTokenItem are the Keychain calls
+// behind SaveHTTPToken. The macOS build replaces them. Save deletes
+// the old item and adds a new one so AccessibleWhenUnlocked and
+// not-synced are set on the new item, not left over from an update.
+var (
+	deleteHTTPTokenItem = func(service, account string) error {
+		return errors.New("keystore: http token requires the macOS Keychain")
+	}
+	addHTTPTokenItem = func(service, account, label string, data []byte) error {
+		return errors.New("keystore: http token requires the macOS Keychain")
+	}
+)
+
+// SaveHTTPToken writes or replaces the remote token. data must be 32
+// bytes. Replacement deletes the old item and adds a new one.
+func SaveHTTPToken(s secret.Secret) error {
+	if len(s.Bytes()) != HTTPTokenLen {
+		return errors.New("keystore: http token has the wrong length")
+	}
+	data := make([]byte, HTTPTokenLen)
+	copy(data, s.Bytes())
+	defer zero(data)
+	if err := deleteHTTPTokenItem(Service, HTTPTokenAccount); err != nil {
+		return fmt.Errorf("keystore: delete http token before replace: %w", err)
+	}
+	if err := addHTTPTokenItem(Service, HTTPTokenAccount, HTTPTokenLabel, data); err != nil {
+		return fmt.Errorf("keystore: save http token: %w", err)
+	}
+	return nil
+}
 
 // GenerateHTTPToken returns 32 random bytes in a Secret. The caller
 // zeros the Secret when finished.

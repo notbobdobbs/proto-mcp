@@ -14,10 +14,6 @@ func LoadHTTPToken() (secret.Secret, error) {
 	return secret.Secret{}, errors.New("keystore: http token requires the macOS Keychain")
 }
 
-func SaveHTTPToken(secret.Secret) error {
-	return errors.New("keystore: http token requires the macOS Keychain")
-}
-
 func DeleteHTTPToken() error {
 	return errors.New("keystore: http token requires the macOS Keychain")
 }

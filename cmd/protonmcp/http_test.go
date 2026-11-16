@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,12 +46,27 @@ func (m *memVault) Delete() error {
 }
 
 type fakeBoard struct {
+	mu    sync.Mutex
 	value string
 }
 
-func (f *fakeBoard) Read() (string, error) { return f.value, nil }
-func (f *fakeBoard) Write(s string) error  { f.value = s; return nil }
-func (f *fakeBoard) Clear() error          { f.value = ""; return nil }
+func (f *fakeBoard) Read() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.value, nil
+}
+func (f *fakeBoard) Write(s string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.value = s
+	return nil
+}
+func (f *fakeBoard) Clear() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.value = ""
+	return nil
+}
 
 func testDeps(t *testing.T) (httpDeps, *memVault, *fakeBoard, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
@@ -67,7 +83,7 @@ func testDeps(t *testing.T) (httpDeps, *memVault, *fakeBoard, *bytes.Buffer, *by
 		stdout:     stdout,
 		stderr:     stderr,
 		approve:    func(context.Context) error { return nil },
-		after:      func(time.Duration, func()) {},
+		hold:       200 * time.Millisecond,
 	}, vault, board, stdout, stderr
 }
 
@@ -141,6 +157,84 @@ func TestHTTPEnableRefusesWithoutToken(t *testing.T) {
 	}
 }
 
+func TestHTTPDisableRewritesUnparseableFile(t *testing.T) {
+	deps, _, _, stdout, _ := testDeps(t)
+	if err := os.WriteFile(deps.configPath, []byte("enabled: true\nremote_tools: [*\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var signaled int
+	deps.signal = func() error { signaled++; return nil }
+	if err := runHTTPWith(context.Background(), []string{"disable"}, deps); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := httpconfig.Load(deps.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Enabled {
+		t.Fatal("disable left the door enabled")
+	}
+	if signaled != 1 {
+		t.Fatalf("signals = %d", signaled)
+	}
+	if !strings.Contains(stdout.String(), "disabled") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestHTTPEnableDoesNotEchoArguments(t *testing.T) {
+	deps, _, _, _, _ := testDeps(t)
+	secretArg := "not-a-real-token-value"
+	err := runHTTPWith(context.Background(), []string{"enable", secretArg}, deps)
+	if err == nil || strings.Contains(err.Error(), secretArg) {
+		t.Fatalf("enable echoed its argument: %v", err)
+	}
+}
+
+func TestHTTPStatusReadsLiveDoorState(t *testing.T) {
+	deps, vault, _, stdout, _ := testDeps(t)
+	tok, err := keystore.GenerateHTTPToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Zero()
+	_ = vault.Save(tok)
+	stamp := time.Now().Add(-3 * time.Minute).Unix()
+	if err := httpconfig.WriteDoorState(httpconfig.DoorStatePath(deps.configPath), httpconfig.DoorState{
+		PID: os.Getpid(), Listening: true, Sessions: 4, UnlockUnix: stamp,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runHTTPWith(context.Background(), []string{"status"}, deps); err != nil {
+		t.Fatal(err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "sessions: 4") || !strings.Contains(out, "listening: true") || strings.Contains(out, "unlock age: none") {
+		t.Fatalf("status = %q", out)
+	}
+	if strings.Contains(out, mustHex(t, tok)) {
+		t.Fatal("status printed the token")
+	}
+}
+
+func TestHTTPRevokeSignals(t *testing.T) {
+	deps, vault, _, _, _ := testDeps(t)
+	tok, err := keystore.GenerateHTTPToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Zero()
+	_ = vault.Save(tok)
+	var signaled int
+	deps.signal = func() error { signaled++; return nil }
+	if err := runHTTPWith(context.Background(), []string{"token", "revoke"}, deps); err != nil {
+		t.Fatal(err)
+	}
+	if signaled != 1 || vault.has {
+		t.Fatalf("signals=%d has=%v", signaled, vault.has)
+	}
+}
+
 func TestHTTPEnableKeepsABadFileOff(t *testing.T) {
 	deps, vault, _, _, _ := testDeps(t)
 	tok, err := keystore.GenerateHTTPToken()
@@ -168,14 +262,15 @@ func TestHTTPEnableKeepsABadFileOff(t *testing.T) {
 
 func TestHTTPRotateReplacesTokenAndClearsClipboard(t *testing.T) {
 	deps, vault, board, stdout, stderr := testDeps(t)
-	var waits []time.Duration
-	var clears []func()
-	deps.after = func(d time.Duration, fn func()) {
-		waits = append(waits, d)
-		clears = append(clears, fn)
-	}
+	var signaled int
+	deps.signal = func() error { signaled++; return nil }
+	deps.hold = 250 * time.Millisecond
+	start := time.Now()
 	if err := runHTTPWith(context.Background(), []string{"token", "rotate"}, deps); err != nil {
 		t.Fatal(err)
+	}
+	if time.Since(start) < 200*time.Millisecond {
+		t.Fatal("rotate returned before the clipboard hold; the clear would die with the process")
 	}
 	first, err := vault.Load()
 	if err != nil {
@@ -183,18 +278,33 @@ func TestHTTPRotateReplacesTokenAndClearsClipboard(t *testing.T) {
 	}
 	defer first.Zero()
 	firstHex := mustHex(t, first)
-	if board.value != firstHex {
-		t.Fatalf("clipboard = %q, want the token", board.value)
+	if board.value != "" {
+		t.Fatalf("clipboard still holds %q after rotate returned", board.value)
 	}
 	if strings.Contains(stdout.String()+stderr.String(), firstHex) {
 		t.Fatal("rotate wrote the token to output")
 	}
-	if len(waits) != 1 || waits[0] != 60*time.Second {
-		t.Fatalf("clear scheduled at %v, want 60s", waits)
+	if !strings.Contains(stderr.String(), "Ctrl-C") || !strings.Contains(stderr.String(), "Clipboard cleared") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if signaled != 1 {
+		t.Fatalf("rotate signals = %d, want 1", signaled)
 	}
 
+	// A value copied during the hold is left alone.
+	deps.hold = 300 * time.Millisecond
+	done := make(chan struct{})
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		_ = board.Write("something the user copied later")
+		close(done)
+	}()
 	if err := runHTTPWith(context.Background(), []string{"token", "rotate"}, deps); err != nil {
 		t.Fatal(err)
+	}
+	<-done
+	if board.value != "something the user copied later" {
+		t.Fatalf("clear wiped a newer clipboard value: %q", board.value)
 	}
 	second, err := vault.Load()
 	if err != nil {
@@ -207,21 +317,28 @@ func TestHTTPRotateReplacesTokenAndClearsClipboard(t *testing.T) {
 	if keystore.HTTPTokenMatches(second.Bytes(), firstHex) {
 		t.Fatal("old token still matches")
 	}
-	if !keystore.HTTPTokenMatches(second.Bytes(), board.value) {
-		t.Fatal("clipboard does not hold the new token")
+}
+
+func TestHTTPRotateCtrlCClearsEarly(t *testing.T) {
+	deps, _, board, _, stderr := testDeps(t)
+	deps.hold = 5 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	if err := runHTTPWith(ctx, []string{"token", "rotate"}, deps); err != nil {
+		t.Fatal(err)
 	}
-	secondHex := board.value
-	clears[1]()
+	if time.Since(start) > time.Second {
+		t.Fatal("Ctrl-C did not end the clipboard hold")
+	}
 	if board.value != "" {
-		t.Fatalf("clipboard still holds the token after the timer: %q", board.value)
+		t.Fatalf("clipboard = %q after Ctrl-C", board.value)
 	}
-	board.value = "something the user copied later"
-	clears[1]()
-	if board.value != "something the user copied later" {
-		t.Fatalf("clear wiped a newer clipboard value: %q", board.value)
-	}
-	if strings.Contains(stdout.String()+stderr.String(), secondHex) || strings.Contains(stdout.String(), firstHex) {
-		t.Fatal("output contains a token")
+	if !strings.Contains(stderr.String(), "Clipboard cleared") {
+		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
 
@@ -270,13 +387,24 @@ func TestHTTPShowCopiesWithoutPrinting(t *testing.T) {
 	}
 	defer tok.Zero()
 	_ = vault.Save(tok)
+	want := mustHex(t, tok)
+	seen := make(chan string, 1)
+	deps.hold = 250 * time.Millisecond
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cur, _ := board.Read()
+		seen <- cur
+	}()
 	if err := runHTTPWith(context.Background(), []string{"token", "show"}, deps); err != nil {
 		t.Fatal(err)
 	}
-	if board.value != mustHex(t, tok) {
-		t.Fatalf("clipboard = %q", board.value)
+	if got := <-seen; got != want {
+		t.Fatalf("clipboard during the hold = %q, want the token", got)
 	}
-	if strings.Contains(stdout.String()+stderr.String(), board.value) {
+	if board.value != "" {
+		t.Fatalf("clipboard after show returned = %q", board.value)
+	}
+	if strings.Contains(stdout.String()+stderr.String(), want) {
 		t.Fatal("show printed the token")
 	}
 }
