@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
+	"strings"
 	"time"
 
-	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gluon/rfc822"
+	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
@@ -135,7 +136,7 @@ func mailDraftCreate(deps Deps) mcp.Tool {
 
 func mailDraftUpdate(deps Deps) mcp.Tool {
 	return mcp.Tool{
-		Name:        "mail_draft_update",
+		Name: "mail_draft_update",
 		Description: "Update an existing draft. Any field you don't pass is preserved. body_html still runs through outbound sanitization. " +
 			"Optional `attachments` array uploads ADDITIONAL files (does not replace existing attachments on the draft — for that, mail_draft_delete + mail_draft_create).",
 		InputSchema: json.RawMessage(`{
@@ -176,9 +177,18 @@ func mailDraftUpdate(deps Deps) mcp.Tool {
 			}
 
 			subject := pickStr(in.Subject, current.Subject)
-			to := pickAddrList(in.To, current.ToList)
-			cc := pickAddrList(in.CC, current.CCList)
-			bcc := pickAddrList(in.BCC, current.BCCList)
+			to, err := pickAddrList(in.To, current.ToList)
+			if err != nil {
+				return mcp.ErrorResult("mail_draft_update: %v", err), nil
+			}
+			cc, err := pickAddrList(in.CC, current.CCList)
+			if err != nil {
+				return mcp.ErrorResult("mail_draft_update: %v", err), nil
+			}
+			bcc, err := pickAddrList(in.BCC, current.BCCList)
+			if err != nil {
+				return mcp.ErrorResult("mail_draft_update: %v", err), nil
+			}
 			_, addrKR, err := senderKeyring(deps)
 			if err != nil {
 				return mcp.ErrorResult("mail_draft_update: %v", err), nil
@@ -362,6 +372,10 @@ func buildDraftTemplate(deps Deps, subject string, to, cc, bcc []string, bodyTex
 		mimeType = "text/html"
 	}
 
+	subject, err := exactField("subject", subject)
+	if err != nil {
+		return gpa.DraftTemplate{}, "", err
+	}
 	sender, err := primarySenderAddress(deps)
 	if err != nil {
 		return gpa.DraftTemplate{}, "", err
@@ -423,17 +437,41 @@ func senderKeyring(deps Deps) (string, *crypto.KeyRing, error) {
 	return addr.ID, kr, nil
 }
 
+// parseAddrList parses every recipient the send will use. One entry
+// may hold several addresses ("a@x.com, b@y.com"); those are exploded
+// so the send matches the approval dialog, which shows each of them.
+// An address the dialog would rewrite (bidi, zero-width, NFKC) is
+// refused — same rule as addressShownAsSent (issue #125).
 func parseAddrList(addrs []string) ([]*mail.Address, error) {
 	if len(addrs) == 0 {
 		return nil, nil
 	}
-	out := make([]*mail.Address, 0, len(addrs))
+	var out []*mail.Address
 	for _, s := range addrs {
-		a, err := mail.ParseAddress(s)
-		if err != nil {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		list, err := mail.ParseAddressList(s)
+		if err != nil || len(list) == 0 {
+			if err == nil {
+				err = errors.New("no addresses")
+			}
 			return nil, fmt.Errorf("invalid address %q: %w", s, err)
 		}
-		out = append(out, a)
+		for _, a := range list {
+			if a == nil {
+				return nil, fmt.Errorf("invalid address %q", s)
+			}
+			if err := rejectHiddenText("display name", a.Name); err != nil {
+				return nil, fmt.Errorf("invalid address %q: %w", s, err)
+			}
+			canon, err := canonicalAddress(a.Address)
+			if err != nil {
+				return nil, err
+			}
+			a.Address = canon
+			out = append(out, a)
+		}
 	}
 	return out, nil
 }
@@ -449,12 +487,20 @@ func toEmailStrings(addrs []*mail.Address) []string {
 	return out
 }
 
-func pickAddrList(preferred []string, fallback []*mail.Address) []*mail.Address {
-	if len(preferred) > 0 {
-		parsed, _ := parseAddrList(preferred)
-		return parsed
+// pickAddrList uses preferred when the caller sent a recipient list.
+// A list that does not parse is an error: the previous behavior
+// discarded the error and returned a nil list, which cleared the
+// draft's recipients. The caller's text stays in the error and the
+// draft is left unchanged.
+func pickAddrList(preferred []string, fallback []*mail.Address) ([]*mail.Address, error) {
+	if len(preferred) == 0 {
+		return fallback, nil
 	}
-	return fallback
+	parsed, err := parseAddrList(preferred)
+	if err != nil {
+		return nil, err
+	}
+	return parsed, nil
 }
 
 func addressStrings(addrs []*mail.Address) []string {

@@ -196,8 +196,8 @@ Commands:
   uninstall  Remove protonmcp from the selected client config(s).
              Flags: --client {desktop|code|all}  (default: all).
   purge      Hard-delete cached message bodies older than a TTL.
-             SECURITY D13 — the at-rest plaintext mitigation
-             pending Phase-6 envelope encryption.
+             The on-disk mirror is sealed; this bounds how long
+             decrypted bodies stay in it.
              Flags: --older-than {30d|7d|24h|...} (default 30d),
                     --dry-run, --vacuum, --db <path>.
   policy     Inspect or hot-reload the policy engine.

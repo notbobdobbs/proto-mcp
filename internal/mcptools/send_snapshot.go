@@ -102,7 +102,11 @@ func draftPromptSnapshot(deps Deps) func(context.Context, json.RawMessage) (stri
 		if err != nil {
 			return "", "", nil, fmt.Errorf("fetch draft: %w", err)
 		}
-		title, body, err := sendApprovalDialog("mail_send_draft", draftPromptBody(draft))
+		raw, addrs, err := draftPromptBody(draft)
+		if err != nil {
+			return "", "", nil, err
+		}
+		title, body, err := sendApprovalDialog("mail_send_draft", raw, addrs)
 		if err != nil {
 			return "", "", nil, err
 		}
@@ -114,36 +118,76 @@ func draftPromptSnapshot(deps Deps) func(context.Context, json.RawMessage) (stri
 // it goes and what rides along: every recipient, the subject, and
 // every attachment (all of them — the snapshot check compares all of
 // them, so the dialog shows all of them). Recipients come first and
-// as bare addresses (issue #125).
-func draftPromptBody(d gpa.Message) string {
+// as bare addresses (issue #125). The returned slice is those
+// addresses, in To/CC/BCC order, for the post-sanitize exact-match check.
+func draftPromptBody(d gpa.Message) (string, []string, error) {
+	if err := rejectHiddenText("subject", d.Subject); err != nil {
+		return "", nil, err
+	}
+	for _, a := range d.Attachments {
+		if err := rejectHiddenText("attachment name", a.Name); err != nil {
+			return "", nil, err
+		}
+	}
+	to, cc, bcc := addressStrings(d.ToList), addressStrings(d.CCList), addressStrings(d.BCCList)
+	tj, toCanon, err := joinAddrs(to)
+	if err != nil {
+		return "", nil, err
+	}
+	cj, ccCanon, err := joinAddrs(cc)
+	if err != nil {
+		return "", nil, err
+	}
+	bj, bccCanon, err := joinAddrs(bcc)
+	if err != nil {
+		return "", nil, err
+	}
 	parts := []string{"Send draft " + capField(d.ID, promptNameMaxRunes)}
-	parts = append(parts, recipientLines(
-		joinAddrs(addressStrings(d.ToList)),
-		joinAddrs(addressStrings(d.CCList)),
-		joinAddrs(addressStrings(d.BCCList)),
-	)...)
-	parts = append(parts, "Subject: "+capField(d.Subject, promptSubjectMaxRunes))
-	if s := messageAttachmentsList(d.Attachments); s != "" {
+	parts = append(parts, recipientLines(tj, cj, bj)...)
+	subject, err := exactField("subject", d.Subject)
+	if err != nil {
+		return "", nil, err
+	}
+	parts = append(parts, "Subject: "+subject)
+	if s, err := messageAttachmentsList(d.Attachments); err != nil {
+		return "", nil, err
+	} else if s != "" {
 		parts = append(parts, "Attachments: "+s)
 	}
-	return strings.Join(parts, "\n")
+	addrs := append(append(append([]string{}, toCanon...), ccCanon...), bccCanon...)
+	return strings.Join(parts, "\n"), addrs, nil
 }
 
 // recipientLines renders the To / CC / BCC lines of a send dialog from
 // already-joined bare-address lists. All three always appear, "(none)"
 // when empty, so the user can see there is no BCC.
 func recipientLines(to, cc, bcc string) []string {
-	return []string{"To: " + orNone(to), "CC: " + orNone(cc), "BCC: " + orNone(bcc)}
+	return []string{
+		fmt.Sprintf("To (%d): %s", addrCount(to), orNone(to)),
+		fmt.Sprintf("Cc (%d): %s", addrCount(cc), orNone(cc)),
+		fmt.Sprintf("Bcc (%d): %s", addrCount(bcc), orNone(bcc)),
+	}
+}
+
+func addrCount(joined string) int {
+	if joined == "" {
+		return 0
+	}
+	return strings.Count(joined, ", ") + 1
 }
 
 // messageAttachmentsList renders every attachment already on a server
 // message as "name (size), …", each name capped. "" when none.
-func messageAttachmentsList(atts []gpa.Attachment) string {
+func messageAttachmentsList(atts []gpa.Attachment) (string, error) {
 	out := make([]string, 0, len(atts))
 	for _, a := range atts {
-		out = append(out, fmt.Sprintf("%s (%s)", capField(a.Name, promptNameMaxRunes), humanBytes(a.Size)))
+		name, err := exactField("attachment name", a.Name)
+		if err != nil {
+			return "", err
+		}
+		out = append(out, fmt.Sprintf("%s (%s)", name, humanBytes(a.Size)))
 	}
-	return strings.Join(out, ", ")
+	return strings.Join(out, ", "), nil
 }
 
 // draftChange names the first thing that differs between the draft
@@ -216,8 +260,11 @@ func replyPromptSnapshot(deps Deps, toolName string, replyAll bool) func(context
 		if err != nil {
 			return "", "", nil, fmt.Errorf("fetch parent: %w", err)
 		}
-		title, body, err := sendApprovalDialog(toolName,
-			replyPromptBody(deps, parent, in.InReplyTo, replyAll, in.Attachments))
+		raw, addrs, err := replyPromptBody(deps, parent, in.InReplyTo, replyAll, in.Attachments)
+		if err != nil {
+			return "", "", nil, err
+		}
+		title, body, err := sendApprovalDialog(toolName, raw, addrs)
 		if err != nil {
 			return "", "", nil, err
 		}
@@ -227,22 +274,42 @@ func replyPromptSnapshot(deps Deps, toolName string, replyAll bool) func(context
 
 // replyPromptBody renders a reply dialog from the fetched parent:
 // recipients first (issue #125), then the subject the reply will
-// carry, then any new attachments.
-func replyPromptBody(deps Deps, parent gpa.Message, parentID string, replyAll bool, attachments []sendAttachmentInput) string {
+// carry, then any new attachments. The returned slice is the To and
+// CC addresses the reply will actually use.
+func replyPromptBody(deps Deps, parent gpa.Message, parentID string, replyAll bool, attachments []sendAttachmentInput) (string, []string, error) {
 	verb := "Reply to"
 	if replyAll {
 		verb = "Reply-all to"
 	}
-	to, cc := replyRecipients(deps, parent, replyAll)
-	parts := []string{verb + " message " + capField(parentID, promptNameMaxRunes)}
-	parts = append(parts, recipientLines(joinAddrs(to), joinAddrs(cc), "")...)
-	parts = append(parts, "Subject: "+capField(replySubject(parent.Subject), promptSubjectMaxRunes))
-	if decoded, err := decodeAndValidateAttachments(deps, attachments); err == nil {
-		if s := attachmentsSummary(decoded); s != "" {
-			parts = append(parts, s)
-		}
+	if err := rejectHiddenText("subject", parent.Subject); err != nil {
+		return "", nil, err
 	}
-	return strings.Join(parts, "\n")
+	to, cc := replyRecipients(deps, parent, replyAll)
+	tj, toCanon, err := joinAddrs(to)
+	if err != nil {
+		return "", nil, err
+	}
+	cj, ccCanon, err := joinAddrs(cc)
+	if err != nil {
+		return "", nil, err
+	}
+	parts := []string{verb + " message " + capField(parentID, promptNameMaxRunes)}
+	parts = append(parts, recipientLines(tj, cj, "")...)
+	subject, err := exactField("subject", replySubject(parent.Subject))
+	if err != nil {
+		return "", nil, err
+	}
+	parts = append(parts, "Subject: "+subject)
+	decoded, err := decodeAndValidateAttachments(deps, attachments)
+	if err != nil {
+		return "", nil, err
+	}
+	if s, err := attachmentsSummary(decoded); err != nil {
+		return "", nil, err
+	} else if s != "" {
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, "\n"), append(append([]string{}, toCanon...), ccCanon...), nil
 }
 
 // forwardPromptSnapshot is mail_forward's PromptSnapshot (issue #125).
@@ -260,7 +327,11 @@ func forwardPromptSnapshot(deps Deps) func(context.Context, json.RawMessage) (st
 		if err != nil {
 			return "", "", nil, fmt.Errorf("fetch parent: %w", err)
 		}
-		title, body, err := sendApprovalDialog("mail_forward", forwardPromptBody(deps, parent, in))
+		raw, addrs, err := forwardPromptBody(deps, parent, in)
+		if err != nil {
+			return "", "", nil, err
+		}
+		title, body, err := sendApprovalDialog("mail_forward", raw, addrs)
 		if err != nil {
 			return "", "", nil, err
 		}
@@ -272,19 +343,52 @@ func forwardPromptSnapshot(deps Deps) func(context.Context, json.RawMessage) (st
 // addresses, from args), the subject the forward will carry, new
 // attachments, and — when the call carries them over — every one of
 // the parent's attachments.
-func forwardPromptBody(deps Deps, parent gpa.Message, in forwardInput) string {
-	parts := []string{"Forward message " + capField(in.ForwardOf, promptNameMaxRunes)}
-	parts = append(parts, recipientLines(promptAddrs(in.To), promptAddrs(in.CC), promptAddrs(in.BCC))...)
-	parts = append(parts, "Subject: "+capField(forwardSubject(parent.Subject), promptSubjectMaxRunes))
-	if decoded, err := decodeAndValidateAttachments(deps, in.Attachments); err == nil {
-		if s := attachmentsSummary(decoded); s != "" {
-			parts = append(parts, s)
+func forwardPromptBody(deps Deps, parent gpa.Message, in forwardInput) (string, []string, error) {
+	to, toA, err := promptAddrs(in.To)
+	if err != nil {
+		return "", nil, err
+	}
+	cc, ccA, err := promptAddrs(in.CC)
+	if err != nil {
+		return "", nil, err
+	}
+	bcc, bccA, err := promptAddrs(in.BCC)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := rejectHiddenText("subject", parent.Subject); err != nil {
+		return "", nil, err
+	}
+	for _, a := range parent.Attachments {
+		if err := rejectHiddenText("attachment name", a.Name); err != nil {
+			return "", nil, err
 		}
 	}
-	if in.IncludeParentAttachments {
-		parts = append(parts, "Forwarded attachments: "+orNone(messageAttachmentsList(parent.Attachments)))
+	parts := []string{"Forward message " + capField(in.ForwardOf, promptNameMaxRunes)}
+	parts = append(parts, recipientLines(to, cc, bcc)...)
+	subject, err := exactField("subject", forwardSubject(parent.Subject))
+	if err != nil {
+		return "", nil, err
 	}
-	return strings.Join(parts, "\n")
+	parts = append(parts, "Subject: "+subject)
+	decoded, err := decodeAndValidateAttachments(deps, in.Attachments)
+	if err != nil {
+		return "", nil, err
+	}
+	if s, err := attachmentsSummary(decoded); err != nil {
+		return "", nil, err
+	} else if s != "" {
+		parts = append(parts, s)
+	}
+	if in.IncludeParentAttachments {
+		s, err := messageAttachmentsList(parent.Attachments)
+		if err != nil {
+			return "", nil, err
+		}
+		parts = append(parts, "Forwarded attachments: "+orNone(s))
+	}
+	addrs := append(append(append([]string{}, toA...), ccA...), bccA...)
+	return strings.Join(parts, "\n"), addrs, nil
 }
 
 // forwardSubject prefixes Fwd: unless already present.

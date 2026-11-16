@@ -76,6 +76,10 @@ anything a sender chose to put in it.
   plus a SHA-256 self-check that refuses to run a swapped binary.
 - **Log leakage.** Secrets are redacted; bodies are reduced to
   `{sha256, bytes}` in the audit log.
+- **Mirror at rest.** `store.db` (bodies, envelopes, the full-text
+  index, cached attachments, calendar text, the audit table) is
+  AES-256-GCM under a random key in the login Keychain. A copy of
+  that file without the key does not read.
 
 ## Out of scope — accepted risks
 
@@ -113,10 +117,22 @@ anything a sender chose to put in it.
   ships. A signed binary carrying that entitlement is killed by the
   kernel at launch. The application-layer Touch ID gate is the practical
   security boundary, by design.
-- **A local account already compromised.** Everything runs as your user;
-  malware already executing as you can read the SQLite mirror, the audit
-  log, and staged attachments. proto-mcp is not a defense against code
-  already running under your account.
+- **A local account already compromised.** Everything runs as your user.
+  Malware already executing as you can read the Keychain (the login
+  keychain is not sealed to this binary; see the item above), the
+  plaintext working file `store.db.live` while the mirror is open, the
+  JSONL audit log, and staged attachments. The sealed `store.db` does
+  not add a boundary against that malware. proto-mcp is not a defense
+  against code already running under your account.
+- **The working file and attachment exports.** `store.db.live` (and its
+  `-wal`) is plaintext for as long as any process has the mirror open,
+  and again if the process crashes, until the next open seals it and
+  shreds it. Shredding overwrites the file and unlinks it; APFS does
+  not promise the old blocks are gone. Files the tools hand back for
+  you to read — `attachment-staging/` for large downloads, and
+  `mail_save_attachment`'s copy in `~/Downloads` — are plaintext on
+  purpose. `protonmcp purge` removes the staging copies with the
+  cached bodies.
 - **Physical access to an unlocked, logged-in Mac.** The auto-lock
   triggers shrink the window, but an attacker at your unlocked machine
   during an unlocked session is outside the model.
@@ -132,11 +148,23 @@ anything a sender chose to put in it.
 - Skim the audit log periodically (see [observability in
   configuration.md](./configuration.md#observability)).
 - Don't raise `max_attachment_bytes` past what you need; large decrypted
-  attachments are written to a local staging directory.
-- Use `protonmcp purge --older-than 7d --vacuum` to shrink the window of
-  decrypted bodies cached on disk.
+  attachments are written to a local staging directory for the client
+  to read.
+- Use `protonmcp purge --older-than 7d --vacuum` to shorten how long
+  decrypted bodies and attachments stay in the sealed mirror.
 
-## What a Touch ID prompt looks like
+## What an approval looks like
+
+Tools with `confirm: true` (every send, plus save-attachment and
+folder/label delete) show the full operation in an alert first. The
+body is a scrolling text view, not the Touch ID sheet's title: macOS
+puts `localizedReason` in the title and clips it, which would hide a
+recipient past the first line. Allow on that alert is what reaches
+Touch ID; Cancel never prompts. The Touch ID reason is then the short
+title ("Approve mail_send?"), because the list was already on screen.
+
+Other prompted tools (trash, move, label) put their shorter sentence
+in the Touch ID sheet directly.
 
 When Claude says "move 'Re: gear list' from inbox to archive," the prompt
 that fires says exactly that — not a redacted argument dump:
@@ -162,14 +190,21 @@ verbatim:
 
 ```
 ┌──────────────────────────────────────────────┐
-│ Send mail_send?                              │
+│ Approve mail_send?                           │
 │                                              │
-│ To: alice@example.com                        │
-│ CC: charlie@example.com                      │
+│ To (1): alice@example.com                    │
+│ Cc (1): charlie@example.com                  │
+│ Bcc (0): (none)                              │
 │ Subject: Re: gear list                       │
 │                                              │
-│ [ Cancel ]              [ Send & Touch ID ]  │
+│ [ Cancel ]                           [ Allow ]│
 └──────────────────────────────────────────────┘
 ```
 
-That recipient list is the verification surface you tap against.
+Allow is followed by Touch ID (or the account password). Each list
+is labeled with its count, including Bcc. If the alert cannot show
+the whole body at once, Allow stays disabled until the list is
+scrolled to the end. Addresses are an ASCII allowlist; an IDN domain
+is shown and sent only as its UTS-46 punycode. Anything else, and a
+subject or attachment name that contains a hidden or bidirectional
+character, is refused.

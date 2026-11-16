@@ -25,6 +25,45 @@
 > personal-use development tool, not a sanctioned third-party client.
 > The full README mirrors this paragraph for first-time visibility.
 
+## At-rest mailbox mirror
+
+`store.db` is sealed with AES-256-GCM (chunked, random nonce per
+chunk, header bound into the AAD). The 32-byte key is its own Keychain
+item — service `zone.dort.protonmcp`, account `store-key` — created on
+first open, `AccessibleWhenUnlocked`, not iCloud-synced. It is not the
+Proton session secret.
+
+What that stops: a copy of Application Support (Time Machine of that
+folder, a disk image, a leftover file) without the login Keychain.
+The seal covers bodies, envelopes, the FTS index, cached attachment
+bytes, decrypted calendar text, and the audit table. An older
+plaintext `store.db` is sealed on first open; the old bytes are
+overwritten and the file removed, along with `-wal` / `-shm`.
+
+What it does not stop, on purpose:
+
+- The working copy `store.db.live` is plaintext SQLite while any
+  process has the store open, so the daemon and the CLI can share it.
+  The last close seals it and shreds the working file. A crash leaves
+  the working file until the next open, which seals it again.
+- Shred is overwrite-then-unlink. APFS will not always destroy the
+  old extents.
+- Same-user malware with an unlocked login keychain can read the key.
+  That is the same platform limit as the session item
+  (`SecAccessControl` needs an entitlement Apple will not grant this
+  distribution). See [docs/security.md](docs/security.md).
+- Attachment staging files and `mail_save_attachment` output are
+  plaintext exports for the caller. Purge sweeps the staging dir.
+- SQLCipher was not used. The tree is `modernc.org/sqlite` so Linux CI
+  and `go test` stay cgo-free for the database. The only cgo is
+  Security.framework, which notarization already links. A private
+  SQLCipher build would be a second C toolchain and a second thing to
+  sign.
+
+`protonmcp purge` is still the retention control. Encryption does not
+make a 30-day body cache a good idea; it makes the file useless
+without the key.
+
 ---
 
 Security groundwork for proto-mcp. Drafted from a read-only audit before the

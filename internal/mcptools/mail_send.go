@@ -292,6 +292,54 @@ type forwardInput struct {
 // Helpers
 // ============================================================
 
+// prepareSendRecipients is the canonical To/Cc/Bcc the dialog showed.
+// sendCompose calls it before CreateDraft so a refusal does not leave
+// a draft behind.
+func prepareSendRecipients(to, cc, bcc []string) (cto, ccc, cbcc []string, err error) {
+	if cto, err = canonicalRecipientEntries(to); err != nil {
+		return nil, nil, nil, err
+	}
+	if ccc, err = canonicalRecipientEntries(cc); err != nil {
+		return nil, nil, nil, err
+	}
+	if cbcc, err = canonicalRecipientEntries(bcc); err != nil {
+		return nil, nil, nil, err
+	}
+	return cto, ccc, cbcc, nil
+}
+
+// canonicalRecipientEntries explodes address-list entries and reduces
+// each address to the ASCII form canonicalAddress produces. That is
+// the string in the approval dialog and the string that is sent.
+func canonicalRecipientEntries(entries []string) ([]string, error) {
+	var out []string
+	for _, e := range entries {
+		if strings.TrimSpace(e) == "" {
+			continue
+		}
+		list, err := mail.ParseAddressList(e)
+		if err != nil || len(list) == 0 {
+			return nil, fmt.Errorf("invalid recipient %q", e)
+		}
+		for _, a := range list {
+			if a == nil || a.Address == "" {
+				return nil, fmt.Errorf("invalid recipient %q", e)
+			}
+			if a.Name != "" {
+				if _, err := exactField("display name", a.Name); err != nil {
+					return nil, fmt.Errorf("recipient %q: %w", e, err)
+				}
+			}
+			canon, err := canonicalAddress(a.Address)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, canon)
+		}
+	}
+	return out, nil
+}
+
 // extractSendRecipients pulls To+CC+BCC out of a mail_send arg
 // payload for the allowed_recipients middleware stage.
 //
@@ -350,7 +398,11 @@ func sendPromptSnapshot(deps Deps, toolName string) func(context.Context, json.R
 	return func(_ context.Context, args json.RawMessage) (string, string, any, error) {
 		var in sendInput
 		_ = json.Unmarshal(args, &in)
-		title, body, err := sendApprovalDialog(toolName, sendPromptBody(deps, in))
+		raw, addrs, err := sendPromptBody(deps, in)
+		if err != nil {
+			return "", "", nil, err
+		}
+		title, body, err := sendApprovalDialog(toolName, raw, addrs)
 		if err != nil {
 			return "", "", nil, err
 		}
@@ -364,21 +416,51 @@ func sendPromptSnapshot(deps Deps, toolName string) func(context.Context, json.R
 // subject, and attachments are what matter at approval time. Phase
 // 8/B — also appends an attachment summary line; attachment
 // validation errors are swallowed here (the handler reports them).
-func sendPromptBody(deps Deps, in sendInput) string {
-	parts := recipientLines(promptAddrs(in.To), promptAddrs(in.CC), promptAddrs(in.BCC))
-	parts = append(parts, "Subject: "+capField(in.Subject, promptSubjectMaxRunes))
-	if decoded, err := decodeAndValidateAttachments(deps, in.Attachments); err == nil {
-		if s := attachmentsSummary(decoded); s != "" {
-			parts = append(parts, s)
-		}
+// The returned slice is every address the send will use.
+func sendPromptBody(deps Deps, in sendInput) (string, []string, error) {
+	to, toA, err := promptAddrs(in.To)
+	if err != nil {
+		return "", nil, err
 	}
-	return strings.Join(parts, "\n")
+	cc, ccA, err := promptAddrs(in.CC)
+	if err != nil {
+		return "", nil, err
+	}
+	bcc, bccA, err := promptAddrs(in.BCC)
+	if err != nil {
+		return "", nil, err
+	}
+	subject, err := exactField("subject", in.Subject)
+	if err != nil {
+		return "", nil, err
+	}
+	parts := recipientLines(to, cc, bcc)
+	parts = append(parts, "Subject: "+subject)
+	decoded, err := decodeAndValidateAttachments(deps, in.Attachments)
+	if err != nil {
+		return "", nil, err
+	}
+	if s, err := attachmentsSummary(decoded); err != nil {
+		return "", nil, err
+	} else if s != "" {
+		parts = append(parts, s)
+	}
+	addrs := append(append(append([]string{}, toA...), ccA...), bccA...)
+	return strings.Join(parts, "\n"), addrs, nil
 }
 
 // sendCompose is mail_send: create a draft, send it, return.
 // Phase 8/B — uploads attachments to the draft between CreateDraft
 // and SendDraft so they ride on the same send call.
 func sendCompose(ctx mcp.Context, deps Deps, toolName, parentID string, in sendInput) (*mcp.ToolResult, error) {
+	// Canonicalize before any draft exists. Approval showed these
+	// strings; creating the draft first would leave a server-side
+	// message behind when the same check later refused an IDN.
+	to, cc, bcc, err := prepareSendRecipients(in.To, in.CC, in.BCC)
+	if err != nil {
+		return mcp.ErrorResult("%s: %v", toolName, err), nil
+	}
+	in.To, in.CC, in.BCC = to, cc, bcc
 	decoded, err := decodeAndValidateAttachments(deps, in.Attachments)
 	if err != nil {
 		return mcp.ErrorResult("%s: %v", toolName, err), nil
@@ -424,6 +506,15 @@ func sendDraftByID(ctx mcp.Context, deps Deps, toolName, draftID string) (*mcp.T
 	if err != nil {
 		return mcp.ErrorResult("%s: fetch draft: %v", toolName, err), nil
 	}
+	subject, err := exactField("subject", draft.Subject)
+	if err != nil {
+		return mcp.ErrorResult("%s refused: %v", toolName, err), nil
+	}
+	for _, a := range draft.Attachments {
+		if _, err := exactField("attachment name", a.Name); err != nil {
+			return mcp.ErrorResult("%s refused: %v", toolName, err), nil
+		}
+	}
 	if approved, ok := ctx.Snapshot.(gpa.Message); ok {
 		if what := draftChange(approved, draft); what != "" {
 			return mcp.ErrorResult("%s refused: the draft's %s changed after the approval dialog was shown, so what you approved is not what would be sent. Nothing was sent; review the draft and call %s again.",
@@ -453,7 +544,7 @@ func sendDraftByID(ctx mcp.Context, deps Deps, toolName, draftID string) (*mcp.T
 		return mcp.ErrorResult("%s: decrypt draft body: %v", toolName, err), nil
 	}
 	tpl := gpa.DraftTemplate{
-		Subject:  draft.Subject,
+		Subject:  subject,
 		Sender:   draft.Sender,
 		ToList:   draft.ToList,
 		CCList:   draft.CCList,
@@ -688,9 +779,12 @@ func finalizeSend(ctx mcp.Context, deps Deps, toolName string, addrKR *crypto.Ke
 	// allRecipients, draft fetch via addressStrings, reply build) so
 	// the allowlist comparison sees the same shape extractSendRecipients
 	// produces for the middleware path.
-	normalized := make([]string, 0, len(recipients))
-	for _, r := range recipients {
-		normalized = append(normalized, normalizeRecipientList(r)...)
+	// Same canonical form the approval dialog showed (ASCII, or IDN
+	// as punycode). A unicode IDN is not a failure here: it is
+	// reduced to that form and that form is what is sent.
+	normalized, err := canonicalRecipientEntries(recipients)
+	if err != nil {
+		return mcp.ErrorResult("%s refused: %v Nothing was sent.", toolName, err), nil
 	}
 	if deps.Policy != nil {
 		if _, pol := deps.Policy.Decide(toolName, nil, mcpCallerFromContext(ctx)); pol != nil && len(pol.AllowedRecipients) > 0 {

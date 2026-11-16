@@ -14,9 +14,10 @@ import (
 // mail_download_attachment reads.
 //
 // Filename is the SANITIZED form (sanitize.Filename has run before
-// the row hits this layer). Content is plaintext bytes — same D13/
-// C-1 plaintext-at-rest posture as body_text/body_html. The
-// `secure_delete=on` pragma covers post-purge erasure.
+// the row hits this layer). Content is plaintext in the working
+// database and ciphertext in the sealed store.db. The
+// `secure_delete=on` pragma covers post-purge erasure of the
+// working file.
 type AttachmentCacheRow struct {
 	MessageID    string
 	AttachmentID string

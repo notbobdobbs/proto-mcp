@@ -103,8 +103,8 @@ same keyring as mail. Notes & limitations:
   already decrypted. Background sync mirrors metadata lazily; run
   `protonmcp calendar-backfill --decrypt` to decrypt everything up front and
   warm the index, or just list a date range once (which decrypts that page).
-- Decrypted event text is cached in SQLite — same plaintext-at-rest posture
-  as message bodies (see [security.md](./security.md)), swept by
+- Decrypted event text is cached in the same sealed SQLite mirror as
+  message bodies (see [security.md](./security.md)) and swept by
   `protonmcp purge`.
 
 > There is deliberately **no permanent-delete tool**. `mail_trash` moves a

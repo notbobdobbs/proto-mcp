@@ -521,11 +521,60 @@ func sanitizePromptRunes(in string) string {
 		case r == 0x200b || r == 0x200c || r == 0x200d || r == 0xfeff,
 			r >= 0x2060 && r <= 0x2064: // word joiner, invisible operators
 			// Zero-width / invisible characters — drop.
+		case disallowedPromptRune(r):
+			// Soft hyphen, CGJ, Hangul fillers, variation selectors,
+			// tag characters, and dot lookalikes. They are invisible
+			// or confusable and must not reach a dialog. Recipients
+			// are additionally held to an ASCII allowlist.
 		default:
 			b.WriteRune(r)
 		}
 	}
 	return b.String()
+}
+
+// ContainsDisallowedPromptRune reports whether s contains a character
+// that must not appear in text we both display and send: bidi controls,
+// soft hyphen, CGJ, Hangul fillers, variation selectors, tag characters,
+// and dot lookalikes. The dialog sanitizer drops these; sending the
+// original would hide them from the person approving.
+func ContainsDisallowedPromptRune(s string) bool {
+	for _, r := range s {
+		if disallowedPromptRune(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func disallowedPromptRune(r rune) bool {
+	switch r {
+	case 0x00ad, // soft hyphen
+		0x034f,                 // combining grapheme joiner
+		0x115f, 0x1160, 0x3164, // Hangul fillers
+		0xffa0,                 // halfwidth Hangul filler
+		0x3002, 0xff0e, 0xff61: // ideographic / fullwidth / halfwidth full stop
+		return true
+	}
+	if r >= 0xfe00 && r <= 0xfe0f { // variation selectors
+		return true
+	}
+	if r >= 0xe0100 && r <= 0xe01ef { // variation selectors supplement
+		return true
+	}
+	if r >= 0xe0000 && r <= 0xe007f { // tags
+		return true
+	}
+	// Bidi controls. The sanitizer also drops these; naming them here
+	// lets the send path reject the original text instead of only
+	// hiding the controls on screen.
+	switch r {
+	case 0x200e, 0x200f, 0x061c,
+		0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+		0x2066, 0x2067, 0x2068, 0x2069:
+		return true
+	}
+	return false
 }
 
 // updateDecision backfills policy_decision into the audit row that

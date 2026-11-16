@@ -1,24 +1,23 @@
-// protonmcp-touchid — single-prompt Touch ID helper for proto-mcp.
+// protonmcp-touchid — Touch ID + NSAlert helper for proto-mcp.
 //
 // Spec:
 //   - Read one JSON object from stdin (single line or multi-line).
-//   - Run LAContext.evaluatePolicy(.deviceOwnerAuthentication) with
-//     the body text (plus caller info, when present) as the
-//     localizedReason. The biometric IS the confirmation — no
-//     separate NSAlert step.
+//   - If confirm: true, show an NSAlert whose body is the full
+//     operation text in a scroll view. macOS puts LAContext's
+//     localizedReason in the dialog title and clips it, so a send's
+//     recipient list cannot live only there (issue #125). Cancel
+//     exits 1 and skips biometrics.
+//   - Then run LAContext.evaluatePolicy(.deviceOwnerAuthentication).
+//     When the alert already showed the body, the Touch ID reason is
+//     the short title. Otherwise the reason is the body, as before.
 //   - Exit 0 on biometric/password success, 1 on deny/cancel/
 //     auth-fail, 2 on stdin parse error.
-//
-// History: earlier versions of this helper showed an NSAlert FIRST
-// when policy had confirm:true, then the Touch ID prompt — same
-// body text shown twice with one extra click. Collapsed to a single
-// prompt; the `confirm` field on the request is now accepted for
-// backwards compat but does not gate a second dialog.
 //
 // Distribution: ad-hoc signed by swiftc on the dev machine. Phase 7
 // adds Developer ID signing + notarization + NSFaceIDUsageDescription
 // in an Info.plist when we bundle this as a .app.
 
+import AppKit
 import Foundation
 import LocalAuthentication
 
@@ -35,6 +34,38 @@ guard let req = try? JSONDecoder().decode(Request.self, from: data) else {
     exit(2)
 }
 
+// AppKit needs an NSApplication for NSAlert. Without this the alert
+// silently no-ops. .accessory keeps a one-shot prompt out of the Dock.
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+
+// confirm: true is the policy flag for "show the literal operation
+// before Touch ID" (mail_send and the other irreversible tools).
+// The body goes in a scroll view, not informativeText: informative
+// text is clipped, and a clipped BCC line is the bug #125 closed.
+if req.confirm == true {
+    var full = req.body
+    if let caller = req.caller, !caller.isEmpty {
+        if !full.isEmpty {
+            full += "\n\n"
+        }
+        full += "Requested by: \(caller)"
+    }
+
+    let alert = NSAlert()
+    alert.messageText = req.title.isEmpty ? "Approve this action?" : req.title
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Allow")
+    alert.addButton(withTitle: "Cancel")
+    let allowButton = alert.buttons[0]
+    alert.accessoryView = scrollableBody(full, allow: allowButton)
+
+    NSApp.activate(ignoringOtherApps: true)
+    if alert.runModal() != .alertFirstButtonReturn {
+        exit(1)
+    }
+}
+
 // D30 (Phase 7/A): use .deviceOwnerAuthentication instead of
 // .deviceOwnerAuthenticationWithBiometrics so the system falls back
 // to the user's login password when biometric hardware is missing
@@ -45,20 +76,22 @@ guard let req = try? JSONDecoder().decode(Request.self, from: data) else {
 let ctx = LAContext()
 var laError: NSError?
 guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &laError) else {
-    // Neither biometric NOR password available — extremely rare
-    // (only happens with no user account configured for the local
-    // session). Treat as deny.
     FileHandle.standardError.write(Data("authentication not available: \(laError?.localizedDescription ?? "unknown")\n".utf8))
     exit(1)
 }
 
-// Compose the reason text. macOS's Touch ID dialog renders this
-// just below the lock icon; multi-line is supported but kept short.
-// Caller info appended on a final line so the user can see which
-// process is asking.
-var reason = req.body
-if let caller = req.caller, !caller.isEmpty {
-    reason += "\n\nRequested by: \(caller)"
+// The Touch ID sheet's localizedReason is a title on macOS, not a
+// scrolling body. After the alert has shown every recipient, the
+// reason stays the short title so the sheet cannot clip the list
+// the user just approved.
+var reason: String
+if req.confirm == true {
+    reason = req.title.isEmpty ? "Approve this action" : req.title
+} else {
+    reason = req.body
+    if let caller = req.caller, !caller.isEmpty {
+        reason += "\n\nRequested by: \(caller)"
+    }
 }
 
 let sem = DispatchSemaphore(value: 0)
@@ -72,3 +105,147 @@ ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { succes
 }
 sem.wait()
 exit(ok ? 0 : 1)
+
+// scrollableBody lays the approval text out at its real height and
+// shows as much of that as fits. A list that is taller than the
+// viewport starts with Allow disabled; scrolling to the end enables
+// it, so a Bcc past the first screen cannot be approved unseen.
+// The Go side labels each list "To (n)", "Cc (n)", and "Bcc (n)".
+func scrollableBody(_ text: String, allow: NSButton) -> NSScrollView {
+    let width: CGFloat = 480
+    let contentWidth = width - 16
+    // Build TextKit 1 before the string is set. On macOS 13+ a
+    // default NSTextView is TextKit 2, and touching layoutManager
+    // afterwards flips it to TextKit 1 with an empty usedRect. That
+    // used to fall back to a 48pt viewport with Allow already enabled.
+    let storage = NSTextStorage()
+    let layout = NSLayoutManager()
+    storage.addLayoutManager(layout)
+    let container = NSTextContainer(size: NSSize(width: contentWidth, height: CGFloat.greatestFiniteMagnitude))
+    container.widthTracksTextView = true
+    layout.addTextContainer(container)
+    let view = NSTextView(frame: NSRect(x: 0, y: 0, width: contentWidth, height: 10), textContainer: container)
+    view.isEditable = false
+    view.isSelectable = true
+    view.isRichText = false
+    view.font = NSFont.userFixedPitchFont(ofSize: 12)
+    view.drawsBackground = false
+    view.isVerticallyResizable = true
+    view.isHorizontallyResizable = false
+    view.textContainerInset = NSSize(width: 4, height: 6)
+    view.minSize = NSSize(width: 0, height: 0)
+    view.maxSize = NSSize(width: contentWidth, height: CGFloat.greatestFiniteMagnitude)
+    view.string = text
+    layout.ensureLayout(for: container)
+    let used = layout.usedRect(for: container)
+    // used.height < 1 with text present means the measurement failed.
+    // Do not invent a 200pt document: scrolling that fake end turned
+    // Allow on before the real last line, including Bcc, was visible.
+    // Allow stays disabled until a later layout reports a real height
+    // and that last line is inside the viewport.
+    if !text.isEmpty && used.height < 1 {
+        allow.isEnabled = false
+        view.frame = NSRect(x: 0, y: 0, width: contentWidth, height: 220)
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: 220))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.drawsBackground = false
+        scroll.documentView = view
+        let gate = LineGate(view: view, layout: layout, container: container, allow: allow, text: text)
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scroll.contentView,
+            queue: .main
+        ) { _ in
+            gate.consider()
+        }
+        return scroll
+    }
+
+    let contentH = used.height + view.textContainerInset.height * 2 + 8
+    view.frame = NSRect(x: 0, y: 0, width: contentWidth, height: max(contentH, 48))
+
+    let maxH: CGFloat = 440
+    let viewH = min(maxH, view.frame.height)
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: viewH))
+    scroll.hasVerticalScroller = true
+    scroll.autohidesScrollers = contentH <= viewH + 1
+    scroll.borderType = .bezelBorder
+    scroll.drawsBackground = false
+    scroll.documentView = view
+
+    if contentH > viewH + 1 {
+        allow.isEnabled = false
+        let gate = LineGate(view: view, layout: layout, container: container, allow: allow, text: text)
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scroll.contentView,
+            queue: .main
+        ) { _ in
+            gate.consider()
+        }
+    }
+    return scroll
+}
+
+// LineGate enables Allow only after the text has a real measured
+// height and the last line (the Bcc line, when the body has one) is
+// inside the viewport. A zero usedRect never enables Allow.
+final class LineGate: NSObject {
+    let view: NSTextView
+    let layout: NSLayoutManager
+    let container: NSTextContainer
+    weak var allow: NSButton?
+    let text: String
+
+    init(view: NSTextView, layout: NSLayoutManager, container: NSTextContainer, allow: NSButton, text: String) {
+        self.view = view
+        self.layout = layout
+        self.container = container
+        self.allow = allow
+        self.text = text
+    }
+
+    func consider() {
+        layout.ensureLayout(for: container)
+        let used = layout.usedRect(for: container)
+        if text.isEmpty == false && used.height < 1 {
+            allow?.isEnabled = false
+            return
+        }
+        let contentH = used.height + view.textContainerInset.height * 2 + 8
+        if contentH > view.frame.height + 1 {
+            view.frame.size.height = contentH
+        }
+        guard let scroll = view.enclosingScrollView else {
+            allow?.isEnabled = false
+            return
+        }
+        let ns = text as NSString
+        var charRange = NSRange(location: 0, length: 0)
+        let marker = ns.range(of: "Bcc (", options: .backwards)
+        if marker.location != NSNotFound {
+            charRange = marker
+        } else if ns.length > 0 {
+            charRange = NSRange(location: ns.length - 1, length: 1)
+        }
+        if charRange.length == 0 {
+            allow?.isEnabled = false
+            return
+        }
+        let glyphs = layout.glyphRange(forCharacterRange: charRange, actualCharacterRange: nil)
+        if glyphs.length == 0 {
+            allow?.isEnabled = false
+            return
+        }
+        let rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
+        if rect.height < 1 {
+            allow?.isEnabled = false
+            return
+        }
+        let visible = scroll.contentView.bounds
+        allow?.isEnabled = visible.minY <= rect.minY + 2 && visible.maxY >= rect.maxY - 2
+    }
+}

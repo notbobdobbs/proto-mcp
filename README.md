@@ -215,11 +215,13 @@ locally-signed build, see
   Don't rate-abuse, scrape, or run multi-account automation through it —
   anything that violates Proton's [Terms](https://proton.me/legal/terms)
   is no less a violation for borrowing Bridge's header.
-- **Cached bodies are plaintext-in-SQLite.** Decrypted message bodies are
-  cached locally (TTL-bounded, `secure_delete` on). On a stolen, imaged
-  disk that's recoverable cleartext until purged. Envelope encryption
-  (SQLCipher) is a post-1.0 item. `protonmcp purge --older-than 7d
-  --vacuum` shrinks the window now.
+- **The local mirror is sealed.** Message bodies, envelopes, the audit
+  table, and cached attachments are AES-256-GCM at `store.db`. The key
+  is a random 32-byte item in the login Keychain, next to the session.
+  A copy of the file without that Keychain item does not read. While a
+  process has the mirror open there is a plaintext working file
+  (`store.db.live`); it is shredded when the last process closes.
+  `protonmcp purge` still bounds how long decrypted bodies are kept.
 - **Personal use.** Built for one person and their mailbox on their Mac.
 
 ## Documentation

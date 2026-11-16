@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gluon/rfc822"
+	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/sanitize"
@@ -195,23 +195,24 @@ func uploadAttachmentsAndCollectKeys(
 //	"Attachments: report.pdf (2.4 MB)"
 //	"Attachments: report.pdf (2.4 MB), photo.jpg (850 KB)"
 //	"Attachments: a.pdf (1 KB), b.pdf (1 KB), c.pdf (1 KB) and 5 more"
-func attachmentsSummary(decoded []decodedAttachment) string {
+//
+// attachmentsSummary lists every attachment. A count is included so a
+// long list still says how many files ride along; the names themselves
+// are not cut down to three. A dialog that cannot fit the full list
+// is refused by sendApprovalDialog rather than shown in part.
+func attachmentsSummary(decoded []decodedAttachment) (string, error) {
 	if len(decoded) == 0 {
-		return ""
+		return "", nil
 	}
-	const max = 3
-	parts := make([]string, 0, max)
-	for i, d := range decoded {
-		if i >= max {
-			break
+	parts := make([]string, 0, len(decoded))
+	for _, d := range decoded {
+		name, err := exactField("attachment name", d.Filename)
+		if err != nil {
+			return "", err
 		}
-		parts = append(parts, fmt.Sprintf("%s (%s)", capField(d.Filename, promptNameMaxRunes), humanBytes(int64(len(d.Plain)))))
+		parts = append(parts, fmt.Sprintf("%s (%s)", name, humanBytes(int64(len(d.Plain)))))
 	}
-	out := "Attachments: " + strings.Join(parts, ", ")
-	if len(decoded) > max {
-		out += fmt.Sprintf(" and %d more", len(decoded)-max)
-	}
-	return out
+	return fmt.Sprintf("Attachments (%d): %s", len(decoded), strings.Join(parts, ", ")), nil
 }
 
 // humanBytes formats a byte count as a short human-readable string.

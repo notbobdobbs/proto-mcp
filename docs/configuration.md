@@ -78,10 +78,12 @@ tail -f ~/Library/Application\ Support/protonmcp/audit.log
 tail -f ~/Library/Logs/protonmcp/daemon.log
 ```
 
-Or query the SQLite source of truth for richer analytics:
+Or query the mirror's working file while the daemon (or a CLI
+command) has it open. `store.db` itself is sealed and `sqlite3` will
+not open it; see [at-rest data](#at-rest-data--purging).
 
 ```sh
-sqlite3 ~/Library/Application\ Support/protonmcp/store.db \
+sqlite3 ~/Library/Application\ Support/protonmcp/store.db.live \
   'SELECT tool, outcome, policy_decision, duration_ms
      FROM audit_log
     ORDER BY id DESC LIMIT 20;'
@@ -94,15 +96,26 @@ redacted arguments.
 
 ## At-rest data & purging
 
-When Claude reads a message, the decrypted body is cached in SQLite with
-a TTL (default 30 days) so repeat reads are instant and offline. That
-cache is plaintext-in-SQLite, mitigated by the `secure_delete=on` pragma
-(deleted cells are zeroed on the next page write) and TTL purging:
+When Claude reads a message, the decrypted body is cached so repeat
+reads are instant and offline. The cache lives in `store.db`, which is
+sealed with AES-256-GCM under a random key in the macOS Keychain
+(`zone.dort.protonmcp` / `store-key`). The same seal covers envelopes,
+the full-text index, cached attachment bytes, calendar text, and the
+audit table. `sqlite3 store.db` cannot open that file.
+
+While any process has the mirror open, SQLite runs on a plaintext
+working file `store.db.live` (mode `0600`). The last close seals it
+back over `store.db` and shreds the working file, its `-wal` / `-shm`,
+and a crash leftover is sealed again on the next open. An existing
+plaintext `store.db` from an older build is sealed on first open and
+the old file is overwritten with random bytes and removed.
 
 ```sh
-protonmcp purge --older-than 7d         # shrink the cached-body window
-protonmcp purge --vacuum                # force secure_delete to reclaim now
+protonmcp purge --older-than 7d         # drop cached bodies sooner
+protonmcp purge --vacuum                # reclaim the freed pages
 ```
 
-Envelope encryption of the body cache (SQLCipher) is a post-1.0 item; see
-[security.md](./security.md) for the at-rest threat discussion.
+`secure_delete=on` still zeroes deleted cells in the working file.
+Large attachment exports (`attachment-staging/`) stay plaintext for
+the MCP client to read and are swept by the same purge. See
+[security.md](./security.md) for what the seal does not cover.
