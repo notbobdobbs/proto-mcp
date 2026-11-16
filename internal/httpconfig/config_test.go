@@ -117,6 +117,29 @@ func TestSaveIsOwnerOnlyAndRoundTrips(t *testing.T) {
 	}
 }
 
+func TestAllowedOriginsRoundTripAndDefaultEmpty(t *testing.T) {
+	bare, err := Parse([]byte("enabled: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bare.AllowedOrigins) != 0 {
+		t.Fatalf("default origins = %v, want none", bare.AllowedOrigins)
+	}
+	cfg := Default()
+	cfg.AllowedOrigins = []string{"https://example.tailnet.ts.net"}
+	path := filepath.Join(t.TempDir(), "http.yaml")
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.AllowedOrigins) != 1 || got.AllowedOrigins[0] != "https://example.tailnet.ts.net" {
+		t.Fatalf("origins = %v", got.AllowedOrigins)
+	}
+}
+
 func TestLoadRefusesGroupOrWorldWritable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "http.yaml")

@@ -87,6 +87,9 @@ caller_label: remote
 allowed_hosts:
   - 127.0.0.1:4765
   - localhost:4765
+# allowed_origins is empty unless you set it. A browser Origin is refused.
+# allowed_origins:
+#   - https://your-name.tailnet.ts.net
 max_requests_per_minute: 60    # 0 means 60, never unlimited; hard ceiling 600
 max_remote_reads_per_day: 500  # 0 means 500, never unlimited; hard ceiling 5000
 max_unlock_hours: 8            # 0 means 8; allowed 1–24; no unlimited value
@@ -96,9 +99,11 @@ max_unlock_hours: 8            # 0 means 8; allowed 1–24; no unlimited value
 `listen` must be `127.0.0.1` or `::1` with an explicit port. `0.0.0.0`,
 a LAN address, an empty host, and the name `localhost` are refused.
 Add the tunnel's public hostname to `allowed_hosts` when you turn the
-tunnel on. A Host or Origin that is not on the list is rejected before
-any tool runs. A missing Origin is allowed. The Origin value `null` is
-rejected.
+tunnel on. A Host that is not on that list is rejected before any tool
+runs. A present Origin is checked against `allowed_origins`, not against
+the host list. The default origin list is empty, so a browser is refused,
+including `Origin: http://127.0.0.1:4765`. A missing Origin is allowed.
+The Origin value `null` is rejected.
 
 Omitted or empty `remote_tools` means the built-in default, not every
 tool. The default is search, read, draft, send, attachment download,
@@ -114,9 +119,11 @@ and `mail_delete_permanent` are not on it. `*` or `all`, a number below
 the file unusable: the previous good file stays, and a first load does
 not enable the listener.
 
-`protonmcp policy reload` (SIGHUP) also re-reads `http.yaml` and opens
-or closes the listener. Each request reads the token from the Keychain,
-so revoke is immediate.
+`protonmcp policy reload` (SIGHUP) re-reads `http.yaml` and opens or
+closes the listener. That re-read still runs when the policy file
+itself cannot be reloaded, so a broken `policy.yaml` cannot leave the
+door listening after `http disable`. Each request reads the token from
+the Keychain, so revoke is immediate.
 
 ```sh
 protonmcp http token rotate    # new token on the clipboard for about 60 seconds; not printed
@@ -124,13 +131,14 @@ protonmcp http token show      # same clipboard copy, only after Touch ID; decli
 protonmcp http token revoke    # delete the token; logout does not do this
 protonmcp http enable          # refuses without a token; warns if screen lock is off, and still enables
 protonmcp http disable         # stop listening; the socket keeps working
-protonmcp http status          # enabled, listen address, whether a token exists; never the token
+protonmcp http status          # enabled, listen, token present or not, sessions, unlock age, listening; never the token
 protonmcp http activity        # remote call counts; --ids also prints message ids; never a body
 ```
 
-`token rotate` and `token show` clear the clipboard about 60 seconds
-later only if it still holds that token. Neither command takes the
-token as an argument. A Mac is required for show and rotate.
+`token rotate` and `token show` wait in that process and clear the
+clipboard about 60 seconds later, only if it still holds that token.
+Ctrl-C clears it immediately. Neither command takes the token as an
+argument, and neither prints it. A Mac is required for show and rotate.
 
 Screen lock left off is an accepted risk. `http enable` and `doctor`
 warn. They do not block, and the warning does not fail `doctor`.

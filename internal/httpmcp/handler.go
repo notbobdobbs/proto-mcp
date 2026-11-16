@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -130,23 +131,50 @@ func (s *Service) Reload() error {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.cfg = cfg
 	if !cfg.Enabled || !s.tokenPresent() {
 		s.stopLocked()
+		s.mu.Unlock()
+		s.Publish()
 		return nil
 	}
 	if s.ln != nil {
+		s.mu.Unlock()
+		s.Publish()
 		return nil
 	}
 	ln, err := Listen(cfg.Listen)
 	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
 	s.ln = ln
 	s.httpSrv = &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	go s.httpSrv.Serve(ln)
+	s.mu.Unlock()
+	s.Publish()
 	return nil
+}
+
+// Publish writes the live door picture next to http.yaml so
+// `http status` and doctor can see the listener, the session count,
+// and the unlock stamp. A missing path writes nothing.
+func (s *Service) Publish() {
+	if s == nil || s.Path == "" {
+		return
+	}
+	s.mu.Lock()
+	st := httpconfig.DoorState{
+		PID:       os.Getpid(),
+		Listening: s.ln != nil,
+		Sessions:  len(s.sessions),
+	}
+	path := s.Path
+	s.mu.Unlock()
+	if s.Clock != nil {
+		st.UnlockUnix = s.Clock.Unix()
+	}
+	_ = httpconfig.WriteDoorState(httpconfig.DoorStatePath(path), st)
 }
 
 func (s *Service) tokenPresent() bool {
@@ -252,6 +280,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	case http.MethodDelete:
+		tok, ok := s.authed(w, r)
+		if !ok {
+			return
+		}
+		s.noteToken(tok)
+		zero(tok)
 		s.deleteSession(w, r)
 		return
 	case http.MethodPost:
@@ -259,19 +293,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if r.URL.RawQuery != "" && hasTokenQuery(r) {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	now := s.now()
-	if s.authFails.over(now, authFailLimit) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		return
-	}
-	tok, ok := s.bearer(r)
+	tok, ok := s.authed(w, r)
 	if !ok {
-		s.authFails.add(now)
-		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 	defer zero(tok)
@@ -284,7 +307,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	cfg := s.cfg
 	s.mu.Unlock()
-	if !hostOK(r.Host, cfg.AllowedHosts) || !originOK(r.Header.Get("Origin"), cfg.AllowedHosts) {
+	if !hostOK(r.Host, cfg.AllowedHosts) || !originOK(r.Header.Get("Origin"), cfg.AllowedOrigins) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
@@ -305,6 +328,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 60
 	}
+	now := s.now()
 	if !s.perMinute.allow(now, limit) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
@@ -362,20 +386,42 @@ func (s *Service) serveInitialize(w http.ResponseWriter, ctx context.Context, re
 	}
 	s.sessions[id] = &hsess{conn: conn, claimed: clientName(req.Params), last: s.now()}
 	s.mu.Unlock()
+	s.Publish()
 	w.Header().Set("Mcp-Session-Id", id)
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Service) deleteSession(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.bearer(r); !ok {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
 	id := r.Header.Get("Mcp-Session-Id")
 	s.mu.Lock()
 	delete(s.sessions, id)
 	s.mu.Unlock()
+	s.Publish()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// authed checks the shared failure bucket, then the bearer. A token
+// in the query string is a failure even when the Authorization header
+// is valid. The bucket covers POST and DELETE. GET and OPTIONS are
+// not authentication attempts.
+func (s *Service) authed(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	now := s.now()
+	if s.authFails.over(now, authFailLimit) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		return nil, false
+	}
+	if r.URL.RawQuery != "" && hasTokenQuery(r) {
+		s.authFails.add(now)
+		w.WriteHeader(http.StatusUnauthorized)
+		return nil, false
+	}
+	tok, ok := s.bearer(r)
+	if !ok {
+		s.authFails.add(now)
+		w.WriteHeader(http.StatusUnauthorized)
+		return nil, false
+	}
+	return tok, true
 }
 
 func (s *Service) session(id string) *hsess {
@@ -471,11 +517,11 @@ func originOK(origin string, allowed []string) bool {
 	if origin == "" {
 		return true
 	}
-	if origin == "null" {
+	if strings.EqualFold(origin, "null") {
 		return false
 	}
 	for _, a := range allowed {
-		if strings.EqualFold(a, origin) || strings.HasSuffix(strings.ToLower(origin), "://"+strings.ToLower(a)) {
+		if strings.EqualFold(strings.TrimSpace(a), origin) {
 			return true
 		}
 	}

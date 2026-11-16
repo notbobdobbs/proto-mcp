@@ -11,7 +11,7 @@ Protocol](https://modelcontextprotocol.io) tools — and every message
 that goes out needs your fingerprint on a prompt that names the real
 recipient.
 
-Nothing leaves your laptop except the mail itself.
+Mail stays on your Mac unless you send it, or you turn on the remote door and a bot reads it.
 
 ![platform: macOS](https://img.shields.io/badge/platform-macOS%2013%2B-black?logo=apple)
 ![Go 1.26.6+](https://img.shields.io/badge/Go-1.26.6%2B-00ADD8?logo=go&logoColor=white)
@@ -71,7 +71,7 @@ protonmcp install          # connect it to Claude Desktop + Claude Code
 
 </details>
 
-Signed, notarized binaries — no Gatekeeper warning, no network listener.
+Signed, notarized binaries — no Gatekeeper warning. The daemon does not open a public port. The loopback door stays off until you enable it.
 
 Anything not working? **`protonmcp doctor`** checks every piece of the
 install and tells you the one command that fixes it:

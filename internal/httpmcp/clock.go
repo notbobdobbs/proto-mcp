@@ -19,6 +19,7 @@ type UnlockClock struct {
 	declined time.Time
 	now      func() time.Time
 	cooldown time.Duration
+	onStamp  func()
 }
 
 func NewUnlockClock(now func() time.Time) *UnlockClock {
@@ -26,6 +27,30 @@ func NewUnlockClock(now func() time.Time) *UnlockClock {
 		now = time.Now
 	}
 	return &UnlockClock{now: now, cooldown: 60 * time.Second}
+}
+
+// SetOnStamp registers a callback for a successful stamp. It runs
+// after the clock lock is released.
+func (c *UnlockClock) SetOnStamp(fn func()) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.onStamp = fn
+	c.mu.Unlock()
+}
+
+// Unix is the stamp as seconds, or 0 when nothing has been stamped.
+func (c *UnlockClock) Unix() int64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.at.IsZero() {
+		return 0
+	}
+	return c.at.Unix()
 }
 
 // Stamp records a successful Touch ID that unlocks the session.
@@ -36,7 +61,11 @@ func (c *UnlockClock) Stamp(t time.Time) {
 	c.mu.Lock()
 	c.at = t
 	c.declined = time.Time{}
+	fn := c.onStamp
 	c.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // Age is the time since the last stamp. A zero stamp is a large age.

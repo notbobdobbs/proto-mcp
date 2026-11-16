@@ -406,21 +406,40 @@ func checkHTTP(r *report) {
 		r.add("http", stateWarn, "cannot locate http.yaml", "")
 		return
 	}
-	cfg, err := httpconfig.Load(filepath.Join(dir, "http.yaml"))
-	if err != nil {
-		r.add("http", stateWarn, "http.yaml is not usable; the door stays off", "fix http.yaml")
-		return
+	path := filepath.Join(dir, "http.yaml")
+	cfg, cfgErr := httpconfig.Load(path)
+	live := httpconfig.ReadLiveDoorState(httpconfig.DoorStatePath(path))
+	st, detail, fix := httpDoorLine(cfg, cfgErr, httpTokenPresent(), live)
+	r.add("http", st, detail, fix)
+}
+
+// httpDoorLine describes the remote door without claiming it is off
+// while a live daemon is still listening.
+func httpDoorLine(cfg httpconfig.Config, cfgErr error, tokenPresent bool, live httpconfig.DoorState) (checkState, string, string) {
+	token := "token absent"
+	if tokenPresent {
+		token = "token present"
+	}
+	if cfgErr != nil {
+		if live.Listening {
+			return stateWarn, "http.yaml is not usable; the listener is still up, " + token, "protonmcp http disable"
+		}
+		return stateWarn, "http.yaml is not usable; the door stays off", "fix http.yaml"
+	}
+	if live.Listening && !cfg.Enabled {
+		return stateWarn, "config is disabled but the listener is still up, " + token, "protonmcp http disable"
 	}
 	line := "off"
 	if cfg.Enabled {
 		line = "on, listen " + cfg.Listen
 	}
-	if httpTokenPresent() {
-		line += ", token present"
-	} else {
-		line += ", token absent"
+	line += ", " + token
+	if live.Listening {
+		line += fmt.Sprintf(", listening, sessions %d", live.Sessions)
+	} else if cfg.Enabled {
+		line += ", not listening"
 	}
-	r.add("http", stateOK, line, "")
+	return stateOK, line, ""
 }
 
 func checkScreenLock(r *report) {

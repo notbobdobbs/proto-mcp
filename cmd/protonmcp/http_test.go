@@ -502,6 +502,41 @@ func TestTokenShowHelperExitCodes(t *testing.T) {
 	}
 }
 
+func TestDoctorReportsListenerWhenConfigIsBad(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, "Library", "Application Support", "protonmcp")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yamlPath := filepath.Join(dir, "http.yaml")
+	if err := os.WriteFile(yamlPath, []byte("{{ broken\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := httpconfig.WriteDoorState(httpconfig.DoorStatePath(yamlPath), httpconfig.DoorState{
+		PID: os.Getpid(), Listening: true, Sessions: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var bad report
+	checkHTTP(&bad)
+	if len(bad.checks) != 1 || !strings.Contains(bad.checks[0].detail, "still up") {
+		t.Fatalf("bad file detail = %+v", bad.checks)
+	}
+	if bad.checks[0].state == stateFail {
+		t.Fatal("a bad http.yaml fails doctor")
+	}
+
+	if err := httpconfig.WriteDisabled(yamlPath); err != nil {
+		t.Fatal(err)
+	}
+	var off report
+	checkHTTP(&off)
+	if len(off.checks) != 1 || !strings.Contains(off.checks[0].detail, "still up") {
+		t.Fatalf("disabled-but-listening detail = %+v", off.checks)
+	}
+}
+
 func TestDoctorScreenLockWarningDoesNotFail(t *testing.T) {
 	prev := screenLockOn
 	t.Cleanup(func() { screenLockOn = prev })

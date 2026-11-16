@@ -92,8 +92,9 @@ type Runtime struct {
 	hupStop   chan struct{}
 	pidUnlink func()
 
-	// onReload runs after a successful policy reload so the HTTP
-	// door can open or close its loopback listener.
+	// onReload re-reads http.yaml. It runs on SIGHUP even when the
+	// policy reload fails, so a bad policy.yaml cannot leave the
+	// loopback listener open after `http disable`.
 	onReload func()
 	// onUnlockStamp runs after a Touch ID unlock succeeds. Idle
 	// bumps do not call it.
@@ -228,8 +229,8 @@ func (r *Runtime) Unlock(ctx context.Context) error {
 	return nil
 }
 
-// SetOnReload registers a callback for a successful SIGHUP policy
-// reload. The HTTP door re-reads http.yaml from it.
+// SetOnReload registers the HTTP door's config reload. SIGHUP calls
+// it even when the policy file cannot be reloaded.
 func (r *Runtime) SetOnReload(fn func()) {
 	r.mu.Lock()
 	r.onReload = fn
@@ -242,6 +243,30 @@ func (r *Runtime) SetOnUnlockStamp(fn func()) {
 	r.mu.Lock()
 	r.onUnlockStamp = fn
 	r.mu.Unlock()
+}
+
+// handleSighup reloads policy and then the HTTP door. A policy error
+// keeps the previous policy and still runs reload, so `http disable`
+// closes the listener even when policy.yaml is broken.
+func handleSighup(engine *policy.Engine, broker *approval.Broker, logger *slog.Logger, reload func()) {
+	if engine != nil {
+		if err := engine.Reload(); err != nil {
+			if logger != nil {
+				logger.Warn("policy reload failed; previous policy retained", "err", err.Error())
+			}
+		} else {
+			n := 0
+			if broker != nil {
+				n = broker.Invalidate()
+			}
+			if logger != nil {
+				logger.Info("policy reloaded", "approvals_dropped", n)
+			}
+		}
+	}
+	if reload != nil {
+		reload()
+	}
 }
 
 // SessionBundle is the cmd-side wrapper around a Proton session.
@@ -456,23 +481,13 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 		for {
 			select {
 			case <-hupCh:
-				if rerr := engine.Reload(); rerr != nil {
-					logger.Warn("policy reload failed; previous policy retained", "err", rerr.Error())
-					continue
-				}
-				n := 0
-				if broker != nil {
-					n = broker.Invalidate()
-				}
-				logger.Info("policy reloaded", "approvals_dropped", n)
+				var reload func()
 				if rt != nil {
 					rt.mu.RLock()
-					reload := rt.onReload
+					reload = rt.onReload
 					rt.mu.RUnlock()
-					if reload != nil {
-						reload()
-					}
 				}
+				handleSighup(engine, broker, logger, reload)
 			case <-hupStop:
 				signal.Stop(hupCh)
 				return

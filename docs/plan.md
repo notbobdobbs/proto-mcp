@@ -137,6 +137,8 @@ caller_label: remote          # what the audit log and the approval dialog call 
 allowed_hosts:                # Host header, no scheme, port optional
   - 127.0.0.1:4765
   - localhost:4765
+# allowed_origins:            # full Origin header. Omitted means none.
+#   - https://your-name.tailnet.ts.net
 max_requests_per_minute: 60   # authenticated calls; 0 means this default, never unlimited
 max_remote_reads_per_day: 500 # HTTP read calls per local day; 0 means this default, never unlimited
 max_unlock_hours: 8           # wall clock since last Touch ID, for HTTP only; 0 means this default
@@ -168,14 +170,17 @@ max_unlock_hours: 8           # wall clock since last Touch ID, for HTTP only; 0
 ```
 
 You add the tunnel's public hostname to `allowed_hosts` when you
-turn the tunnel on. A Host or Origin that is not on the list is
-rejected (`403`) before any tool runs. A missing Origin is allowed,
-because non-browser MCP clients do not send one. A present Origin
-must match an entry you listed. The value `null` is rejected. The
-default list has no Origins, so a browser is refused.
+turn the tunnel on. A Host that is not on that list is rejected
+(`403`) before any tool runs. A present Origin must match an entry
+in `allowed_origins`, not an allowed host. The value `null` is
+rejected. A missing Origin is allowed, because non-browser MCP
+clients do not send one. The default origin list is empty, so a
+browser is refused, including one whose Origin is
+`http://127.0.0.1:4765`.
 
 `protonmcp policy reload` (SIGHUP) also re-reads `http.yaml` and
-opens or closes the listener. The token is not cached: each request
+opens or closes the listener. A policy reload error does not skip
+that re-read. The token is not cached: each request
 reads it from the Keychain, so revoke is immediate. Omitted or `0`
 for `max_unlock_hours` and the two rate caps means the default.
 There is no value that means "never expire" or "no cap". A number

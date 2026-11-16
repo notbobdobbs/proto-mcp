@@ -72,7 +72,10 @@ it.
   unchanged by the HTTP door. The HTTP door, when enabled, binds only
   a literal loopback address (`127.0.0.1` or `::1`), requires a bearer
   token on every request, ignores `X-Forwarded-For`, and sends no CORS
-  headers. Its tool list can only remove tools. It cannot turn a
+  headers. A present Origin is refused unless it is listed in
+  `allowed_origins`. That list is empty by default, so a browser —
+  including one aimed at loopback — is refused. A missing Origin is
+  allowed. Its tool list can only remove tools. It cannot turn a
   policy `deny` into `allow` or `prompt`.
 - **Remote trash is recoverable only.** HTTP `mail_trash` moves a
   message to Trash. If the mirror says the message is already in
@@ -197,7 +200,8 @@ The socket's peer checks stay; they simply do not apply to HTTP.
 - **Funnel stays on.** That is an accepted risk: a permanent public
   name, and scanners will hit it. The controls are the bearer token,
   the shared auth-failure limit (10 failures a minute, then `429` for
-  everyone, including the real bot, for the rest of that minute), the
+  everyone, including the real bot, for the rest of that minute; POST,
+  DELETE, and a token in the query string all count), the
   per-minute cap, the daily read cap (default 500, stored so a restart
   does not zero it), and the audit log. Every HTTP tool call that
   passes auth, reads included, writes a redacted row.

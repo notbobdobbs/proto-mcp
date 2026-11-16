@@ -25,6 +25,7 @@ func startHTTPDoor(ctx context.Context, rt *serve.Runtime) *httpmcp.Service {
 	}
 	svc := httpmcp.New(rt.MCPServer, path, keystore.LoadHTTPToken)
 	svc.Clock = httpmcp.NewUnlockClock(nil)
+	svc.Clock.SetOnStamp(svc.Publish)
 	svc.Reads = httpmcp.NewReadCap(rt.Store.DB, nil, svc.MaxReads)
 	rt.MCPServer.UseRemoteAllow(svc.Allows)
 	if svc.Reads != nil {

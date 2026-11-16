@@ -106,10 +106,15 @@ var ErrBadFile = errors.New("http.yaml is not usable")
 // caps have already been replaced with the defaults. There is no
 // value here that means unlimited.
 type Config struct {
-	Enabled              bool
-	Listen               string
-	CallerLabel          string
-	AllowedHosts         []string
+	Enabled      bool
+	Listen       string
+	CallerLabel  string
+	AllowedHosts []string
+	// AllowedOrigins is the Origin header allowlist. Empty refuses
+	// every present Origin, including a loopback browser. A missing
+	// Origin is not an entry in this list; the handler allows that
+	// separately. Hosts are not origins.
+	AllowedOrigins       []string
 	MaxRequestsPerMinute int
 	MaxRemoteReadsPerDay int
 	MaxUnlockHours       int
@@ -140,6 +145,7 @@ type rawFile struct {
 	Listen               *string   `yaml:"listen"`
 	CallerLabel          *string   `yaml:"caller_label"`
 	AllowedHosts         *[]string `yaml:"allowed_hosts"`
+	AllowedOrigins       *[]string `yaml:"allowed_origins"`
 	MaxRequestsPerMinute *int      `yaml:"max_requests_per_minute"`
 	MaxRemoteReadsPerDay *int      `yaml:"max_remote_reads_per_day"`
 	MaxUnlockHours       *int      `yaml:"max_unlock_hours"`
@@ -168,6 +174,9 @@ func Parse(data []byte) (Config, error) {
 	}
 	if raw.AllowedHosts != nil {
 		cfg.AllowedHosts = append([]string(nil), (*raw.AllowedHosts)...)
+	}
+	if raw.AllowedOrigins != nil {
+		cfg.AllowedOrigins = append([]string(nil), (*raw.AllowedOrigins)...)
 	}
 	rpm, err := capOrDefault(raw.MaxRequestsPerMinute, DefaultMaxRequestsPerMinute, maxRequestsPerMinuteCeiling, "max_requests_per_minute")
 	if err != nil {
@@ -297,6 +306,9 @@ func Save(path string, cfg Config) error {
 		"max_requests_per_minute":  cfg.MaxRequestsPerMinute,
 		"max_remote_reads_per_day": cfg.MaxRemoteReadsPerDay,
 		"max_unlock_hours":         cfg.MaxUnlockHours,
+	}
+	if len(cfg.AllowedOrigins) > 0 {
+		doc["allowed_origins"] = cfg.AllowedOrigins
 	}
 	if cfg.RemoteToolsSet {
 		doc["remote_tools"] = cfg.RemoteTools

@@ -334,6 +334,118 @@ func TestAuthFailureLockout(t *testing.T) {
 	}
 }
 
+func TestAuthFailureLockoutCountsDeleteAndQuery(t *testing.T) {
+	host := "127.0.0.1:4765"
+	init := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
+
+	s, _, text, calls := testService(t)
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest(http.MethodDelete, "http://"+host+"/mcp", nil)
+		req.Host = host
+		req.RemoteAddr = "127.0.0.1:9"
+		req.Header.Set("Authorization", "Bearer 00")
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("delete %d: %d", i, rec.Code)
+		}
+	}
+	if rec := post(s, text, host, "", init); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("good token after delete flood: %d", rec.Code)
+	}
+
+	s, _, text, calls = testService(t)
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest(http.MethodPost, "http://"+host+"/mcp?access_token=guess", strings.NewReader(init))
+		req.Host = host
+		req.RemoteAddr = "127.0.0.1:9"
+		req.Header.Set("Authorization", "Bearer "+text)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized || rec.Body.Len() != 0 {
+			t.Fatalf("query %d: %d %q", i, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := post(s, text, host, "", init); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("good token after query flood: %d", rec.Code)
+	}
+	if *calls != 0 {
+		t.Fatal("tool ran during lockout")
+	}
+}
+
+func TestLoopbackOriginIsRefusedUnlessListed(t *testing.T) {
+	s, _, text, calls := testService(t)
+	host := "127.0.0.1:4765"
+	init := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"synthetic","version":"0"}}}`
+	for _, origin := range []string{"http://127.0.0.1:4765", "http://localhost:4765"} {
+		req := httptest.NewRequest(http.MethodPost, "http://"+host+"/mcp", strings.NewReader(init))
+		req.Host = host
+		req.RemoteAddr = "127.0.0.1:9"
+		req.Header.Set("Authorization", "Bearer "+text)
+		req.Header.Set("Origin", origin)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("origin %s: %d, want 403", origin, rec.Code)
+		}
+	}
+	s.cfg.AllowedOrigins = []string{"http://127.0.0.1:4765"}
+	req := httptest.NewRequest(http.MethodPost, "http://"+host+"/mcp", strings.NewReader(init))
+	req.Host = host
+	req.RemoteAddr = "127.0.0.1:9"
+	req.Header.Set("Authorization", "Bearer "+text)
+	req.Header.Set("Origin", "http://127.0.0.1:4765")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("listed origin: %d %s", rec.Code, rec.Body.String())
+	}
+	if *calls != 0 {
+		t.Fatal("initialize ran a tool")
+	}
+}
+
+func TestDoorStateTracksListenerSessionsAndUnlock(t *testing.T) {
+	s, _, text, _ := testService(t)
+	s.Clock = NewUnlockClock(func() time.Time { return time.Unix(1_700_000_000, 0) })
+	s.Clock.SetOnStamp(s.Publish)
+	s.Clock.Stamp(time.Unix(1_700_000_000, 0))
+	cfg := s.cfg
+	cfg.Enabled = true
+	cfg.Listen = "127.0.0.1:0"
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	st := httpconfig.ReadLiveDoorState(httpconfig.DoorStatePath(s.Path))
+	if !st.Listening || st.PID != os.Getpid() || st.UnlockUnix != 1_700_000_000 {
+		t.Fatalf("after listen: %+v", st)
+	}
+	host := "127.0.0.1:4765"
+	init := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"synthetic","version":"0"}}}`
+	if rec := post(s, text, host, "", init); rec.Code != http.StatusOK {
+		t.Fatalf("initialize %d %s", rec.Code, rec.Body.String())
+	}
+	st = httpconfig.ReadLiveDoorState(httpconfig.DoorStatePath(s.Path))
+	if st.Sessions != 1 || !st.Listening {
+		t.Fatalf("after initialize: %+v", st)
+	}
+	if err := httpconfig.WriteDisabled(s.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	st = httpconfig.ReadLiveDoorState(httpconfig.DoorStatePath(s.Path))
+	if st.Listening {
+		t.Fatalf("disable left listening set: %+v", st)
+	}
+}
+
 func TestDailyReadCapSurvivesRestart(t *testing.T) {
 	s, st, text, calls := testService(t)
 	host := "127.0.0.1:4765"
