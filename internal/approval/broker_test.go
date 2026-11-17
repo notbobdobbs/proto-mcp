@@ -107,7 +107,11 @@ func TestBrokerHelperTimeoutIsNotAuthFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if b.helperTimeout != 30*time.Second {
+		t.Fatalf("helper timeout = %s, want 30s", b.helperTimeout)
+	}
 	b.helperTimeout = 100 * time.Millisecond
+	start := time.Now()
 	_, err = b.Request(context.Background(), Request{
 		Tool:   "test_tool",
 		Caller: caller.Caller{PID: 1},
@@ -121,6 +125,9 @@ func TestBrokerHelperTimeoutIsNotAuthFailure(t *testing.T) {
 	}
 	if errors.Is(err, mcperrors.ErrAuthFailed) {
 		t.Fatalf("timeout reported as auth failure: %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("sleeping helper was not canceled well before the 45s HTTP request limit")
 	}
 }
 
@@ -290,6 +297,41 @@ func TestBrokerInvalidateDropsCache(t *testing.T) {
 	}
 	if src == SourceCached {
 		t.Error("post-invalidate request hit the cache — D14 fix not working")
+	}
+}
+
+func TestBrokerOneHelperAtATime(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix helper fixture")
+	}
+	p := filepath.Join(t.TempDir(), "slow-touchid")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\nsleep 0.4\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := Request{
+		Tool:   "mail_trash",
+		Caller: caller.Caller{Transport: caller.TransportHTTP, Label: "remote", PID: 0},
+		Args:   json.RawMessage(`{"message_id":"synthetic-1"}`),
+		Policy: policy.ToolPolicy{Decision: policy.DecisionPrompt, TTL: "0", Confirm: true},
+		Title:  "Approve mail_trash?",
+		Body:   "synthetic",
+	}
+	errCh := make(chan error, 2)
+	go func() {
+		_, err := b.Request(context.Background(), req)
+		errCh <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	_, err = b.Request(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "already waiting") {
+		t.Fatalf("second prompt = %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
 	}
 }
 

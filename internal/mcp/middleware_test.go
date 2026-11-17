@@ -489,6 +489,7 @@ func TestMiddlewareHTTPCallerIsAudited(t *testing.T) {
 	}
 	registerEcho("mail_read", &reads)
 	registerEcho("mail_delete_permanent", &deniedRuns)
+	allowRemoteHooks(srv)
 
 	httpCaller := caller.Caller{
 		Transport: caller.TransportHTTP,
@@ -670,6 +671,105 @@ tools:
 	}
 }
 
+func allowRemoteHooks(srv *Server) {
+	srv.UseHTTPUnlock(func(context.Context) error { return nil })
+	srv.UseRemoteAllow(func(string) bool { return true })
+	srv.UseReadCap(func(string) error { return nil })
+	srv.UseTrashGuard(func(context.Context, json.RawMessage) error { return nil })
+}
+
+func TestNilHTTPHooksDenyAndUnixDoesNot(t *testing.T) {
+	w, _ := newTestAudit(t)
+	pol := newTestPolicy(t, "{}\n")
+	var httpCalls, unixCalls int
+	srv := New(nil, WithPolicy(pol), WithAudit(w))
+	srv.Register(Tool{
+		Name:        "mail_read",
+		Description: "read",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Handler: func(ctx Context, _ json.RawMessage) (*ToolResult, error) {
+			if ctx.Caller.PID == 0 {
+				httpCalls++
+			} else {
+				unixCalls++
+			}
+			return StructuredResult(map[string]string{"ok": "yes"})
+		},
+	})
+	httpCtx := caller.WithCaller(context.Background(), caller.Caller{
+		Transport: caller.TransportHTTP, Label: "remote", PID: 0, UID: 501,
+	})
+	resps := serveAs(t, srv, httpCtx, toolCallLines("mail_read", `{}`)...)
+	text := resps[1]["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if httpCalls != 0 || !strings.Contains(text, "not configured") {
+		t.Fatalf("http calls %d text %q", httpCalls, text)
+	}
+	unixCtx := caller.WithCaller(context.Background(), caller.Caller{
+		Transport: caller.TransportUnix, PID: 42, UID: 501, Binary: "/synthetic/client",
+	})
+	serveAs(t, srv, unixCtx, toolCallLines("mail_read", `{}`)...)
+	if unixCalls != 1 {
+		t.Fatalf("unix calls = %d", unixCalls)
+	}
+}
+
+func TestHTTPPolicyDenyBeatsTheRemoteList(t *testing.T) {
+	w, _ := newTestAudit(t)
+	pol := newTestPolicy(t, "tools:\n  mail_read:\n    decision: deny\n")
+	var calls int
+	srv := New(nil, WithPolicy(pol), WithAudit(w))
+	allowRemoteHooks(srv)
+	srv.UseRemoteAllow(func(string) bool { return true })
+	srv.Register(Tool{
+		Name:        "mail_read",
+		Description: "read",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Handler: func(Context, json.RawMessage) (*ToolResult, error) {
+			calls++
+			return StructuredResult(map[string]string{"ok": "yes"})
+		},
+	})
+	ctx := caller.WithCaller(context.Background(), caller.Caller{
+		Transport: caller.TransportHTTP, Label: "remote", PID: 0, UID: 501,
+	})
+	resps := serveAs(t, srv, ctx, toolCallLines("mail_read", `{}`)...)
+	text := resps[1]["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if calls != 0 || !strings.Contains(text, "denied by policy") {
+		t.Fatalf("calls %d text %q", calls, text)
+	}
+}
+
+func TestUnixTrashIgnoresTheHTTPGuard(t *testing.T) {
+	w, _ := newTestAudit(t)
+	pol := newTestPolicy(t, "tools:\n  mail_trash:\n    decision: allow\n")
+	var guard, ran int
+	srv := New(nil, WithPolicy(pol), WithAudit(w))
+	srv.UseTrashGuard(func(context.Context, json.RawMessage) error {
+		guard++
+		return errors.New("unix must not consult the trash guard")
+	})
+	srv.Register(Tool{
+		Name:        "mail_trash",
+		Description: "trash",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Handler: func(Context, json.RawMessage) (*ToolResult, error) {
+			ran++
+			return StructuredResult(map[string]string{"ok": "yes"})
+		},
+	})
+	ctx := caller.WithCaller(context.Background(), caller.Caller{
+		Transport: caller.TransportUnix, PID: 42, UID: 501, Binary: "/synthetic/client",
+	})
+	resps := serveAs(t, srv, ctx, toolCallLines("mail_trash", `{"message_id":"synthetic-message-1"}`)...)
+	text := ""
+	if result, _ := resps[1]["result"].(map[string]any); result != nil && result["isError"] == true {
+		text = result["content"].([]any)[0].(map[string]any)["text"].(string)
+	}
+	if ran != 1 || guard != 0 {
+		t.Fatalf("ran %d guard %d text %q", ran, guard, text)
+	}
+}
+
 func TestMiddlewareHTTPAuditWriteFailureRefusesTheTool(t *testing.T) {
 	w, st := newTestAudit(t)
 	pol := newTestPolicy(t, "{}\n")
@@ -678,6 +778,7 @@ func TestMiddlewareHTTPAuditWriteFailureRefusesTheTool(t *testing.T) {
 	}
 	var httpCalls, unixCalls int
 	srv := New(nil, WithPolicy(pol), WithAudit(w))
+	allowRemoteHooks(srv)
 	srv.Register(Tool{
 		Name:        "mail_read",
 		Description: "read",

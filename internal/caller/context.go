@@ -38,3 +38,18 @@ func FromContext(ctx context.Context) (Caller, bool) {
 	}
 	return c, true
 }
+
+type claimedKey struct{}
+
+// WithClaimedClient records the name from MCP initialize's clientInfo.
+// It is for the audit log only. It is never used to authorize.
+// Unix connections leave it unset.
+func WithClaimedClient(parent context.Context, name string) context.Context {
+	return context.WithValue(parent, claimedKey{}, name)
+}
+
+// ClaimedClient returns the initialize client name, or "" when unset.
+func ClaimedClient(ctx context.Context) string {
+	s, _ := ctx.Value(claimedKey{}).(string)
+	return s
+}

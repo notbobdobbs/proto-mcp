@@ -91,6 +91,13 @@ type Runtime struct {
 
 	hupStop   chan struct{}
 	pidUnlink func()
+
+	// onReload runs after a successful policy reload so the HTTP
+	// door can open or close its loopback listener.
+	onReload func()
+	// onUnlockStamp runs after a Touch ID unlock succeeds. Idle
+	// bumps do not call it.
+	onUnlockStamp func()
 }
 
 // Locked reports whether the runtime is currently in the locked
@@ -211,11 +218,63 @@ func (r *Runtime) Unlock(ctx context.Context) error {
 	}
 	r.locked = false
 	r.lockReason = ""
+	// Copy the hook while r.mu is still held. SetOnUnlockStamp writes
+	// it under the same lock; reading it after Unlock races.
+	stamp := r.onUnlockStamp
 	r.mu.Unlock()
 
 	slog.Info("daemon unlocked")
 	r.publishLockState(false, "")
+	if stamp != nil {
+		stamp()
+	}
 	return nil
+}
+
+// SetOnReload registers a callback for every SIGHUP. The HTTP door
+// re-reads http.yaml from it, including when the policy file failed
+// to reload. The previous policy stays in place on that failure.
+func (r *Runtime) SetOnReload(fn func()) {
+	r.mu.Lock()
+	r.onReload = fn
+	r.mu.Unlock()
+}
+
+// handleSighup reloads policy and then the HTTP door. A policy error
+// keeps the previous policy and still runs the door callback.
+func handleSighup(engine *policy.Engine, broker *approval.Broker, rt *Runtime, logger *slog.Logger) {
+	if engine != nil {
+		if rerr := engine.Reload(); rerr != nil {
+			if logger != nil {
+				logger.Warn("policy reload failed; previous policy retained", "err", rerr.Error())
+			}
+		} else {
+			n := 0
+			if broker != nil {
+				n = broker.Invalidate()
+			}
+			if logger != nil {
+				logger.Info("policy reloaded", "approvals_dropped", n)
+			}
+		}
+	}
+	if rt == nil {
+		return
+	}
+	rt.mu.RLock()
+	reload := rt.onReload
+	rt.mu.RUnlock()
+	if reload != nil {
+		reload()
+	}
+}
+
+// SetOnUnlockStamp registers a callback for a successful Touch ID
+// unlock. It is not called for an idle bump.
+func (r *Runtime) SetOnUnlockStamp(fn func()) {
+	r.mu.Lock()
+	r.onUnlockStamp = fn
+	r.mu.Unlock()
 }
 
 // SessionBundle is the cmd-side wrapper around a Proton session.
@@ -420,6 +479,11 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	resolver := caller.New()
 
 	// 9. SIGHUP handler — policy reload + approval cache drop.
+	// rt is allocated before the goroutine so the signal path and
+	// Setup share one pointer. A failed policy reload still runs
+	// the HTTP reload.
+	rt := &Runtime{}
+	rt.idleTracker = newIdleTracker()
 	hupCh := make(chan os.Signal, 1)
 	signal.Notify(hupCh, syscall.SIGHUP)
 	hupStop := make(chan struct{})
@@ -427,15 +491,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 		for {
 			select {
 			case <-hupCh:
-				if rerr := engine.Reload(); rerr != nil {
-					logger.Warn("policy reload failed; previous policy retained", "err", rerr.Error())
-					continue
-				}
-				n := 0
-				if broker != nil {
-					n = broker.Invalidate()
-				}
-				logger.Info("policy reloaded", "approvals_dropped", n)
+				handleSighup(engine, broker, rt, logger)
 			case <-hupStop:
 				signal.Stop(hupCh)
 				return
@@ -445,10 +501,8 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 
 	// 10. MCP server with full middleware stack.
 	//
-	// rt is built post-srv so the lock-state callback closes over
-	// it. Done in two steps so the closure has a stable target.
-	rt := &Runtime{}
-	rt.idleTracker = newIdleTracker()
+	// The lock-state callback closes over rt. The pointer does not
+	// move after this.
 	opts := []mcp.Option{
 		mcp.WithPolicy(engine),
 		mcp.WithAudit(auditWriter),

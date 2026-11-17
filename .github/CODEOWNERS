@@ -31,6 +31,8 @@
 /internal/approval/              @just-an-oldsalt
 /internal/audit/                 @just-an-oldsalt
 /internal/mcp/                   @just-an-oldsalt
+/internal/httpmcp/               @just-an-oldsalt
+/internal/httpconfig/            @just-an-oldsalt
 
 # Swift Touch ID helper.
 /helpers/touchid/                @just-an-oldsalt

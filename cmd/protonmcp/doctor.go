@@ -95,6 +95,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	checkBinaries(&r)
 	checkLogin(&r)
 	checkScreenLock(&r)
+	checkHTTP(&r)
 	checkStore(ctx, &r, *dbPath)
 	checkDaemon(&r)
 	checkLockState(&r)

@@ -502,6 +502,43 @@ func TestTokenShowHelperExitCodes(t *testing.T) {
 	}
 }
 
+func TestDoctorReportsALiveDoorEvenWhenTheFileIsBad(t *testing.T) {
+	_, detail, _ := describeHTTPDoor(httpconfig.Config{}, errors.New("bad"), httpconfig.DoorState{
+		Listening: true, Sessions: 2,
+	}, true)
+	if !strings.Contains(detail, "listening") || strings.Contains(detail, "off") {
+		t.Fatalf("live door described as off: %q", detail)
+	}
+	if !strings.Contains(detail, "not usable") || !strings.Contains(detail, "sessions 2") {
+		t.Fatalf("detail = %q", detail)
+	}
+	_, quiet, _ := describeHTTPDoor(httpconfig.Config{Enabled: false}, nil, httpconfig.DoorState{}, false)
+	if !strings.Contains(quiet, "off") || strings.Contains(quiet, "listening") {
+		t.Fatalf("idle door = %q", quiet)
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, "Library", "Application Support", "protonmcp")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "http.yaml")
+	if err := os.WriteFile(path, []byte("enabled: true\nmax_unlock_hours: 99\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := httpconfig.WriteDoorState(httpconfig.DoorStatePath(path), httpconfig.DoorState{
+		PID: os.Getpid(), Listening: true, Sessions: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var live report
+	checkHTTP(&live)
+	if len(live.checks) != 1 || !strings.Contains(live.checks[0].detail, "listening") || strings.Contains(live.checks[0].detail, "off") {
+		t.Fatalf("doctor = %+v", live.checks)
+	}
+}
+
 func TestDoctorScreenLockWarningDoesNotFail(t *testing.T) {
 	prev := screenLockOn
 	t.Cleanup(func() { screenLockOn = prev })

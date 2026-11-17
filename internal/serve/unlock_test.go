@@ -2,6 +2,7 @@ package serve
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,4 +130,35 @@ func TestUnlock_ResetsIdleClock(t *testing.T) {
 	if since := time.Since(time.Unix(0, rt.idleTracker.lastActivity.Load())); since > time.Minute {
 		t.Errorf("idle clock not reset by Unlock: last activity %v ago; the next idle tick would relock", since)
 	}
+}
+
+func TestUnlockStampReadDoesNotRaceTheWriter(t *testing.T) {
+	rt := &Runtime{locked: true}
+	rt.acquireSession = func(context.Context) (SessionBundle, error) {
+		return fakeBundle{}, nil
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	stop := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				rt.SetOnUnlockStamp(func() {})
+			}
+		}
+	}()
+	for i := 0; i < 40; i++ {
+		rt.mu.Lock()
+		rt.locked = true
+		rt.mu.Unlock()
+		if err := rt.Unlock(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	wg.Wait()
 }

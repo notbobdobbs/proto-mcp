@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -16,10 +17,12 @@ import (
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/approval"
 	"github.com/just-an-oldsalt/proto-mcp/internal/httpconfig"
+	"github.com/just-an-oldsalt/proto-mcp/internal/httpmcp"
 	"github.com/just-an-oldsalt/proto-mcp/internal/keystore"
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcperrors"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
 	"github.com/just-an-oldsalt/proto-mcp/internal/secret"
+	"github.com/just-an-oldsalt/proto-mcp/internal/store"
 )
 
 // clipboardHold is how long a copied token is left on the clipboard
@@ -125,6 +128,8 @@ func runHTTPWith(ctx context.Context, args []string, deps httpDeps) error {
 		return deps.disable(args[1:])
 	case "status":
 		return deps.status(args[1:])
+	case "activity":
+		return runHTTPActivity(args[1:])
 	case "token":
 		return deps.token(ctx, args[1:])
 	default:
@@ -354,6 +359,83 @@ func (d *httpDeps) clearIfOurs(text string) {
 		return
 	}
 	_ = d.board.Clear()
+}
+
+func runHTTPActivity(args []string) error {
+	fs := flag.NewFlagSet("http activity", flag.ContinueOnError)
+	dbPath := fs.String("db", "", "path to the local mirror")
+	ids := fs.Bool("ids", false, "also print message ids")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := *dbPath
+	if path == "" {
+		var err error
+		path, err = store.DefaultPath()
+		if err != nil {
+			return err
+		}
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	text, err := httpmcp.ActivityText(st.DB, time.Now(), *ids)
+	if err != nil {
+		return err
+	}
+	fmt.Print(text)
+	return nil
+}
+
+// httpTokenPresent reports whether a 32-byte remote token is stored.
+// It never returns the token bytes. Tests replace it.
+var httpTokenPresent = func() bool {
+	tok, err := keystore.LoadHTTPToken()
+	if err != nil {
+		return false
+	}
+	defer tok.Zero()
+	return len(tok.Bytes()) == keystore.HTTPTokenLen
+}
+
+func checkHTTP(r *report) {
+	dir, err := appSupportDir()
+	if err != nil {
+		r.add("http", stateWarn, "cannot locate http.yaml", "")
+		return
+	}
+	path := filepath.Join(dir, "http.yaml")
+	live := httpconfig.ReadLiveDoorState(httpconfig.DoorStatePath(path))
+	cfg, cfgErr := httpconfig.Load(path)
+	state, detail, hint := describeHTTPDoor(cfg, cfgErr, live, httpTokenPresent())
+	r.add("http", state, detail, hint)
+}
+
+// describeHTTPDoor is what doctor and the wording tests share. A live
+// listener is reported as listening even when http.yaml cannot be
+// parsed. It is never described as off while that process still listens.
+func describeHTTPDoor(cfg httpconfig.Config, cfgErr error, live httpconfig.DoorState, tokenPresent bool) (checkState, string, string) {
+	token := "token absent"
+	if tokenPresent {
+		token = "token present"
+	}
+	if live.Listening {
+		detail := fmt.Sprintf("listening, sessions %d, %s", live.Sessions, token)
+		if cfgErr != nil {
+			return stateWarn, detail + "; http.yaml is not usable", "fix http.yaml"
+		}
+		return stateOK, detail, ""
+	}
+	if cfgErr != nil {
+		return stateWarn, "http.yaml is not usable; the door is not listening", "fix http.yaml"
+	}
+	detail := "off"
+	if cfg.Enabled {
+		detail = "enabled, not listening, listen " + cfg.Listen
+	}
+	return stateOK, detail + ", " + token, ""
 }
 
 func checkScreenLock(r *report) {
