@@ -29,9 +29,14 @@ func (s *Service) recordAuthFailure(ctx context.Context, now time.Time) {
 	}
 
 	n := s.bumpAuthFailures(now)
-	_, err := httpconfig.AddAuthFailure(httpconfig.AuthStatePath(s.Path), now)
+	rec, err := httpconfig.AddAuthFailure(httpconfig.AuthStatePath(s.Path), now)
 	if err != nil {
 		slog.Warn("remote door auth-failure counter could not be saved", "err", SafeError(err))
+	} else if rec.Failures > n {
+		// The file was ahead of this process, usually because an
+		// earlier process recorded failures and then exited.
+		n = rec.Failures
+		s.memFails = rec.Failures
 	}
 	limit := s.autoDisableLimit()
 	s.mu.Lock()
@@ -46,17 +51,32 @@ func (s *Service) recordAuthFailure(ctx context.Context, now time.Time) {
 	}
 }
 
-// bumpAuthFailures adds one failure for now's local day. The count
-// lives in the process, so a counter-file write error does not drop it.
-// Caller holds failMu.
+// bumpAuthFailures adds one failure for now's local day. A new day
+// starts from the count already stored for that day, so a restarted
+// process does not begin again at zero. Caller holds failMu.
 func (s *Service) bumpAuthFailures(now time.Time) int {
-	day := now.Format("2006-01-02")
-	if s.memDay != day {
-		s.memDay = day
-		s.memFails = 0
-	}
+	s.adoptStoredCount(now)
 	s.memFails++
 	return s.memFails
+}
+
+// adoptStoredCount loads today's stored count when this process has
+// not counted that day yet, and otherwise keeps the larger of the
+// two. Caller holds failMu.
+func (s *Service) adoptStoredCount(now time.Time) {
+	day := now.Format("2006-01-02")
+	stored := 0
+	if s.Path != "" {
+		stored = httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), now).Failures
+	}
+	if s.memDay != day {
+		s.memDay = day
+		s.memFails = stored
+		return
+	}
+	if stored > s.memFails {
+		s.memFails = stored
+	}
 }
 
 // autoDisableBlocks reports whether Reload must leave the listener
@@ -81,7 +101,9 @@ func (s *Service) autoDisableBlocks(now time.Time) bool {
 		s.blocked = false
 		s.memFails = 0
 		s.memDay = ""
-		return false
+	}
+	if !s.blocked {
+		s.adoptStoredCount(now)
 	}
 	return s.blocked
 }

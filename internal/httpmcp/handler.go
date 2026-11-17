@@ -124,7 +124,7 @@ func (w *window) allow(now time.Time, limit int) bool {
 }
 
 func New(mcpSrv *mcp.Server, path string, token TokenFunc) *Service {
-	return &Service{
+	s := &Service{
 		MCP:       mcpSrv,
 		Path:      path,
 		Token:     token,
@@ -134,6 +134,11 @@ func New(mcpSrv *mcp.Server, path string, token TokenFunc) *Service {
 		perMinute: &window{},
 		inFlight:  make(chan struct{}, inFlightLimit),
 	}
+	// A restarted daemon must not forget failures already stored today.
+	s.failMu.Lock()
+	s.adoptStoredCount(s.now())
+	s.failMu.Unlock()
+	return s
 }
 
 func (s *Service) now() time.Time {

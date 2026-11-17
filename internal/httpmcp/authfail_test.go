@@ -358,6 +358,50 @@ func TestFailedDisableWritesStayClosedAcrossReload(t *testing.T) {
 	}
 }
 
+func TestRestartContinuesTodaysAuthFailureCount(t *testing.T) {
+	s, _, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.AutoDisableAfterAuthFailures = 2
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	s.Notify = func(string) error { return nil }
+	post(s, "", "127.0.0.1:4765", "", `{}`)
+	if !s.Listening() {
+		t.Fatal("the first of two failures closed the door")
+	}
+	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	if got.Failures != 1 {
+		t.Fatalf("stored count after one failure = %+v", got)
+	}
+	s.Close()
+
+	// A new process on the same files. Memory starts empty; the stored
+	// count for today has to come back with it.
+	s2 := New(s.MCP, s.Path, s.Token)
+	s2.Notify = func(string) error { return nil }
+	t.Cleanup(s2.Close)
+	if err := s2.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if !s2.Listening() {
+		t.Fatal("restart closed the door with one failure stored")
+	}
+	post(s2, "", "127.0.0.1:4765", "", `{}`)
+	got = httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	if got.Failures != 2 {
+		t.Fatalf("stored count after restart = %+v", got)
+	}
+	if s2.Listening() {
+		t.Fatal("the second failure after restart left the listener open")
+	}
+}
+
 func dirOf(path string) string {
 	i := strings.LastIndex(path, "/")
 	return path[:i]
