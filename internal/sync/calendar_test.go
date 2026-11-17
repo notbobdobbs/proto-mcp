@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"testing"
 
 	gpa "github.com/ProtonMail/go-proton-api"
@@ -327,9 +326,22 @@ func scopeError(t *testing.T) error {
 		t.Fatal(err)
 	}
 	apiErr.Status = 403
-	// Wrap the value. Go 1.27 rejects %w of *APIError.
-	return fmt.Errorf("403 GET https://mail-api.proton.me/calendar/v1/x/events: %w", *apiErr)
+	return ptrAPIError{
+		msg: "403 GET https://mail-api.proton.me/calendar/v1/x/events",
+		err: apiErr,
+	}
 }
+
+// ptrAPIError wraps *APIError the way catchAPIError does, without %w.
+// Go 1.27's vet rejects %w of that pointer.
+type ptrAPIError struct {
+	msg string
+	err *gpa.APIError
+}
+
+func (e ptrAPIError) Error() string { return e.msg }
+
+func (e ptrAPIError) Unwrap() error { return e.err }
 
 // Phase 2 of RunCalendarOnce on a blocked session: the first 9100 stops
 // the pass (no request per remaining calendar), records the block, and

@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          # Same go.mod `go` and `toolchain` lines as ci.yml.
+          # Same go.mod `go` line as ci.yml. There is no toolchain line.
           go-version-file: go.mod
           cache: true
 

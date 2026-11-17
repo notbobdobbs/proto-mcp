@@ -25,6 +25,17 @@ func (unwrapNilAPIError) Error() string { return "nil api error" }
 
 func (unwrapNilAPIError) Unwrap() error { return (*gpa.APIError)(nil) }
 
+// ptrAPIError wraps *APIError the way catchAPIError does. Go 1.27's
+// vet rejects %w of that pointer, so Unwrap carries it instead.
+type ptrAPIError struct {
+	msg string
+	err *gpa.APIError
+}
+
+func (e ptrAPIError) Error() string { return e.msg }
+
+func (e ptrAPIError) Unwrap() error { return e.err }
+
 func apiErrFromBody(t *testing.T, body string, status int) error {
 	t.Helper()
 	apiErr := &gpa.APIError{}
@@ -32,10 +43,10 @@ func apiErrFromBody(t *testing.T, body string, status int) error {
 		t.Fatalf("decode APIError: %v", err)
 	}
 	apiErr.Status = status
-	// Wrap the value. Go 1.27 rejects %w of *APIError because the
-	// Error method is on the value, and wrapping the pointer defeats
-	// errors.Is. missingScopeAPIError accepts both shapes.
-	return fmt.Errorf("%v GET https://mail-api.proton.me/calendar/v1/x/events: %w", status, *apiErr)
+	return ptrAPIError{
+		msg: fmt.Sprintf("%d GET https://mail-api.proton.me/calendar/v1/x/events", status),
+		err: apiErr,
+	}
 }
 
 func TestMissingScopes_RealAPIError(t *testing.T) {
@@ -58,8 +69,8 @@ func TestMissingScopes_RealAPIError(t *testing.T) {
 	if got := MissingScopes(outer); !reflect.DeepEqual(got, []string{"calendar"}) {
 		t.Errorf("MissingScopes(wrapped) = %v, want [calendar]", got)
 	}
-	var apiErr gpa.APIError
-	if !errors.As(outer, &apiErr) || apiErr.Status != 403 {
+	var apiErr *gpa.APIError
+	if !errors.As(outer, &apiErr) || apiErr == nil || apiErr.Status != 403 {
 		t.Errorf("APIError lost from the chain: %v", outer)
 	}
 	if WrapMissingScope(wrapped) != wrapped {
