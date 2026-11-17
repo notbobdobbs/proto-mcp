@@ -174,14 +174,17 @@ because non-browser MCP clients do not send one. A present Origin
 must match an entry you listed. The value `null` is rejected. The
 default list has no Origins, so a browser is refused.
 
-`protonmcp policy reload` (SIGHUP) also re-reads `http.yaml` and
-opens or closes the listener. The token is not cached: each request
-reads it from the Keychain, so revoke is immediate. Omitted or `0`
-for `max_unlock_hours` and the two rate caps means the default.
-There is no value that means "never expire" or "no cap". A number
-below 0, `max_unlock_hours` above 24, a rate above its hard ceiling,
-or a `remote_tools` entry of `*` keeps the previous good file in
-effect and does not enable the listener on first load.
+`protonmcp policy reload` (SIGHUP) re-reads `http.yaml` and opens
+or closes the listener even when the policy file failed to reload.
+The previous policy stays in that case. The token is not cached:
+each request reads it from the Keychain, so revoke is immediate.
+Omitted or `0` for `max_unlock_hours` and the two rate caps means
+the default. There is no value that means "never expire" or "no
+cap". A number below 0, `max_unlock_hours` above 24, a rate above
+its hard ceiling, or a `remote_tools` entry of `*` makes the file
+unusable. The daemon treats an unusable file as disabled and closes
+a listener it already opened. It does not keep the last good config.
+A first load does not enable the listener.
 
 ### Remote tool scope
 
@@ -279,19 +282,24 @@ Commands, all local:
   enables. `protonmcp doctor` prints the same warning. Neither
   blocks. Screen lock off is the accepted risk in decision (a).
 - `protonmcp http token rotate` — replace the 32 bytes, copy the new
-  token to the clipboard, and clear the clipboard about 60 seconds
-  later if it still holds that token. Do not write it to stdout,
+  token to the clipboard, and keep the process alive for about 60
+  seconds with a countdown. Ctrl-C clears early. Clear only if the
+  clipboard still holds that token. Do not write it to stdout,
   stderr, or a log. Drop in-memory sessions. The previous token fails
   on the next request. The value is not an argument (it would show
-  up in `ps`).
+  up in `ps`). Universal Clipboard can copy the token to the owner's
+  other Apple devices while it sits on the clipboard.
 - `protonmcp http token revoke` — delete the Keychain item and drop
   sessions. The listener, if still up, answers `401` to everyone.
 - `protonmcp http token show` — same clipboard copy and 60-second
   clear, and only after a Touch ID approval. Decline copies nothing.
   This does not approve a send.
 - `protonmcp http status` — enabled or not, listen address, whether
-  a token exists, session count, age of the HTTP unlock clock.
-  Never the token.
+  a token exists, session count, age of the HTTP unlock clock, and
+  whether the daemon is actually listening. The live numbers come
+  from the daemon's status file and are shown only while that
+  process is still running. Never the token. `doctor` says the door
+  is listening whenever that process still has the listener open.
 - `protonmcp http activity` — counts of remote tool calls from the
   audit log. See below.
 

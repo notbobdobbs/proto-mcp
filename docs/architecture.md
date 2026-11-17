@@ -1,8 +1,13 @@
 # Architecture
 
-proto-mcp runs as a small constellation of local processes. Nothing
-listens on a network port; everything talks over a `0600` Unix socket
-inside your home directory.
+proto-mcp runs as a small constellation of local processes. Local
+clients talk over a `0600` Unix socket inside your home directory.
+When you turn it on, the daemon also listens on loopback only
+(`127.0.0.1:4765` by default) for a remote MCP client. That listener
+is off unless `http.yaml` has `enabled: true` and a token is in the
+Keychain. The socket path, mode, and peer checks are unchanged. The
+daemon does not open a public port; a tunnel you run yourself, if you
+want one, forwards to that loopback port.
 
 ```
                 Claude Desktop          Claude Code
@@ -31,7 +36,7 @@ inside your home directory.
 | Binary | Role |
 |---|---|
 | `protonmcp` | The CLI. Login, backfill, daemon control, policy, install. What you run by hand. |
-| `protonmcpd` | The daemon. One long-running process holding the Touch-ID-unlocked session and serving every MCP tool over the socket. |
+| `protonmcpd` | The daemon. One long-running process holding the Touch-ID-unlocked session and serving every MCP tool over the socket, and over loopback HTTP when that door is enabled. |
 | `protonmcp-shim` | A tiny stdio↔socket forwarder. Claude Desktop and Claude Code each spawn their own shim; both share the one daemon. |
 | `protonmcp-touchid` | Swift helper that puts up the biometric prompt (`LAContext` / `.deviceOwnerAuthentication`). |
 | `protonmcp-lockwatch` | Swift helper that watches for screen lock and sleep so the daemon can auto-lock. |
@@ -72,7 +77,9 @@ encrypted at rest.
 | `internal/keystore` | macOS Keychain read/write for the session blob (cgo against `Security.framework`). |
 | `internal/audit` | Redacted audit log (SQLite + JSONL). |
 | `internal/redact` | Scrubbing of secrets/tokens/bodies before anything is logged. |
-| `internal/caller` | `SO_PEERCRED` / `LOCAL_PEERPID` peer-credential checks on each socket connection. |
+| `internal/caller` | `SO_PEERCRED` / `LOCAL_PEERPID` peer-credential checks on each socket connection. HTTP callers are recorded as `http:<label>` instead. |
+| `internal/httpmcp` | The loopback HTTP door. The only TCP listen in the repo. |
+| `internal/httpconfig` | Reads and writes `http.yaml`. Editing `policy.yaml` cannot open the port. |
 | `internal/serve` | The MCP runtime shared by `serve-stdio` and the daemon. |
 | `internal/mcptools` | The 31 tools. |
 
