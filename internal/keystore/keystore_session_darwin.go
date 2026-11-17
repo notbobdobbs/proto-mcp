@@ -135,13 +135,12 @@ func Exists() (bool, error) {
 	return len(results) > 0, nil
 }
 
-// Delete removes the stored session. Returns nil if no entry exists
-// (idempotent — useful for logout flows that don't want to fail when
-// the user was never logged in).
-func Delete() error {
-	err := keychain.DeleteGenericPasswordItem(Service, Account)
-	if errors.Is(err, keychain.ErrorItemNotFound) {
-		return nil
+func init() {
+	deleteKeychainItem = func(service, account string) error {
+		err := keychain.DeleteGenericPasswordItem(service, account)
+		if errors.Is(err, keychain.ErrorItemNotFound) {
+			return errKeychainItemNotFound
+		}
+		return err
 	}
-	return err
 }
