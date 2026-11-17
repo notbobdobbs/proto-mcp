@@ -339,7 +339,7 @@ func acceptLoop(ctx context.Context, l *net.UnixListener, rt *serve.Runtime) err
 					"our_uid", os.Getuid())
 				return
 			}
-			connCtx := caller.WithCaller(ctx, peer)
+			connCtx := caller.WithCaller(ctx, stampSocketCaller(peer))
 			serveConn(connCtx, c, rt)
 		}(conn)
 	}
@@ -357,6 +357,15 @@ func acceptLoop(ctx context.Context, l *net.UnixListener, rt *serve.Runtime) err
 		slog.Warn("daemon drain timeout — some connections still open at exit")
 	}
 	return nil
+}
+
+// stampSocketCaller marks a peer-credential identity as a Unix-socket
+// caller. Transport is part of the approval cache key, so an approval
+// recorded for this door is not reused by another. PID, UID, and the
+// binary path are the peer's and are left alone.
+func stampSocketCaller(peer caller.Caller) caller.Caller {
+	peer.Transport = caller.TransportUnix
+	return peer
 }
 
 // serveConn runs one NDJSON conversation against a single connection.

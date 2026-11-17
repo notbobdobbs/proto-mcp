@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -435,3 +437,279 @@ func TestMiddlewareJSONRPCErrorBubbles(t *testing.T) {
 
 // _ unused — kept so the import isn't dropped if errors usage changes.
 var _ = errors.New
+
+func serveAs(t *testing.T, srv *Server, ctx context.Context, lines ...string) []map[string]any {
+	t.Helper()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	in := strings.NewReader(strings.Join(lines, "\n") + "\n")
+	var out bytes.Buffer
+	if err := srv.Serve(ctx, in, &out); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("Serve: %v", err)
+	}
+	var responses []map[string]any
+	dec := json.NewDecoder(&out)
+	for dec.More() {
+		var m map[string]any
+		if err := dec.Decode(&m); err != nil {
+			t.Fatalf("decode response: %v\n%s", err, out.String())
+		}
+		responses = append(responses, m)
+	}
+	return responses
+}
+
+func toolCallLines(name, args string) []string {
+	return []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"synthetic","version":"0"}}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"` + name + `","arguments":` + args + `}}`,
+	}
+}
+
+// A PID-0 HTTP caller is audited as that caller, for a read and for
+// a denial. It must not be rewritten as the daemon's parent. Args
+// keep message_id and store a body only as a hash and a length.
+func TestMiddlewareHTTPCallerIsAudited(t *testing.T) {
+	w, st := newTestAudit(t)
+	pol := newTestPolicy(t, "{}\n")
+	var reads, deniedRuns int
+	srv := New(nil, WithPolicy(pol), WithAudit(w), WithCallerResolver(caller.New()))
+	registerEcho := func(name string, counter *int) {
+		srv.Register(Tool{
+			Name:        name,
+			Description: name,
+			InputSchema: json.RawMessage(`{"type":"object"}`),
+			Handler: func(Context, json.RawMessage) (*ToolResult, error) {
+				*counter++
+				return StructuredResult(map[string]string{"ok": "yes"})
+			},
+		})
+	}
+	registerEcho("mail_read", &reads)
+	registerEcho("mail_delete_permanent", &deniedRuns)
+
+	httpCaller := caller.Caller{
+		Transport: caller.TransportHTTP,
+		Label:     "remote",
+		PID:       0,
+		UID:       501,
+	}
+	ctx := caller.WithCaller(context.Background(), httpCaller)
+	args := `{"message_id":"synthetic-message-1","body":"synthetic body not a mailbox"}`
+	parent := os.Getppid()
+
+	for _, name := range []string{"mail_read", "mail_delete_permanent"} {
+		resps := serveAs(t, srv, ctx, toolCallLines(name, args)...)
+		if len(resps) < 2 {
+			t.Fatalf("%s: got %d responses", name, len(resps))
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("mail_read handler calls = %d, want 1", reads)
+	}
+	if deniedRuns != 0 {
+		t.Fatalf("denied tool handler ran %d times", deniedRuns)
+	}
+
+	rows, err := st.DB.Query(`
+SELECT tool, caller_pid, caller_binary, transport, caller_label, claimed_client, outcome, args_json
+FROM audit_log ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var tool, binary, transport, label, claimed, outcome, argsJSON string
+		var pid int
+		if err := rows.Scan(&tool, &pid, &binary, &transport, &label, &claimed, &outcome, &argsJSON); err != nil {
+			t.Fatal(err)
+		}
+		seen[tool] = true
+		if pid != 0 {
+			t.Errorf("%s caller_pid = %d, want 0 (parent pid is %d; that would be the launchd fallback)", tool, pid, parent)
+		}
+		if transport != caller.TransportHTTP || label != "remote" {
+			t.Errorf("%s transport=%q label=%q, want http/remote", tool, transport, label)
+		}
+		if binary != "" {
+			t.Errorf("%s caller_binary = %q, want empty", tool, binary)
+		}
+		if claimed != "" {
+			t.Errorf("%s claimed_client = %q, want empty until a later change records it", tool, claimed)
+		}
+		if strings.Contains(argsJSON, "synthetic body not a mailbox") {
+			t.Errorf("%s stored the body literally: %s", tool, argsJSON)
+		}
+		if !strings.Contains(argsJSON, `"message_id":"synthetic-message-1"`) {
+			t.Errorf("%s lost message_id: %s", tool, argsJSON)
+		}
+		if !strings.Contains(argsJSON, `"sha256"`) || !strings.Contains(argsJSON, `"bytes"`) {
+			t.Errorf("%s body was not stored as sha256 and bytes: %s", tool, argsJSON)
+		}
+		switch tool {
+		case "mail_read":
+			if outcome != "ok" {
+				t.Errorf("mail_read outcome = %q, want ok", outcome)
+			}
+		case "mail_delete_permanent":
+			if outcome != "denied" {
+				t.Errorf("mail_delete_permanent outcome = %q, want denied", outcome)
+			}
+		default:
+			t.Errorf("unexpected tool %s", tool)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !seen["mail_read"] || !seen["mail_delete_permanent"] {
+		t.Fatalf("audit rows = %v, want both tools", seen)
+	}
+}
+
+func TestMiddlewareUnixRowLeavesClaimedClientEmpty(t *testing.T) {
+	w, st := newTestAudit(t)
+	pol := newTestPolicy(t, "{}\n")
+	srv := New(nil, WithPolicy(pol), WithAudit(w), WithCallerResolver(caller.New()))
+	srv.Register(Tool{
+		Name:        "mail_read",
+		Description: "read",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Handler: func(Context, json.RawMessage) (*ToolResult, error) {
+			return StructuredResult(map[string]string{"ok": "yes"})
+		},
+	})
+	ctx := caller.WithCaller(context.Background(), caller.Caller{
+		Transport: caller.TransportUnix,
+		PID:       4242,
+		UID:       501,
+		Binary:    "/synthetic/client",
+	})
+	serveAs(t, srv, ctx, toolCallLines("mail_read", `{"message_id":"synthetic-message-1"}`)...)
+
+	var transport, label, claimed string
+	var pid int
+	if err := st.DB.QueryRow(`SELECT caller_pid, transport, caller_label, claimed_client FROM audit_log WHERE tool = 'mail_read'`).
+		Scan(&pid, &transport, &label, &claimed); err != nil {
+		t.Fatal(err)
+	}
+	if pid != 4242 || transport != "unix" || label != "" || claimed != "" {
+		t.Errorf("unix row pid=%d transport=%q label=%q claimed=%q", pid, transport, label, claimed)
+	}
+}
+
+// Two PIDs share one per-tool bucket. The second call is over the
+// cap whichever caller makes it. The persisted key is the tool name,
+// not tool|pid.
+func TestMiddlewareRateLimitIsPerTool(t *testing.T) {
+	w, _ := newTestAudit(t)
+	pol := newTestPolicy(t, `
+tools:
+  mail_read:
+    decision: allow
+    rate_limit: "1/hour"
+`)
+	persisted := &fakePersister{}
+	var calls int
+	srv := New(nil,
+		WithPolicy(pol),
+		WithAudit(w),
+		WithCallerResolver(caller.New()),
+		WithRateLimitPersister(persisted),
+	)
+	srv.Register(Tool{
+		Name:        "mail_read",
+		Description: "read",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Handler: func(Context, json.RawMessage) (*ToolResult, error) {
+			calls++
+			return StructuredResult(map[string]string{"ok": "yes"})
+		},
+	})
+
+	call := func(pid int) string {
+		t.Helper()
+		ctx := caller.WithCaller(context.Background(), caller.Caller{
+			Transport: caller.TransportUnix,
+			PID:       pid,
+			UID:       501,
+			Binary:    "/synthetic/client",
+		})
+		resps := serveAs(t, srv, ctx, toolCallLines("mail_read", `{}`)...)
+		if len(resps) < 2 {
+			t.Fatalf("pid %d: %d responses", pid, len(resps))
+		}
+		result, _ := resps[1]["result"].(map[string]any)
+		if result == nil {
+			t.Fatalf("pid %d: no result: %+v", pid, resps[1])
+		}
+		if result["isError"] == true {
+			return result["content"].([]any)[0].(map[string]any)["text"].(string)
+		}
+		return ""
+	}
+
+	if msg := call(111); msg != "" {
+		t.Fatalf("first caller denied: %s", msg)
+	}
+	msg := call(222)
+	if !strings.Contains(msg, "rate limit") {
+		t.Fatalf("second pid should share the bucket and be denied; got %q", msg)
+	}
+	if calls != 1 {
+		t.Fatalf("handler calls = %d, want 1", calls)
+	}
+	if len(persisted.saved) != 1 {
+		t.Fatalf("buckets = %#v, want one", persisted.saved)
+	}
+	if _, ok := persisted.saved["mail_read"]; !ok {
+		t.Fatalf("bucket key = %#v, want mail_read", persisted.saved)
+	}
+}
+
+func TestMiddlewareHTTPAuditWriteFailureRefusesTheTool(t *testing.T) {
+	w, st := newTestAudit(t)
+	pol := newTestPolicy(t, "{}\n")
+	if err := st.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var httpCalls, unixCalls int
+	srv := New(nil, WithPolicy(pol), WithAudit(w))
+	srv.Register(Tool{
+		Name:        "mail_read",
+		Description: "read",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Handler: func(ctx Context, _ json.RawMessage) (*ToolResult, error) {
+			if ctx.Caller.PID == 0 {
+				httpCalls++
+			} else {
+				unixCalls++
+			}
+			return StructuredResult(map[string]string{"ok": "yes"})
+		},
+	})
+	httpCtx := caller.WithCaller(context.Background(), caller.Caller{
+		Transport: caller.TransportHTTP, Label: "remote", PID: 0, UID: 501,
+	})
+	resps := serveAs(t, srv, httpCtx, toolCallLines("mail_read", `{}`)...)
+	if len(resps) < 2 {
+		t.Fatalf("responses %d", len(resps))
+	}
+	text := resps[1]["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "audit log") {
+		t.Fatalf("HTTP text = %q", text)
+	}
+	if httpCalls != 0 {
+		t.Fatal("HTTP tool ran without an audit row")
+	}
+	unixCtx := caller.WithCaller(context.Background(), caller.Caller{
+		Transport: caller.TransportUnix, PID: 42, UID: 501, Binary: "/synthetic/client",
+	})
+	resps = serveAs(t, srv, unixCtx, toolCallLines("mail_read", `{}`)...)
+	if unixCalls != 1 {
+		t.Fatalf("unix calls = %d, responses %+v", unixCalls, resps)
+	}
+}

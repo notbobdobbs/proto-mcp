@@ -9,9 +9,10 @@
 //	1 → user declined / cancelled / biometric failed
 //	2 → malformed stdin (programmer error on our side; surfaces as ErrAuthFailed)
 //
-// Caching: per-policy TTL is applied here, keyed by
-// sha256(tool || pid || args_json) so changing recipients
-// invalidates an approval. ttl: 0 bypasses the cache entirely
+// Caching: per-policy TTL is applied here. The key covers the
+// tool, the caller's pid, transport, and label, and the args, so
+// one caller cannot reuse another's approval and changing
+// recipients invalidates it. ttl: 0 bypasses the cache entirely
 // (always reprompt) — appropriate for irreversible operations.
 package approval
 
@@ -55,9 +56,9 @@ type Request struct {
 // Construct via New(). Safe for concurrent use; the cache has its
 // own lock.
 type Broker struct {
-	helperPath  string
-	cache       *cache
-	logger      *slog.Logger
+	helperPath    string
+	cache         *cache
+	logger        *slog.Logger
 	helperTimeout time.Duration
 }
 
@@ -107,7 +108,7 @@ func New(helperPath string, logger *slog.Logger) (*Broker, error) {
 func (b *Broker) Request(ctx context.Context, r Request) (string, error) {
 	ttl := r.Policy.TTLDuration()
 	if ttl > 0 {
-		key := cacheKey(r.Tool, r.Caller.PID, r.Args)
+		key := cacheKey(r.Tool, r.Caller, r.Args)
 		if b.cache.hit(key) {
 			return SourceCached, nil
 		}

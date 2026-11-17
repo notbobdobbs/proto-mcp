@@ -17,6 +17,25 @@ const scopeBody = `{"Code":9100,"Error":"Access token does not have sufficient s
 
 // apiErrFromBody decodes body the way go-proton-api does and wraps it the
 // way catchAPIError does, so the tests exercise the real error shape.
+// unwrapNilAPIError puts a nil *APIError in an error chain without
+// using %w on the pointer, which Go 1.27's vet rejects.
+type unwrapNilAPIError struct{}
+
+func (unwrapNilAPIError) Error() string { return "nil api error" }
+
+func (unwrapNilAPIError) Unwrap() error { return (*gpa.APIError)(nil) }
+
+// ptrAPIError wraps *APIError the way catchAPIError does. Go 1.27's
+// vet rejects %w of that pointer, so Unwrap carries it instead.
+type ptrAPIError struct {
+	msg string
+	err *gpa.APIError
+}
+
+func (e ptrAPIError) Error() string { return e.msg }
+
+func (e ptrAPIError) Unwrap() error { return e.err }
+
 func apiErrFromBody(t *testing.T, body string, status int) error {
 	t.Helper()
 	apiErr := &gpa.APIError{}
@@ -24,7 +43,10 @@ func apiErrFromBody(t *testing.T, body string, status int) error {
 		t.Fatalf("decode APIError: %v", err)
 	}
 	apiErr.Status = status
-	return fmt.Errorf("%v GET https://mail-api.proton.me/calendar/v1/x/events: %w", status, apiErr)
+	return ptrAPIError{
+		msg: fmt.Sprintf("%d GET https://mail-api.proton.me/calendar/v1/x/events", status),
+		err: apiErr,
+	}
 }
 
 func TestMissingScopes_RealAPIError(t *testing.T) {
@@ -48,7 +70,7 @@ func TestMissingScopes_RealAPIError(t *testing.T) {
 		t.Errorf("MissingScopes(wrapped) = %v, want [calendar]", got)
 	}
 	var apiErr *gpa.APIError
-	if !errors.As(outer, &apiErr) || apiErr.Status != 403 {
+	if !errors.As(outer, &apiErr) || apiErr == nil || apiErr.Status != 403 {
 		t.Errorf("APIError lost from the chain: %v", outer)
 	}
 	if WrapMissingScope(wrapped) != wrapped {
@@ -80,7 +102,7 @@ func TestMissingScopes_NonMatching(t *testing.T) {
 		"hv 9001":       apiErrFromBody(t, `{"Code":9001,"Error":"Human verification required","Details":{"HumanVerificationToken":"x"}}`, 422),
 		"other 403":     apiErrFromBody(t, `{"Code":2011,"Error":"Forbidden"}`, 403),
 		"net error":     fmt.Errorf("fetch: %w", io.ErrUnexpectedEOF),
-		"nil *APIError": fmt.Errorf("x: %w", (*gpa.APIError)(nil)),
+		"nil *APIError": unwrapNilAPIError{},
 	}
 	for name, err := range cases {
 		t.Run(name, func(t *testing.T) {

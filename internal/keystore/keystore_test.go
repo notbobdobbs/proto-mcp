@@ -1,6 +1,7 @@
 package keystore
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 
@@ -21,5 +22,34 @@ func TestValidateRefusesAllZeroSaltedKeyPass(t *testing.T) {
 	}.validate()
 	if err == nil || !strings.Contains(err.Error(), "all-zero") {
 		t.Fatalf("validate with an all-zero pass = %v, want an all-zero refusal", err)
+	}
+}
+
+// Non-macOS builds have no Keychain. Save must still refuse an
+// all-zero pass, and a well-formed session must not be reported as
+// stored.
+func TestSaveWithoutKeychainRefusesAndDoesNotSucceed(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("macOS Save writes the real Keychain item")
+	}
+	err := Save(Live{
+		Email:         "synthetic@example.com",
+		UID:           "uid",
+		RefreshToken:  "refresh",
+		SaltedKeyPass: secret.New(make([]byte, 32)),
+	})
+	if err == nil || !strings.Contains(err.Error(), "all-zero") {
+		t.Fatalf("Save(all-zero) = %v, want the all-zero refusal", err)
+	}
+	pass := make([]byte, 32)
+	pass[0] = 1
+	err = Save(Live{
+		Email:         "synthetic@example.com",
+		UID:           "uid",
+		RefreshToken:  "refresh",
+		SaltedKeyPass: secret.New(pass),
+	})
+	if err == nil || !strings.Contains(err.Error(), "macOS Keychain") {
+		t.Fatalf("Save = %v, want a Keychain-required error", err)
 	}
 }

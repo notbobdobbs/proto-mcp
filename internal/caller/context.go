@@ -25,12 +25,16 @@ func WithCaller(parent context.Context, c Caller) context.Context {
 	return context.WithValue(parent, callerKey, c)
 }
 
-// FromContext returns the Caller stashed by WithCaller, or the
-// zero Caller if absent. Callers detect "no per-conn caller set"
-// by comparing the result against the zero value.
-func FromContext(ctx context.Context) Caller {
-	if c, ok := ctx.Value(callerKey).(Caller); ok {
-		return c
+// FromContext returns the Caller stashed by WithCaller.
+//
+// The boolean is false only when nothing was stashed. A stashed
+// caller is present even when PID is 0. HTTP has no peer process,
+// and treating PID 0 as "absent" made the middleware fall back to
+// the daemon's parent (launchd) and audit the wrong caller.
+func FromContext(ctx context.Context) (Caller, bool) {
+	c, ok := ctx.Value(callerKey).(Caller)
+	if !ok {
+		return Caller{}, false
 	}
-	return Caller{}
+	return c, true
 }

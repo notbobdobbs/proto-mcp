@@ -56,8 +56,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          # See ci.yml: sourced from go.mod so the toolchain always
-          # satisfies the declared floor.
+          # Same go.mod `go` line as ci.yml. There is no toolchain line.
           go-version-file: go.mod
           cache: true
 
