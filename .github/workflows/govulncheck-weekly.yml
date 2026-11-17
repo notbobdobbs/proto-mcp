@@ -28,8 +28,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          # See ci.yml: sourced from go.mod so the toolchain always
-          # satisfies the declared floor.
+          # Same go.mod `go` and `toolchain` lines as ci.yml.
           go-version-file: go.mod
           cache: true
 

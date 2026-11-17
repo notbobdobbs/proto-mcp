@@ -327,7 +327,8 @@ func scopeError(t *testing.T) error {
 		t.Fatal(err)
 	}
 	apiErr.Status = 403
-	return fmt.Errorf("403 GET https://mail-api.proton.me/calendar/v1/x/events: %w", apiErr)
+	// Wrap the value. Go 1.27 rejects %w of *APIError.
+	return fmt.Errorf("403 GET https://mail-api.proton.me/calendar/v1/x/events: %w", *apiErr)
 }
 
 // Phase 2 of RunCalendarOnce on a blocked session: the first 9100 stops
