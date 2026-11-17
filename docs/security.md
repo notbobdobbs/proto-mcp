@@ -224,9 +224,13 @@ The socket's peer checks stay; they simply do not apply to HTTP.
   threshold the daemon writes `enabled: false`, closes the listener,
   drops HTTP sessions, writes an audit row that does not contain the
   token, and posts a notification. A failed notification leaves the
-  door off. Midnight resets the count and does not turn the door
-  back on. The only re-enable is `protonmcp http enable`, which also
-  zeros today's count. This is not an idle lock.
+  door off. A counter file that cannot be written still counts in
+  memory and still turns the door off. A Keychain read error is a
+  401 and is not one of those failures; the log does not contain the
+  token. Midnight resets the count and does not turn the door back
+  on. Editing `http.yaml` and reloading does not turn it back on
+  either. The only re-enable is `protonmcp http enable`, which clears
+  the auto-disable and zeros today's count. This is not an idle lock.
 - **Prompt injection from mail the bot reads.** A hostile message can
   tell the bot to trash, download, or send. Download and recoverable
   trash are on the default remote list and still require Touch ID.

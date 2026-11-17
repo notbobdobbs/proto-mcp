@@ -7,7 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -53,8 +56,15 @@ type Service struct {
 	// A returned error does not undo the disable.
 	Notify func(string) error
 
-	mu        sync.Mutex
-	failMu    sync.Mutex
+	mu     sync.Mutex
+	failMu sync.Mutex
+	// memDay and memFails count failed sign-ins even when the counter
+	// file cannot be written. blocked stays set until http enable
+	// clears it, including when both disable writes failed.
+	memDay    string
+	memFails  int
+	blocked   bool
+	blockedAt int64
 	cfg       httpconfig.Config
 	ln        net.Listener
 	httpSrv   *http.Server
@@ -140,6 +150,9 @@ func (s *Service) now() time.Time {
 func (s *Service) Reload() error {
 	cfg, loadErr := httpconfig.Load(s.Path)
 	fp, have := s.currentFP()
+	// An auto-disable sticks until `protonmcp http enable` clears it.
+	// A hand-edit of http.yaml plus SIGHUP does not.
+	blocked := s.autoDisableBlocks(s.now())
 	s.mu.Lock()
 	var ret error
 	if loadErr != nil {
@@ -150,7 +163,8 @@ func (s *Service) Reload() error {
 		ret = loadErr
 	} else {
 		s.cfg = cfg
-		if !cfg.Enabled || !have {
+		if blocked || !cfg.Enabled || !have {
+			s.cfg.Enabled = cfg.Enabled && !blocked
 			s.sessions = map[string]*hsess{}
 			s.haveFP = false
 			s.stopLocked()
@@ -355,8 +369,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-	tok, ok := s.bearer(r)
-	if !ok {
+	tok, err := s.bearer(r)
+	if err != nil {
+		if errors.Is(err, errTokenStore) {
+			slog.Warn("remote door could not read the bearer token", "err", SafeError(err))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		s.authFails.add(now)
 		s.recordAuthFailure(r.Context(), now)
 		w.WriteHeader(http.StatusUnauthorized)
@@ -504,30 +523,41 @@ func (s *Service) dropOldestLocked() {
 	}
 }
 
-func (s *Service) bearer(r *http.Request) ([]byte, bool) {
+// errTokenRejected is a bad or missing bearer. errTokenStore is a
+// failure to read the Keychain (or whatever Token uses). A store
+// error is not a failed sign-in.
+var (
+	errTokenRejected = errors.New("httpmcp: bearer rejected")
+	errTokenStore    = errors.New("httpmcp: token store")
+)
+
+func (s *Service) bearer(r *http.Request) ([]byte, error) {
 	if s.Token == nil {
-		return nil, false
+		return nil, errTokenRejected
 	}
 	stored, err := s.Token()
 	if err != nil {
-		return nil, false
+		if errors.Is(err, keystore.ErrHTTPTokenNotFound) {
+			return nil, errTokenRejected
+		}
+		return nil, fmt.Errorf("%w: %s", errTokenStore, SafeError(err))
 	}
 	defer stored.Zero()
 	if len(stored.Bytes()) != keystore.HTTPTokenLen {
-		return nil, false
+		return nil, errTokenRejected
 	}
 	h := r.Header.Get("Authorization")
 	const p = "Bearer "
 	if len(h) < len(p) || !strings.EqualFold(h[:len(p)], p) {
-		return nil, false
+		return nil, errTokenRejected
 	}
 	presented := strings.TrimSpace(h[len(p):])
 	if !keystore.HTTPTokenMatches(stored.Bytes(), presented) {
-		return nil, false
+		return nil, errTokenRejected
 	}
 	out := make([]byte, len(stored.Bytes()))
 	copy(out, stored.Bytes())
-	return out, true
+	return out, nil
 }
 
 func (s *Service) noteToken(raw []byte) {

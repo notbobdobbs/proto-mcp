@@ -166,9 +166,14 @@ wrong bearer, and any bearer in the query string, including
 `enabled: false` (mode `0600`, other settings kept when the file
 still parses), closes the listener, and drops HTTP sessions. It
 writes an audit row with the count and not the token, then posts a
-notification. If that notification fails, the door stays off. The
-count resets at local midnight and when you run `protonmcp http
-enable`. The door does not turn itself back on. There is no idle
+notification. If that notification fails, the door stays off. If the
+counter file cannot be saved, the failure is still counted in memory
+and the door turns off. A Keychain read error is a 401 and is not
+counted as a failed sign-in. The count resets at local midnight and
+when you run `protonmcp http enable`. Editing `http.yaml` back to
+`enabled: true` and reloading does not turn the door on after an
+auto-disable, including when the disable could not write the file.
+Only `protonmcp http enable` clears that block. There is no idle
 lock and no away lock in this counter.
 
 Screen lock left off is an accepted risk. `http enable` and `doctor`

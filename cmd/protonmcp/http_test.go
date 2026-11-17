@@ -212,7 +212,7 @@ func TestHTTPEnableResetsTodayAuthFailures(t *testing.T) {
 		t.Fatalf("enabled %+v %v", cfg.Enabled, err)
 	}
 	got := httpconfig.ReadAuthDay(path, time.Now())
-	if got.Failures != 0 || !got.AutoDisabled || got.AutoDisabledAt == "" {
+	if got.Failures != 0 || got.AutoDisabled || got.ClearedUnixNano == 0 {
 		t.Fatalf("auth day after enable = %+v", got)
 	}
 	if !strings.Contains(stdout.String(), "enabled") {
@@ -222,7 +222,7 @@ func TestHTTPEnableResetsTodayAuthFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := stdout.String()
-	if !strings.Contains(out, "auth failures today: 0") || !strings.Contains(out, "auto-disabled: "+got.AutoDisabledAt) {
+	if !strings.Contains(out, "auth failures today: 0") || !strings.Contains(out, "auto-disabled: none") {
 		t.Fatalf("status = %q", out)
 	}
 }

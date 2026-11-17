@@ -16,6 +16,10 @@ type AuthDay struct {
 	Failures       int    `json:"failures"`
 	AutoDisabled   bool   `json:"auto_disabled"`
 	AutoDisabledAt string `json:"auto_disabled_at,omitempty"`
+	// ClearedUnixNano is set by `protonmcp http enable`. A hand-edit
+	// of http.yaml does not set it. The daemon uses it to tell an
+	// enable apart from a reload after a failed disable write.
+	ClearedUnixNano int64 `json:"cleared_unix_nano,omitempty"`
 }
 
 // AuthStatePath is the counter file next to http.yaml.
@@ -59,15 +63,18 @@ func MarkAutoDisabled(path string, now time.Time) error {
 	return writeAuthDay(path, rec)
 }
 
-// ResetAuthFailures zeros today's count. An auto-disable already
-// recorded for today stays, so status can still show the event.
-// A new local day starts clean.
+// ResetAuthFailures is what `protonmcp http enable` calls. It zeros
+// today's count and clears the auto-disable block. A new local day
+// zeros the count by itself, but it does not clear the block.
 func ResetAuthFailures(path string, now time.Time) error {
 	authMu.Lock()
 	defer authMu.Unlock()
 	rec := readAuthDay(path, now)
 	rec.Day = dayKey(now)
 	rec.Failures = 0
+	rec.AutoDisabled = false
+	rec.AutoDisabledAt = ""
+	rec.ClearedUnixNano = now.UnixNano()
 	return writeAuthDay(path, rec)
 }
 
@@ -78,8 +85,14 @@ func readAuthDay(path string, now time.Time) AuthDay {
 		return AuthDay{Day: today}
 	}
 	var rec AuthDay
-	if err := json.Unmarshal(data, &rec); err != nil || rec.Day != today {
+	if err := json.Unmarshal(data, &rec); err != nil {
 		return AuthDay{Day: today}
+	}
+	if rec.Day != today {
+		// The failure count is per local day. The auto-disable block
+		// stays until http enable clears it.
+		rec.Day = today
+		rec.Failures = 0
 	}
 	return rec
 }

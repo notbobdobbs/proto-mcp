@@ -1,7 +1,9 @@
 package httpmcp
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/audit"
 	"github.com/just-an-oldsalt/proto-mcp/internal/httpconfig"
+	"github.com/just-an-oldsalt/proto-mcp/internal/secret"
 )
 
 func TestAuthFailuresCloseTheListenerAndKeepTheFile(t *testing.T) {
@@ -112,7 +115,7 @@ func TestAuthFailuresCloseTheListenerAndKeepTheFile(t *testing.T) {
 		t.Fatalf("enable left %+v %v", again, err)
 	}
 	today := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
-	if today.Failures != 0 || !today.AutoDisabled {
+	if today.Failures != 0 || today.AutoDisabled || today.ClearedUnixNano == 0 {
 		t.Fatalf("after enable %+v", today)
 	}
 	if err := s.Reload(); err != nil {
@@ -159,4 +162,198 @@ func TestAuthFailureCountResetsAtLocalMidnight(t *testing.T) {
 	if old.Failures != 0 {
 		t.Fatalf("yesterday still counts: %+v", old)
 	}
+}
+
+func TestUnsavedAuthFailureStillClosesTheDoor(t *testing.T) {
+	s, _, text, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.AutoDisableAfterAuthFailures = 50
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	authPath := httpconfig.AuthStatePath(s.Path)
+	if err := os.Mkdir(authPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authPath+"/blocker", []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var notes []string
+	s.Notify = func(msg string) error {
+		notes = append(notes, msg)
+		return nil
+	}
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	host := "127.0.0.1:4765"
+	post(s, "", host, "", `{}`)
+	if s.Listening() {
+		t.Fatal("a counter write error left the listener up")
+	}
+	if _, err := net.DialTimeout("tcp", cfg.Listen, 200*time.Millisecond); err == nil {
+		t.Fatal("dial succeeded after the counter write failed")
+	}
+	body, err := os.ReadFile(s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 || !strings.Contains(string(body), "enabled: false") {
+		t.Fatalf("mode %o yaml %s", info.Mode().Perm(), body)
+	}
+	if len(notes) != 1 || strings.Contains(notes[0], text) || strings.Contains(logs.String(), text) {
+		t.Fatalf("notice %v log %s", notes, logs.String())
+	}
+	if !strings.Contains(logs.String(), "could not be saved") {
+		t.Fatalf("log %s", logs.String())
+	}
+}
+
+func TestKeychainReadErrorDoesNotCount(t *testing.T) {
+	s, _, text, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.AutoDisableAfterAuthFailures = 1
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	secretHex := strings.Repeat("ab", 32)
+	s.Token = func() (secret.Secret, error) {
+		return secret.Secret{}, errors.New("keychain read failed near " + secretHex)
+	}
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	host := "127.0.0.1:4765"
+	rec := post(s, text, host, "", `{}`)
+	if rec.Code != http.StatusUnauthorized || rec.Body.Len() != 0 {
+		t.Fatalf("code %d body %q", rec.Code, rec.Body.String())
+	}
+	if !s.Listening() {
+		t.Fatal("a keychain read error disabled the door")
+	}
+	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	if got.Failures != 0 || got.AutoDisabled {
+		t.Fatalf("counted a keychain error: %+v", got)
+	}
+	if strings.Contains(logs.String(), secretHex) || strings.Contains(logs.String(), text) {
+		t.Fatalf("log leaked a secret: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "could not read the bearer token") {
+		t.Fatalf("log %s", logs.String())
+	}
+}
+
+func TestHandEditDoesNotClearAnAutoDisable(t *testing.T) {
+	s, _, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.AutoDisableAfterAuthFailures = 1
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	s.Notify = func(string) error { return nil }
+	post(s, "", "127.0.0.1:4765", "", `{}`)
+	if s.Listening() {
+		t.Fatal("threshold left the listener up")
+	}
+	cfg.Enabled = true
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if s.Listening() {
+		t.Fatal("a hand-edit and reload re-opened the door")
+	}
+	if err := httpconfig.ResetAuthFailures(httpconfig.AuthStatePath(s.Path), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Listening() {
+		t.Fatal("http enable's clear did not allow the door to listen")
+	}
+}
+
+func TestFailedDisableWritesStayClosedAcrossReload(t *testing.T) {
+	s, _, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.AutoDisableAfterAuthFailures = 50
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dirOf(s.Path), 0o700)
+		s.Close()
+	})
+	s.Notify = func(string) error { return nil }
+	dir := dirOf(s.Path)
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	post(s, "", "127.0.0.1:4765", "", `{}`)
+	if s.Listening() {
+		t.Fatal("unwritable config left the listener up")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The yaml write failed, so the file can still say enabled.
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if s.Listening() {
+		t.Fatal("reload re-opened the door after both disable writes failed")
+	}
+	loaded, err := httpconfig.Load(s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.Enabled = true
+	if err := httpconfig.Save(s.Path, loaded); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if s.Listening() {
+		t.Fatal("a hand-edit re-opened the door while the in-memory block stood")
+	}
+}
+
+func dirOf(path string) string {
+	i := strings.LastIndex(path, "/")
+	return path[:i]
 }
