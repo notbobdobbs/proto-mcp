@@ -218,12 +218,15 @@ func (r *Runtime) Unlock(ctx context.Context) error {
 	}
 	r.locked = false
 	r.lockReason = ""
+	// Copy the hook while r.mu is still held. SetOnUnlockStamp writes
+	// it under the same lock; reading it after Unlock races.
+	stamp := r.onUnlockStamp
 	r.mu.Unlock()
 
 	slog.Info("daemon unlocked")
 	r.publishLockState(false, "")
-	if r.onUnlockStamp != nil {
-		r.onUnlockStamp()
+	if stamp != nil {
+		stamp()
 	}
 	return nil
 }
