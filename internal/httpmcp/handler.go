@@ -61,19 +61,20 @@ type Service struct {
 	// memDay and memFails count failed sign-ins even when the counter
 	// file cannot be written. blocked stays set until http enable
 	// clears it, including when both disable writes failed.
-	memDay    string
-	memFails  int
-	blocked   bool
-	blockedAt int64
-	cfg       httpconfig.Config
-	ln        net.Listener
-	httpSrv   *http.Server
-	sessions  map[string]*hsess
-	tokenFP   [32]byte
-	haveFP    bool
-	authFails *window
-	perMinute *window
-	inFlight  chan struct{}
+	memDay         string
+	memFails       int
+	blocked        bool
+	blockedAt      int64
+	tokenStoreWarn time.Time
+	cfg            httpconfig.Config
+	ln             net.Listener
+	httpSrv        *http.Server
+	sessions       map[string]*hsess
+	tokenFP        [32]byte
+	haveFP         bool
+	authFails      *window
+	perMinute      *window
+	inFlight       chan struct{}
 }
 
 type hsess struct {
@@ -372,7 +373,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tok, err := s.bearer(r)
 	if err != nil {
 		if errors.Is(err, errTokenStore) {
-			slog.Warn("remote door could not read the bearer token", "err", SafeError(err))
+			// Same per-minute bucket as a bad bearer, so a Keychain
+			// outage cannot be used to hammer the door. It is not a
+			// failed sign-in, so the daily counter is left alone.
+			s.authFails.add(now)
+			if s.noteTokenStoreWarn(now) {
+				slog.Warn("remote door could not read the bearer token", "err", SafeError(err))
+			}
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -521,6 +528,17 @@ func (s *Service) dropOldestLocked() {
 	if oldest != "" {
 		delete(s.sessions, oldest)
 	}
+}
+
+// noteTokenStoreWarn is true for at most one Keychain warning per minute.
+func (s *Service) noteTokenStoreWarn(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.tokenStoreWarn.IsZero() && now.Sub(s.tokenStoreWarn) < time.Minute {
+		return false
+	}
+	s.tokenStoreWarn = now
+	return true
 }
 
 // errTokenRejected is a bad or missing bearer. errTokenStore is a

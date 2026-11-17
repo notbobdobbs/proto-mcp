@@ -244,9 +244,14 @@ func TestKeychainReadErrorDoesNotCount(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	host := "127.0.0.1:4765"
-	rec := post(s, text, host, "", `{}`)
-	if rec.Code != http.StatusUnauthorized || rec.Body.Len() != 0 {
-		t.Fatalf("code %d body %q", rec.Code, rec.Body.String())
+	for i := 0; i < authFailLimit; i++ {
+		rec := post(s, text, host, "", `{}`)
+		if rec.Code != http.StatusUnauthorized || rec.Body.Len() != 0 {
+			t.Fatalf("try %d: code %d body %q", i, rec.Code, rec.Body.String())
+		}
+	}
+	if post(s, text, host, "", `{}`).Code != http.StatusTooManyRequests {
+		t.Fatal("keychain errors did not trip the per-minute limiter")
 	}
 	if !s.Listening() {
 		t.Fatal("a keychain read error disabled the door")
@@ -258,7 +263,7 @@ func TestKeychainReadErrorDoesNotCount(t *testing.T) {
 	if strings.Contains(logs.String(), secretHex) || strings.Contains(logs.String(), text) {
 		t.Fatalf("log leaked a secret: %s", logs.String())
 	}
-	if !strings.Contains(logs.String(), "could not read the bearer token") {
+	if strings.Count(logs.String(), "could not read the bearer token") != 1 {
 		t.Fatalf("log %s", logs.String())
 	}
 }
