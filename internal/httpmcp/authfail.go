@@ -65,26 +65,47 @@ func (s *Service) recordAuthFailure(ctx context.Context, now time.Time, ev httpc
 		s.disableLocked(ctx, now, label, n, err != nil)
 		return
 	}
-	if limit > warnAt && n >= warnAt && !rec.Warned {
-		// One try per counted failure. A failed notification does not
-		// set the flag, so the next counted failure, including after
-		// a restart, can try again. The door stays up either way.
-		if nerr := s.postAuthNotice(rec, false); nerr != nil {
+	if limit > warnAt && n >= warnAt && !rec.Warned && !s.warnedMem {
+		// The audit row is written for this crossing either way.
+		// Warned is set only after the notification succeeds. A failed
+		// notification can be tried on a later counted failure. If the
+		// notification succeeded and the flag file did not, warnedMem
+		// stops a repeat for this count. The door stays up either way.
+		nerr := s.postAuthNotice(rec, false)
+		notify := "ok"
+		outcome := audit.OutcomeOK
+		msg := "warned after repeated remote sign-in failures"
+		if nerr != nil {
+			notify = "failed"
+			outcome = audit.OutcomeError
+			msg = "auth warning notification failed"
 			slog.Warn("remote door auth warning could not be posted", "err", SafeError(nerr))
+		}
+		s.writeAuthAudit(ctx, label, "http_auth_warn", rec, msg, outcome, "allow", notify)
+		if nerr != nil {
 			return
 		}
-		if merr := httpconfig.MarkWarned(httpconfig.AuthStatePath(s.Path), now); merr != nil {
+		s.warnedMem = true
+		if merr := s.persistWarned(now); merr != nil {
 			slog.Warn("remote door auth warning could not be saved", "err", SafeError(merr))
 			return
 		}
 		rec.Warned = true
-		s.writeAuthAudit(ctx, label, "http_auth_warn", rec, "warned after repeated remote sign-in failures", audit.OutcomeOK, "allow")
 	}
+}
+
+func (s *Service) persistWarned(now time.Time) error {
+	path := httpconfig.AuthStatePath(s.Path)
+	if s.saveWarned != nil {
+		return s.saveWarned(path, now)
+	}
+	return httpconfig.MarkWarned(path, now)
 }
 
 // noteAuthEvent records a rejection that does not count as a sign-in
 // failure. The detail stays in memory and is written at most about
-// once a second. A write error does not change the door.
+// once a second, with a trailing write about a second after the last
+// change. A write error does not change the door.
 func (s *Service) noteAuthEvent(now time.Time, ev httpconfig.AuthEvent) {
 	if s == nil || s.Path == "" || ev.Reason == "" {
 		return
@@ -104,21 +125,52 @@ func (s *Service) noteDeferredLocked(now time.Time, ev httpconfig.AuthEvent) {
 	}
 	s.deferred.Add(ev)
 	if !s.deferredSave.IsZero() && now.Sub(s.deferredSave) < time.Second {
+		s.armDeferredTimerLocked()
 		return
 	}
 	s.flushDeferredLocked(now)
 }
 
+// deferredTrail is how long after the last pending detail change the
+// remainder is written, when no later request writes it first.
+const deferredTrail = time.Second
+
+func (s *Service) armDeferredTimerLocked() {
+	s.deferredGen++
+	gen := s.deferredGen
+	if s.deferredTimer != nil {
+		s.deferredTimer.Stop()
+	}
+	s.deferredTimer = time.AfterFunc(deferredTrail, func() {
+		s.failMu.Lock()
+		defer s.failMu.Unlock()
+		if s.deferredGen != gen {
+			return
+		}
+		s.flushDeferredLocked(s.now())
+	})
+}
+
+func (s *Service) stopDeferredTimerLocked() {
+	s.deferredGen++
+	if s.deferredTimer != nil {
+		s.deferredTimer.Stop()
+		s.deferredTimer = nil
+	}
+}
+
 func (s *Service) flushDeferredLocked(now time.Time) {
+	s.stopDeferredTimerLocked()
 	if len(s.deferred.Reasons) == 0 && len(s.deferred.Sample) == 0 {
 		return
 	}
 	err := httpconfig.MergeAuthTrace(httpconfig.AuthStatePath(s.Path), now, s.deferred)
-	// A failed save waits until the next interval instead of trying
+	// A failed save waits until the trailing timer instead of trying
 	// again on every request. The detail stays in memory.
 	s.deferredSave = now
 	if err != nil {
 		slog.Warn("remote door auth-failure detail could not be saved", "err", SafeError(err))
+		s.armDeferredTimerLocked()
 		return
 	}
 	s.deferred = httpconfig.AuthTrace{}
@@ -145,6 +197,7 @@ func (s *Service) adoptStoredCount(now time.Time) {
 	if s.memDay != day {
 		s.memDay = day
 		s.memFails = stored
+		s.warnedMem = false
 		return
 	}
 	if stored > s.memFails {
@@ -207,7 +260,7 @@ func (s *Service) disableLocked(ctx context.Context, now time.Time, label string
 	if writeFailed && failures < s.autoDisableLimit() {
 		msg = "remote door disabled because the auth-failure counter could not be saved"
 	}
-	s.writeAuthAudit(ctx, label, "http_auto_disable", fresh, msg, audit.OutcomeDenied, "deny")
+	s.writeAuthAudit(ctx, label, "http_auto_disable", fresh, msg, audit.OutcomeDenied, "deny", "")
 	if writeFailed && failures < s.autoDisableLimit() {
 		_ = s.postPlainNotice("Remote access was turned off because the sign-in failure counter could not be saved. Turn it back on with protonmcp http enable.")
 		return
@@ -233,7 +286,7 @@ func (s *Service) autoDisableLimit() int {
 	return s.cfg.AutoDisableAfterAuthFailures
 }
 
-func (s *Service) writeAuthAudit(ctx context.Context, label, tool string, rec httpconfig.AuthDay, msg, outcome, decision string) {
+func (s *Service) writeAuthAudit(ctx context.Context, label, tool string, rec httpconfig.AuthDay, msg, outcome, decision, notify string) {
 	if s.Audit == nil {
 		return
 	}
@@ -243,7 +296,8 @@ func (s *Service) writeAuthAudit(ctx context.Context, label, tool string, rec ht
 	raw, err := json.Marshal(struct {
 		Failures int                  `json:"failures"`
 		Trace    httpconfig.AuthTrace `json:"trace"`
-	}{rec.Failures, rec.Trace})
+		Notify   string               `json:"notify,omitempty"`
+	}{rec.Failures, rec.Trace, notify})
 	if err != nil {
 		return
 	}

@@ -234,6 +234,9 @@ The socket's peer checks stay; they simply do not apply to HTTP.
   is at or below 500, because turning the door off already notifies.
   A failed warning leaves the door up and is not marked posted, so a
   later counted failure, including after a restart, can try again.
+  The audit row is written either way and records whether the
+  notification was posted. If it was posted and the flag file could
+  not be saved, this process does not post it again for that count.
   At the auto-disable threshold
   the daemon writes `enabled: false`, closes the listener, drops HTTP
   sessions, writes an audit row, and posts a notification. Both

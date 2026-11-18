@@ -779,6 +779,150 @@ func TestOriginDetailIsSavedAboutOnceASecond(t *testing.T) {
 	}
 }
 
+func TestPendingDetailFlushesOnCloseAndAfterTheBurst(t *testing.T) {
+	burst := func(t *testing.T) (*Service, string) {
+		t.Helper()
+		s, _, _, _ := testService(t)
+		cfg := httpconfig.Default()
+		cfg.Enabled = true
+		cfg.AutoDisableAfterAuthFailures = 10000
+		cfg.WarnAfterAuthFailures = 500
+		cfg.Listen = freeLoopback(t)
+		if err := httpconfig.Save(s.Path, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Reload(); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now()
+		s.Now = func() time.Time { return now }
+		host := "127.0.0.1:4765"
+		path := httpconfig.AuthStatePath(s.Path)
+		send := func() {
+			t.Helper()
+			req := httptest.NewRequest(http.MethodPost, "http://"+host+"/mcp", strings.NewReader(`{}`))
+			req.Host = host
+			req.RemoteAddr = "127.0.0.1:9"
+			req.Header.Set("Origin", "http://evil.example")
+			s.ServeHTTP(httptest.NewRecorder(), req)
+		}
+		send()
+		for i := 0; i < 5; i++ {
+			send()
+		}
+		got := httpconfig.ReadAuthDay(path, now)
+		if got.Failures != 0 || got.Trace.Reasons[httpconfig.ReasonBadOrigin] != 1 {
+			t.Fatalf("during the burst %+v", got.Trace.Reasons)
+		}
+		return s, path
+	}
+
+	s, path := burst(t)
+	s.Close()
+	got := httpconfig.ReadAuthDay(path, time.Now())
+	if got.Failures != 0 || got.Trace.Reasons[httpconfig.ReasonBadOrigin] != 6 {
+		t.Fatalf("Close left %+v", got.Trace.Reasons)
+	}
+
+	s, path = burst(t)
+	t.Cleanup(s.Close)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got = httpconfig.ReadAuthDay(path, time.Now())
+		if got.Trace.Reasons[httpconfig.ReasonBadOrigin] == 6 && got.Failures == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a finished burst left %+v failures %d", got.Trace.Reasons, got.Failures)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestWarnAuditRecordsNotifyResult(t *testing.T) {
+	s, st, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.WarnAfterAuthFailures = 1
+	cfg.AutoDisableAfterAuthFailures = 10
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	aw, err := audit.New(st.DB, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Audit = aw
+	s.Notify = func(string) error { return errors.New("osascript failed") }
+	post(s, "", "127.0.0.1:4765", "", `{}`)
+	if !s.Listening() {
+		t.Fatal("a failed warning closed the door")
+	}
+	var args, outcome string
+	if err := st.DB.QueryRow(`SELECT args_json, outcome FROM audit_log WHERE tool = 'http_auth_warn'`).Scan(&args, &outcome); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(args, `"notify":"failed"`) || outcome != audit.OutcomeError {
+		t.Fatalf("audit args=%s outcome=%s", args, outcome)
+	}
+	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	if got.Failures != 1 || got.Warned {
+		t.Fatalf("after failed notification %+v", got)
+	}
+}
+
+func TestWarnedFlagSaveFailureDoesNotRepeatTheNotification(t *testing.T) {
+	s, st, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.WarnAfterAuthFailures = 1
+	cfg.AutoDisableAfterAuthFailures = 10
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	aw, err := audit.New(st.DB, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Audit = aw
+	calls := 0
+	s.Notify = func(string) error {
+		calls++
+		return nil
+	}
+	s.saveWarned = func(string, time.Time) error { return errors.New("disk full") }
+	post(s, "", "127.0.0.1:4765", "", `{}`)
+	post(s, "", "127.0.0.1:4765", "", `{}`)
+	if calls != 1 {
+		t.Fatalf("notification calls = %d", calls)
+	}
+	if !s.Listening() {
+		t.Fatal("a failed flag write closed the door")
+	}
+	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	if got.Failures != 2 || got.Warned {
+		t.Fatalf("after flag save failure %+v", got)
+	}
+	var n int
+	var args, outcome string
+	if err := st.DB.QueryRow(`SELECT COUNT(*), args_json, outcome FROM audit_log WHERE tool = 'http_auth_warn'`).Scan(&n, &args, &outcome); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || !strings.Contains(args, `"notify":"ok"`) || outcome != audit.OutcomeOK {
+		t.Fatalf("rows=%d args=%s outcome=%s", n, args, outcome)
+	}
+}
+
 func TestWrongHostDoesNotReadTheTokenOrCount(t *testing.T) {
 	s, _, text, _ := testService(t)
 	reads := 0

@@ -67,20 +67,28 @@ type Service struct {
 	blockedAt      int64
 	tokenStoreWarn time.Time
 	// deferred holds bad-Origin and per-minute lockout detail until
-	// the next save. Those saves happen at most about once a second.
-	// failMu guards it.
-	deferred     httpconfig.AuthTrace
-	deferredDay  string
-	deferredSave time.Time
-	cfg          httpconfig.Config
-	ln           net.Listener
-	httpSrv      *http.Server
-	sessions     map[string]*hsess
-	tokenFP      [32]byte
-	haveFP       bool
-	authFails    *window
-	perMinute    *window
-	inFlight     chan struct{}
+	// the next save. Request handling writes it at most about once a
+	// second. A timer writes the rest about a second after the last
+	// change, and Close writes whatever is left. failMu guards it.
+	deferred      httpconfig.AuthTrace
+	deferredDay   string
+	deferredSave  time.Time
+	deferredTimer *time.Timer
+	deferredGen   uint64
+	// warnedMem remembers a warning whose notification was posted
+	// when the flag file could not be saved. failMu guards it.
+	warnedMem bool
+	// saveWarned persists that flag. Nil uses httpconfig.MarkWarned.
+	saveWarned func(path string, now time.Time) error
+	cfg        httpconfig.Config
+	ln         net.Listener
+	httpSrv    *http.Server
+	sessions   map[string]*hsess
+	tokenFP    [32]byte
+	haveFP     bool
+	authFails  *window
+	perMinute  *window
+	inFlight   chan struct{}
 }
 
 type hsess struct {
@@ -278,8 +286,15 @@ func SafeError(err error) string {
 	return tokenHex.ReplaceAllString(err.Error(), "[redacted]")
 }
 
-// Close stops the listener.
-func (s *Service) Close() { s.mu.Lock(); s.stopLocked(); s.mu.Unlock() }
+// Close saves any pending auth-failure detail, then stops the listener.
+func (s *Service) Close() {
+	s.failMu.Lock()
+	s.flushDeferredLocked(s.now())
+	s.failMu.Unlock()
+	s.mu.Lock()
+	s.stopLocked()
+	s.mu.Unlock()
+}
 
 // Listening reports whether a TCP listener is open.
 func (s *Service) Listening() bool {

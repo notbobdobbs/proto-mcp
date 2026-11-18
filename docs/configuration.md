@@ -173,9 +173,12 @@ and written about once a second. They do not add to this count. At
 posts one notification that remote access is still on, and writes
 an audit row with the same detail. That happens once per local day,
 including across a restart, and only when the auto-disable limit is
-above the warn threshold. A failed notification leaves the door up,
-is not marked posted, and the failure still counts. The next counted
-failure can try the warning again. At `auto_disable_after_auth_failures` the
+above the warn threshold. The audit row is written either way and
+records whether the notification was posted. A failed notification
+leaves the door up, is not marked posted, and the failure still
+counts. The next counted failure can try the warning again. If the
+notification was posted and the flag file could not be saved, this
+process does not post it again for that count. At `auto_disable_after_auth_failures` the
 daemon writes `enabled: false` (mode `0600`, other settings kept
 when the file still parses), closes the listener, and drops HTTP
 sessions. It writes an audit row with the count and the scrubbed
