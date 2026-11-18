@@ -127,7 +127,7 @@ func scrubJSONValue(v any) any {
 
 func scrubRaw(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || unicode.IsControl(r) {
+		if r < 0x20 || r == 0x7f || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
 			return -1
 		}
 		return r
@@ -143,17 +143,22 @@ func scrubRaw(s string) string {
 	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
 }
 
-// ForwardedIP is the client address from a Tailscale or Funnel header.
-// A value that is not an IP is ignored. The header text itself is not returned.
-func ForwardedIP(tailscale, xForwardedFor string) string {
-	if ip := firstIP(tailscale); ip != "" {
-		return ip
+// FunnelClientIP is the client address from X-Forwarded-For when
+// Tailscale's proxy marked the request with Tailscale-Funnel-Request: ?1.
+// That proxy overwrites X-Forwarded-For and does not set or strip
+// Tailscale-Client-Ip, so that header is not read. Any other mark,
+// including a missing one, returns empty and the caller records the
+// remote address. Several X-Forwarded-For entries use only the
+// right-most, and only when it is an IP.
+func FunnelClientIP(funnelMark, xForwardedFor string) string {
+	if strings.TrimSpace(funnelMark) != "?1" {
+		return ""
 	}
-	return firstIP(xForwardedFor)
+	return rightmostIP(xForwardedFor)
 }
 
-// ClientSource is "forwarded <ip>" when a Tailscale or Funnel header
-// carries an IP, otherwise "remote <addr>".
+// ClientSource is "forwarded <ip>" when FunnelClientIP returned an
+// address, otherwise "remote <addr>".
 func ClientSource(forwarded, remote string) string {
 	if ip := firstIP(forwarded); ip != "" {
 		return "forwarded " + ip
@@ -174,14 +179,26 @@ func firstIP(header string) string {
 	if header == "" {
 		return ""
 	}
-	for _, part := range strings.Split(header, ",") {
-		part = strings.TrimSpace(part)
-		part = strings.Trim(part, "[]")
-		if ip := net.ParseIP(part); ip != nil {
-			return ip.String()
-		}
+	part := strings.TrimSpace(strings.Split(header, ",")[0])
+	return parseIP(part)
+}
+
+func rightmostIP(header string) string {
+	if header == "" {
+		return ""
 	}
-	return ""
+	parts := strings.Split(header, ",")
+	return parseIP(parts[len(parts)-1])
+}
+
+func parseIP(part string) string {
+	part = strings.TrimSpace(part)
+	part = strings.Trim(part, "[]")
+	ip := net.ParseIP(part)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 // AddAuthEvent folds ev into the trace. ev is scrubbed here.
@@ -223,6 +240,59 @@ func (t *AuthTrace) Add(ev AuthEvent) {
 	if len(t.Sample) > traceSampleMax {
 		t.Sample = append([]AuthSample(nil), t.Sample[len(t.Sample)-traceSampleMax:]...)
 	}
+}
+
+// Merge adds extra into t. extra is not modified. Caps still apply.
+func (t *AuthTrace) Merge(extra AuthTrace) {
+	if t == nil {
+		return
+	}
+	if extra.FirstUnix != 0 && (t.FirstUnix == 0 || extra.FirstUnix < t.FirstUnix) {
+		t.FirstUnix = extra.FirstUnix
+	}
+	if extra.LastUnix > t.LastUnix {
+		t.LastUnix = extra.LastUnix
+	}
+	t.Reasons = mergeCounts(t.Reasons, extra.Reasons, traceMapMax)
+	t.Sources = mergeCounts(t.Sources, extra.Sources, traceMapMax)
+	t.Agents = mergeCounts(t.Agents, extra.Agents, traceMapMax)
+	t.Requests = mergeCounts(t.Requests, extra.Requests, traceMapMax)
+	t.Minutes = mergeCounts(t.Minutes, extra.Minutes, traceMinuteMax)
+	if extra.PeakPerMinute > t.PeakPerMinute {
+		t.PeakPerMinute = extra.PeakPerMinute
+	}
+	for _, n := range t.Minutes {
+		if n > t.PeakPerMinute {
+			t.PeakPerMinute = n
+		}
+	}
+	if len(extra.Sample) == 0 {
+		return
+	}
+	t.Sample = append(t.Sample, extra.Sample...)
+	if len(t.Sample) > traceSampleMax {
+		t.Sample = append([]AuthSample(nil), t.Sample[len(t.Sample)-traceSampleMax:]...)
+	}
+}
+
+func mergeCounts(dst, src map[string]int, cap int) map[string]int {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]int, len(src))
+	}
+	for k, n := range src {
+		if k == "" || n <= 0 {
+			continue
+		}
+		if _, ok := dst[k]; ok || len(dst) < cap || k == "other" {
+			dst[k] += n
+			continue
+		}
+		dst["other"] += n
+	}
+	return dst
 }
 
 func (t *AuthTrace) noteMinute(minute string) {

@@ -30,14 +30,27 @@ func (s *Service) recordAuthFailure(ctx context.Context, now time.Time, ev httpc
 
 	n := s.bumpAuthFailures(now)
 	ev.At = now
-	rec, err := httpconfig.AddAuthFailureEvent(httpconfig.AuthStatePath(s.Path), now, ev)
+	day := now.Format("2006-01-02")
+	extra := httpconfig.AuthTrace{}
+	if s.deferredDay == day {
+		extra = s.deferred
+	} else {
+		s.deferred = httpconfig.AuthTrace{}
+		s.deferredDay = day
+		s.deferredSave = time.Time{}
+	}
+	rec, err := httpconfig.AddAuthFailureIncluding(httpconfig.AuthStatePath(s.Path), now, ev, extra)
 	if err != nil {
 		slog.Warn("remote door auth-failure counter could not be saved", "err", SafeError(err))
-	} else if rec.Failures > n {
-		// The file was ahead of this process, usually because an
-		// earlier process recorded failures and then exited.
-		n = rec.Failures
-		s.memFails = rec.Failures
+	} else {
+		s.deferred = httpconfig.AuthTrace{}
+		s.deferredSave = now
+		if rec.Failures > n {
+			// The file was ahead of this process, usually because an
+			// earlier process recorded failures and then exited.
+			n = rec.Failures
+			s.memFails = rec.Failures
+		}
 	}
 	limit := s.autoDisableLimit()
 	warnAt := s.warnAfter()
@@ -53,26 +66,62 @@ func (s *Service) recordAuthFailure(ctx context.Context, now time.Time, ev httpc
 		return
 	}
 	if limit > warnAt && n >= warnAt && !rec.Warned {
+		// One try per counted failure. A failed notification does not
+		// set the flag, so the next counted failure, including after
+		// a restart, can try again. The door stays up either way.
+		if nerr := s.postAuthNotice(rec, false); nerr != nil {
+			slog.Warn("remote door auth warning could not be posted", "err", SafeError(nerr))
+			return
+		}
 		if merr := httpconfig.MarkWarned(httpconfig.AuthStatePath(s.Path), now); merr != nil {
 			slog.Warn("remote door auth warning could not be saved", "err", SafeError(merr))
 			return
 		}
 		rec.Warned = true
-		s.postAuthNotice(rec, false)
 		s.writeAuthAudit(ctx, label, "http_auth_warn", rec, "warned after repeated remote sign-in failures", audit.OutcomeOK, "allow")
 	}
 }
 
 // noteAuthEvent records a rejection that does not count as a sign-in
-// failure. A write error does not change the door.
+// failure. The detail stays in memory and is written at most about
+// once a second. A write error does not change the door.
 func (s *Service) noteAuthEvent(now time.Time, ev httpconfig.AuthEvent) {
 	if s == nil || s.Path == "" || ev.Reason == "" {
 		return
 	}
 	ev.At = now
-	if err := httpconfig.AddAuthEvent(httpconfig.AuthStatePath(s.Path), now, ev); err != nil {
-		slog.Warn("remote door auth-failure detail could not be saved", "err", SafeError(err))
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	s.noteDeferredLocked(now, ev)
+}
+
+func (s *Service) noteDeferredLocked(now time.Time, ev httpconfig.AuthEvent) {
+	day := now.Format("2006-01-02")
+	if s.deferredDay != day {
+		s.deferred = httpconfig.AuthTrace{}
+		s.deferredDay = day
+		s.deferredSave = time.Time{}
 	}
+	s.deferred.Add(ev)
+	if !s.deferredSave.IsZero() && now.Sub(s.deferredSave) < time.Second {
+		return
+	}
+	s.flushDeferredLocked(now)
+}
+
+func (s *Service) flushDeferredLocked(now time.Time) {
+	if len(s.deferred.Reasons) == 0 && len(s.deferred.Sample) == 0 {
+		return
+	}
+	err := httpconfig.MergeAuthTrace(httpconfig.AuthStatePath(s.Path), now, s.deferred)
+	// A failed save waits until the next interval instead of trying
+	// again on every request. The detail stays in memory.
+	s.deferredSave = now
+	if err != nil {
+		slog.Warn("remote door auth-failure detail could not be saved", "err", SafeError(err))
+		return
+	}
+	s.deferred = httpconfig.AuthTrace{}
 }
 
 // bumpAuthFailures adds one failure for now's local day. A new day
@@ -160,10 +209,10 @@ func (s *Service) disableLocked(ctx context.Context, now time.Time, label string
 	}
 	s.writeAuthAudit(ctx, label, "http_auto_disable", fresh, msg, audit.OutcomeDenied, "deny")
 	if writeFailed && failures < s.autoDisableLimit() {
-		s.postPlainNotice("Remote access was turned off because the sign-in failure counter could not be saved. Turn it back on with protonmcp http enable.")
+		_ = s.postPlainNotice("Remote access was turned off because the sign-in failure counter could not be saved. Turn it back on with protonmcp http enable.")
 		return
 	}
-	s.postAuthNotice(fresh, true)
+	_ = s.postAuthNotice(fresh, true)
 }
 
 func (s *Service) warnAfter() int {
@@ -215,14 +264,14 @@ func (s *Service) writeAuthAudit(ctx context.Context, label, tool string, rec ht
 	s.Audit.Complete(ctx, id, outcome, "policy", msg, 0)
 }
 
-func (s *Service) postAuthNotice(rec httpconfig.AuthDay, disabled bool) {
-	s.postPlainNotice(httpconfig.ShortAuthNotice(rec, disabled))
+func (s *Service) postAuthNotice(rec httpconfig.AuthDay, disabled bool) error {
+	return s.postPlainNotice(httpconfig.ShortAuthNotice(rec, disabled))
 }
 
-func (s *Service) postPlainNotice(text string) {
+func (s *Service) postPlainNotice(text string) error {
 	fn := s.Notify
 	if fn == nil {
 		fn = OSNotify
 	}
-	_ = fn(text)
+	return fn(text)
 }

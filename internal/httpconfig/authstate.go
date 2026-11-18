@@ -51,11 +51,19 @@ func AddAuthFailure(path string, now time.Time) (AuthDay, error) {
 // AddAuthFailureEvent counts one sign-in failure and stores ev.
 // An empty Reason still counts, without a trace row.
 func AddAuthFailureEvent(path string, now time.Time, ev AuthEvent) (AuthDay, error) {
+	return AddAuthFailureIncluding(path, now, ev, AuthTrace{})
+}
+
+// AddAuthFailureIncluding counts one sign-in failure, folds earlier
+// detail into the same write, and returns the updated day. The count
+// is on disk before the caller decides whether to disable the door.
+func AddAuthFailureIncluding(path string, now time.Time, ev AuthEvent, earlier AuthTrace) (AuthDay, error) {
 	authMu.Lock()
 	defer authMu.Unlock()
 	rec := readAuthDay(path, now)
 	rec.Day = dayKey(now)
 	rec.Failures++
+	rec.Trace.Merge(earlier)
 	if ev.Reason != "" {
 		if ev.At.IsZero() {
 			ev.At = now
@@ -66,6 +74,20 @@ func AddAuthFailureEvent(path string, now time.Time, ev AuthEvent) (AuthDay, err
 		return AuthDay{}, err
 	}
 	return rec, nil
+}
+
+// MergeAuthTrace stores detail that is not a counted sign-in failure.
+// The failure count is left as it is.
+func MergeAuthTrace(path string, now time.Time, extra AuthTrace) error {
+	if len(extra.Reasons) == 0 && len(extra.Sample) == 0 {
+		return nil
+	}
+	authMu.Lock()
+	defer authMu.Unlock()
+	rec := readAuthDay(path, now)
+	rec.Day = dayKey(now)
+	rec.Trace.Merge(extra)
+	return writeAuthDay(path, rec)
 }
 
 // AddAuthEvent stores a rejection that is not a counted sign-in

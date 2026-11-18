@@ -71,8 +71,11 @@ it.
   connections are refused. The socket path and those checks are
   unchanged by the HTTP door. The HTTP door, when enabled, binds only
   a literal loopback address (`127.0.0.1` or `::1`), requires a bearer
-  token on every request, ignores `X-Forwarded-For`, and sends no CORS
-  headers. Its tool list can only remove tools. It cannot turn a
+  token on every request, and sends no CORS headers. Loopback is the
+  connection's own address. `X-Forwarded-For` is not used to authorize
+  anything. The auth-failure detail records only its right-most entry,
+  and only when `Tailscale-Funnel-Request` is `?1`. `Tailscale-Client-Ip`
+  is not read. Its tool list can only remove tools. It cannot turn a
   policy `deny` into `allow` or `prompt`.
 - **Remote trash is recoverable only.** HTTP `mail_trash` moves a
   message to Trash. If the mirror says the message is already in
@@ -203,7 +206,10 @@ The socket's peer checks stay; they simply do not apply to HTTP.
   the shared auth-failure limit (10 failures a minute, then `429` for
   everyone, including the real bot, for the rest of that minute), the
   per-minute cap, the daily read cap (default 500, stored so a restart
-  does not zero it), and the audit log. A bad or missing bearer counts,
+  does not zero it), and the audit log. Concurrent requests can pass
+  the 10-a-minute check before any of them is counted, so a burst can
+  run past 10 before the `429`s start. That overshoot is known and is
+  left as it is. A bad or missing bearer counts,
   including a bearer sent in the query string and a failed `DELETE`.
   The token is never accepted from the query string. Every HTTP tool
   call that passes auth, reads included, writes a redacted row.
@@ -226,14 +232,19 @@ The socket's peer checks stay; they simply do not apply to HTTP.
   warning that remote access is still on, once that day, including
   after a restart. It skips that warning when the auto-disable limit
   is at or below 500, because turning the door off already notifies.
-  A failed warning leaves the door up. At the auto-disable threshold
+  A failed warning leaves the door up and is not marked posted, so a
+  later counted failure, including after a restart, can try again.
+  At the auto-disable threshold
   the daemon writes `enabled: false`, closes the listener, drops HTTP
   sessions, writes an audit row, and posts a notification. Both
   notifications stay short and point at `protonmcp http status
   --debug` for the scrubbed detail: times, the busiest minute,
   reasons, client sources, user agents, method and path, and the last
-  20 failures. A source is the forwarded client IP from a Tailscale
-  or Funnel header when one is present, otherwise the remote address.
+  20 failures. A source is the right-most `X-Forwarded-For` address
+  when `Tailscale-Funnel-Request` is `?1`, labelled as forwarded.
+  Otherwise it is the remote address. `Tailscale-Client-Ip` is not
+  read. A bad Origin and the per-minute lockout are kept in memory
+  and written about once a second. They do not add to the daily count.
   No part of a presented token or Authorization value is recorded.
   A failed disable notification leaves the door off. A counter file
   that cannot be written still counts in memory and still turns the

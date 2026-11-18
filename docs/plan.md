@@ -427,7 +427,9 @@ raise any policy cap:
   Unix socket is unaffected. `0` in the file means the default, not
   unlimited.
 - Failed auth: 10 per minute, then `429`, one bucket for the whole
-  listener. A scanner must not be able to hold a Touch ID dialog
+  listener. Concurrent requests can pass the check together, so a
+  burst can run past 10 before the `429`s start. That overshoot is
+  known and is left as it is. A scanner must not be able to hold a Touch ID dialog
   open. The same bucket locks the real bot out for the rest of the
   window. That is accepted. Every connection arrives from loopback,
   so splitting the bucket by address would not separate the scanner
@@ -954,11 +956,13 @@ goes to the audit row and to that command. Detail is the first and
 last failure times, the peak failures per minute, the breakdown
 (missing header, bad scheme, wrong token, query-string token, bad
 origin, rate-limited), the top sources, user agents, and
-method/path pairs, and the last 20 failures. A source is the
-forwarded client IP from a Tailscale or Funnel header when that
-header has an IP, labelled as forwarded, otherwise the remote
-address, labelled as remote. Bad origin and the per-minute lockout
-are recorded in that detail and do not increment the daily count.
+method/path pairs, and the last 20 failures. A source is the right-most `X-Forwarded-For` address when
+`Tailscale-Funnel-Request` is `?1`, labelled as forwarded, and
+otherwise the remote address, labelled as remote.
+`Tailscale-Client-Ip` is not read. Bad origin and the per-minute
+lockout are kept in memory, written about once a second, and do not
+increment the daily count. A failed warning is not marked posted, so
+a later counted failure can try again. The door stays up.
 No part of a presented token or Authorization value is recorded, not
 a prefix and not a hash. Distinct keys and string lengths are capped.
 

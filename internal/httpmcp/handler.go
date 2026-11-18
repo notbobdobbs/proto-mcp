@@ -66,15 +66,21 @@ type Service struct {
 	blocked        bool
 	blockedAt      int64
 	tokenStoreWarn time.Time
-	cfg            httpconfig.Config
-	ln             net.Listener
-	httpSrv        *http.Server
-	sessions       map[string]*hsess
-	tokenFP        [32]byte
-	haveFP         bool
-	authFails      *window
-	perMinute      *window
-	inFlight       chan struct{}
+	// deferred holds bad-Origin and per-minute lockout detail until
+	// the next save. Those saves happen at most about once a second.
+	// failMu guards it.
+	deferred     httpconfig.AuthTrace
+	deferredDay  string
+	deferredSave time.Time
+	cfg          httpconfig.Config
+	ln           net.Listener
+	httpSrv      *http.Server
+	sessions     map[string]*hsess
+	tokenFP      [32]byte
+	haveFP       bool
+	authFails    *window
+	perMinute    *window
+	inFlight     chan struct{}
 }
 
 type hsess struct {
@@ -561,7 +567,7 @@ var (
 )
 
 func authEvent(r *http.Request, reason string, now time.Time) httpconfig.AuthEvent {
-	ip := httpconfig.ForwardedIP(r.Header.Get("Tailscale-Client-Ip"), r.Header.Get("X-Forwarded-For"))
+	ip := httpconfig.FunnelClientIP(r.Header.Get("Tailscale-Funnel-Request"), r.Header.Get("X-Forwarded-For"))
 	path := ""
 	if r.URL != nil {
 		path = r.URL.Path

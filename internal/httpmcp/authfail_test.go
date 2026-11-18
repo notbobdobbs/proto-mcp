@@ -435,14 +435,15 @@ func TestAuthWarnFiresOnceAcrossRestartAndResetsNextDay(t *testing.T) {
 		req.RemoteAddr = "127.0.0.1:9"
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("User-Agent", "bot\x00 "+token+" tail")
-		req.Header.Set("X-Forwarded-For", token)
-		req.Header.Set("Tailscale-Client-Ip", "100.64.1.8")
+		req.Header.Set("Tailscale-Funnel-Request", "?1")
+		req.Header.Set("X-Forwarded-For", token+", 100.64.1.8")
+		req.Header.Set("Tailscale-Client-Ip", "203.0.113.50")
 		svc.ServeHTTP(httptest.NewRecorder(), req)
 	}
 	fail(s)
 	fail(s)
 	fail(s)
-	if len(notes) != 1 || !strings.Contains(notes[0], "still on") || !strings.Contains(notes[0], "http status --debug") || !strings.Contains(notes[0], "wrong token") || !strings.Contains(notes[0], "forwarded 100.64.1.8") {
+	if len(notes) != 1 || !strings.Contains(notes[0], "still on") || !strings.Contains(notes[0], "http status --debug") || !strings.Contains(notes[0], "wrong token") || !strings.Contains(notes[0], "forwarded 100.64.1.8") || strings.Contains(notes[0], "203.0.113.50") {
 		t.Fatalf("warning = %v", notes)
 	}
 	if !s.Listening() {
@@ -456,7 +457,7 @@ func TestAuthWarnFiresOnceAcrossRestartAndResetsNextDay(t *testing.T) {
 	assertNoToken(t, token, args)
 	detail := httpconfig.FormatAuthDebug(httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now()))
 	assertNoToken(t, token, detail)
-	if !strings.Contains(detail, "wrong token") || !strings.Contains(detail, "forwarded 100.64.1.8") || !strings.Contains(detail, "POST /mcp") || !strings.Contains(detail, "first:") || !strings.Contains(detail, "peak per minute:") || !strings.Contains(detail, "sample:") {
+	if !strings.Contains(detail, "wrong token") || !strings.Contains(detail, "forwarded 100.64.1.8") || strings.Contains(detail, "203.0.113.50") || !strings.Contains(detail, "POST /mcp") || !strings.Contains(detail, "first:") || !strings.Contains(detail, "peak per minute:") || !strings.Contains(detail, "sample:") {
 		t.Fatalf("detail = %s", detail)
 	}
 	raw, err := os.ReadFile(httpconfig.AuthStatePath(s.Path))
@@ -548,14 +549,38 @@ func TestAuthWarnFailureDoesNotChangeAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
-	s.Notify = func(string) error { return errors.New("osascript failed") }
+	calls := 0
+	s.Notify = func(string) error {
+		calls++
+		return errors.New("osascript failed")
+	}
 	post(s, "", "127.0.0.1:4765", "", `{}`)
 	if !s.Listening() {
 		t.Fatal("a failed warning closed the door")
 	}
 	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
-	if got.Failures != 1 || !got.Warned {
-		t.Fatalf("after failed warning %+v", got)
+	if got.Failures != 1 || got.Warned || calls != 1 {
+		t.Fatalf("after failed warning failures=%d warned=%v calls=%d", got.Failures, got.Warned, calls)
+	}
+	s.Close()
+
+	s2 := New(s.MCP, s.Path, s.Token)
+	s2.Notify = func(string) error {
+		calls++
+		return nil
+	}
+	t.Cleanup(s2.Close)
+	if err := s2.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	post(s2, "", "127.0.0.1:4765", "", `{}`)
+	got = httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	if !s2.Listening() || got.Failures != 2 || !got.Warned || calls != 2 {
+		t.Fatalf("restart retry failures=%d warned=%v calls=%d listening=%v", got.Failures, got.Warned, calls, s2.Listening())
+	}
+	post(s2, "", "127.0.0.1:4765", "", `{}`)
+	if calls != 2 {
+		t.Fatalf("warned flag did not stop the next try: %d", calls)
 	}
 }
 
@@ -573,6 +598,8 @@ func TestAuthTraceSkipsTheDailyCountForOriginAndRateLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
+	now := time.Now()
+	s.Now = func() time.Time { return now }
 	token := strings.Repeat("ef", 32)
 	host := "127.0.0.1:4765"
 	origin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:4765/mcp", strings.NewReader(`{}`))
@@ -586,7 +613,9 @@ func TestAuthTraceSkipsTheDailyCountForOriginAndRateLimit(t *testing.T) {
 	req.RemoteAddr = "127.0.0.1:9"
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "ua "+token)
+	req.Header.Set("Tailscale-Funnel-Request", "?1")
 	req.Header.Set("X-Forwarded-For", token+", 203.0.113.9")
+	req.Header.Set("Tailscale-Client-Ip", "198.51.100.23")
 	s.ServeHTTP(httptest.NewRecorder(), req)
 	basic := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:4765/mcp", strings.NewReader(`{}`))
 	basic.Host = host
@@ -599,16 +628,18 @@ func TestAuthTraceSkipsTheDailyCountForOriginAndRateLimit(t *testing.T) {
 		post(s, "", host, "", `{}`)
 	}
 	post(s, "", host, "", `{}`)
+	now = now.Add(time.Second)
+	post(s, "", host, "", `{}`)
 
-	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), now)
 	if got.Failures != authFailLimit {
 		t.Fatalf("failures = %d, origin and rate-limit must not count", got.Failures)
 	}
-	if got.Trace.Reasons[httpconfig.ReasonQueryToken] != 1 || got.Trace.Reasons[httpconfig.ReasonBadScheme] != 1 || got.Trace.Reasons[httpconfig.ReasonWrongToken] != 1 || got.Trace.Reasons[httpconfig.ReasonMissingHeader] != authFailLimit-3 || got.Trace.Reasons[httpconfig.ReasonRateLimited] != 1 || got.Trace.Reasons[httpconfig.ReasonBadOrigin] != 1 {
+	if got.Trace.Reasons[httpconfig.ReasonQueryToken] != 1 || got.Trace.Reasons[httpconfig.ReasonBadScheme] != 1 || got.Trace.Reasons[httpconfig.ReasonWrongToken] != 1 || got.Trace.Reasons[httpconfig.ReasonMissingHeader] != authFailLimit-3 || got.Trace.Reasons[httpconfig.ReasonRateLimited] != 2 || got.Trace.Reasons[httpconfig.ReasonBadOrigin] != 1 {
 		t.Fatalf("reasons = %#v", got.Trace.Reasons)
 	}
 	assertNoToken(t, wrong, httpconfig.FormatAuthDebug(got))
-	if got.Trace.Sources["forwarded 203.0.113.9"] != 1 || got.Trace.Sources["remote 127.0.0.1"] == 0 {
+	if got.Trace.Sources["forwarded 203.0.113.9"] != 1 || got.Trace.Sources["remote 127.0.0.1"] == 0 || got.Trace.Sources["forwarded 198.51.100.23"] != 0 {
 		t.Fatalf("sources = %#v", got.Trace.Sources)
 	}
 	if !s.Listening() {
@@ -620,6 +651,223 @@ func TestAuthTraceSkipsTheDailyCountForOriginAndRateLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoToken(t, token, blob+"\n"+string(raw))
+	if strings.Contains(string(raw), "198.51.100.23") {
+		t.Fatal("forged Tailscale-Client-Ip was stored")
+	}
+}
+
+func TestForgedTailscaleClientIPIsIgnored(t *testing.T) {
+	s, _, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.AutoDisableAfterAuthFailures = 10000
+	cfg.WarnAfterAuthFailures = 500
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	host := "127.0.0.1:4765"
+	forged := "203.0.113.50"
+	req := httptest.NewRequest(http.MethodPost, "http://"+host+"/mcp", strings.NewReader(`{}`))
+	req.Host = host
+	req.RemoteAddr = "127.0.0.1:9"
+	req.Header.Set("Tailscale-Client-Ip", forged)
+	req.Header.Set("X-Forwarded-For", "198.51.100.7")
+	s.ServeHTTP(httptest.NewRecorder(), req)
+	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	blob := httpconfig.FormatAuthDebug(got)
+	if strings.Contains(blob, forged) || strings.Contains(blob, "198.51.100.7") || !strings.Contains(blob, "remote 127.0.0.1") {
+		t.Fatalf("unmarked request used a client header: %s", blob)
+	}
+	marked := httptest.NewRequest(http.MethodPost, "http://"+host+"/mcp", strings.NewReader(`{}`))
+	marked.Host = host
+	marked.RemoteAddr = "127.0.0.1:9"
+	marked.Header.Set("Tailscale-Funnel-Request", "?1")
+	marked.Header.Set("Tailscale-Client-Ip", forged)
+	marked.Header.Set("X-Forwarded-For", "198.51.100.7, 203.0.113.9")
+	s.ServeHTTP(httptest.NewRecorder(), marked)
+	got = httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	blob = httpconfig.FormatAuthDebug(got)
+	if !strings.Contains(blob, "forwarded 203.0.113.9") || strings.Contains(blob, forged) || strings.Contains(blob, "198.51.100.7") {
+		t.Fatalf("funnel source = %s", blob)
+	}
+}
+
+func TestOriginDetailIsSavedAboutOnceASecond(t *testing.T) {
+	s, _, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.AutoDisableAfterAuthFailures = 10000
+	cfg.WarnAfterAuthFailures = 500
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	now := time.Now()
+	s.Now = func() time.Time { return now }
+	host := "127.0.0.1:4765"
+	path := httpconfig.AuthStatePath(s.Path)
+	origin := func() {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://"+host+"/mcp", strings.NewReader(`{}`))
+		req.Host = host
+		req.RemoteAddr = "127.0.0.1:9"
+		req.Header.Set("Origin", "http://evil.example")
+		s.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	origin()
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		origin()
+	}
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Fatal("bad Origin rewrote the detail file within the same second")
+	}
+	got := httpconfig.ReadAuthDay(path, now)
+	if got.Failures != 0 || got.Trace.Reasons[httpconfig.ReasonBadOrigin] != 1 {
+		t.Fatalf("during the second %+v failures %d", got.Trace.Reasons, got.Failures)
+	}
+	now = now.Add(time.Second)
+	origin()
+	got = httpconfig.ReadAuthDay(path, now)
+	if got.Failures != 0 || got.Trace.Reasons[httpconfig.ReasonBadOrigin] != 22 || !s.Listening() {
+		t.Fatalf("after a second %+v listening %v", got.Trace.Reasons, s.Listening())
+	}
+	now = now.Add(time.Millisecond)
+	origin()
+	post(s, "", host, "", `{}`)
+	got = httpconfig.ReadAuthDay(path, now)
+	if got.Failures != 1 || got.Trace.Reasons[httpconfig.ReasonBadOrigin] != 23 {
+		t.Fatalf("counted failure did not save immediately: failures %d reasons %+v", got.Failures, got.Trace.Reasons)
+	}
+
+	now = now.Add(2 * time.Minute)
+	for i := 0; i < authFailLimit; i++ {
+		post(s, "", host, "", `{}`)
+	}
+	before := httpconfig.ReadAuthDay(path, now)
+	for i := 0; i < 5; i++ {
+		post(s, "", host, "", `{}`)
+	}
+	held := httpconfig.ReadAuthDay(path, now)
+	if held.Trace.Reasons[httpconfig.ReasonRateLimited] != before.Trace.Reasons[httpconfig.ReasonRateLimited] || held.Failures != before.Failures {
+		t.Fatalf("lockout rewrote the file within the second: before %+v held %+v", before.Trace.Reasons, held.Trace.Reasons)
+	}
+	now = now.Add(time.Second)
+	post(s, "", host, "", `{}`)
+	got = httpconfig.ReadAuthDay(path, now)
+	if got.Failures != before.Failures || got.Trace.Reasons[httpconfig.ReasonRateLimited] != before.Trace.Reasons[httpconfig.ReasonRateLimited]+6 {
+		t.Fatalf("lockout flush failures %d reasons %+v", got.Failures, got.Trace.Reasons)
+	}
+	if !s.Listening() {
+		t.Fatal("saving the detail closed the door")
+	}
+}
+
+func TestWrongHostDoesNotReadTheTokenOrCount(t *testing.T) {
+	s, _, text, _ := testService(t)
+	reads := 0
+	prev := s.Token
+	s.Token = func() (secret.Secret, error) {
+		reads++
+		return prev()
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://evil.example/mcp", strings.NewReader(`{}`))
+	req.Host = "evil.example"
+	req.RemoteAddr = "127.0.0.1:9"
+	req.Header.Set("Authorization", "Bearer "+text)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if reads != 0 {
+		t.Fatalf("token reads %d", reads)
+	}
+	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	if got.Failures != 0 || len(got.Trace.Reasons) != 0 || len(got.Trace.Sample) != 0 {
+		t.Fatalf("host mismatch was recorded: %+v", got)
+	}
+}
+
+func TestAuditBeginFailureLeavesTheListenerAsItWas(t *testing.T) {
+	s, st, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.WarnAfterAuthFailures = 1
+	cfg.AutoDisableAfterAuthFailures = 10
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	aw, err := audit.New(st.DB, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s.Audit = aw
+	s.Notify = func(string) error { return nil }
+	if !s.Listening() {
+		t.Fatal("warning path was not listening")
+	}
+	post(s, "", "127.0.0.1:4765", "", `{}`)
+	if !s.Listening() {
+		t.Fatal("a failed audit Begin closed the listener on the warning path")
+	}
+	s.Close()
+
+	s2, st2, _, _ := testService(t)
+	cfg.AutoDisableAfterAuthFailures = 1
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s2.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s2.Close)
+	aw, err = audit.New(st2.DB, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st2.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2.Audit = aw
+	s2.Notify = func(string) error { return nil }
+	if !s2.Listening() {
+		t.Fatal("disable path was not listening")
+	}
+	post(s2, "", "127.0.0.1:4765", "", `{}`)
+	if s2.Listening() {
+		t.Fatal("the disable threshold left the listener up")
+	}
+	if err := s2.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if s2.Listening() {
+		t.Fatal("a failed audit Begin reopened the listener")
+	}
 }
 
 func assertNoToken(t *testing.T, token, text string) {

@@ -65,19 +65,32 @@ func TestAuthTraceBoundsAndScrub(t *testing.T) {
 	}
 }
 
-func TestClientSourceLabelsForwardedAndRemote(t *testing.T) {
+func TestFunnelClientIPUsesTheRightmostAddressOnlyWhenMarked(t *testing.T) {
 	token := strings.Repeat("12", 32)
-	if got := ForwardedIP(token, "203.0.113.4, 10.0.0.1"); got != "203.0.113.4" {
-		t.Fatalf("forwarded = %s", got)
+	if got := FunnelClientIP("", "203.0.113.4, 198.51.100.8"); got != "" {
+		t.Fatalf("unmarked = %q", got)
 	}
-	if got := ForwardedIP("100.64.1.8", token); got != "100.64.1.8" {
-		t.Fatalf("tailscale = %s", got)
+	if got := FunnelClientIP("?0", "198.51.100.8"); got != "" {
+		t.Fatalf("not funnel = %q", got)
 	}
-	if got := ClientSource(ForwardedIP("100.64.1.8", ""), "192.0.2.1:9"); got != "forwarded 100.64.1.8" {
-		t.Fatalf("source = %s", got)
+	if got := FunnelClientIP("?1", "203.0.113.4, 198.51.100.8"); got != "198.51.100.8" {
+		t.Fatalf("right-most = %q", got)
 	}
-	if got := ClientSource(ForwardedIP(token, "not-an-ip"), "[::1]:9"); got != "remote ::1" {
-		t.Fatalf("remote = %s", got)
+	if got := FunnelClientIP("?1", "198.51.100.8, "+token); got != "" {
+		t.Fatalf("invalid right-most = %q", got)
+	}
+	if got := ClientSource(FunnelClientIP("?1", "203.0.113.4, 198.51.100.8"), "127.0.0.1:9"); got != "forwarded 198.51.100.8" {
+		t.Fatalf("source = %q", got)
+	}
+	if got := ClientSource(FunnelClientIP("?1", token), "[::1]:9"); got != "remote ::1" {
+		t.Fatalf("remote = %q", got)
+	}
+}
+
+func TestScrubAuthTextStripsFormatAndLineSeparators(t *testing.T) {
+	got := ScrubAuthText("ab\u202ecd\u2028ef\u2029gh")
+	if got != "abcdefgh" {
+		t.Fatalf("got %q", got)
 	}
 }
 

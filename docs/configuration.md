@@ -167,23 +167,25 @@ up. It shows the same auth-failure count and auto-disable event.
 
 Failed HTTP sign-ins are counted per local day: a missing bearer, a
 wrong bearer, and any bearer in the query string, including
-`DELETE`. A bad Origin and the per-minute lockout are recorded in
-the detail and do not add to this count. At
+`DELETE`. A bad Origin and the per-minute lockout are kept in memory
+and written about once a second. They do not add to this count. At
 `warn_after_auth_failures` (default 500; `0` means 500) the daemon
 posts one notification that remote access is still on, and writes
 an audit row with the same detail. That happens once per local day,
 including across a restart, and only when the auto-disable limit is
 above the warn threshold. A failed notification leaves the door up,
-and the failure still counts. At `auto_disable_after_auth_failures` the
+is not marked posted, and the failure still counts. The next counted
+failure can try the warning again. At `auto_disable_after_auth_failures` the
 daemon writes `enabled: false` (mode `0600`, other settings kept
 when the file still parses), closes the listener, and drops HTTP
 sessions. It writes an audit row with the count and the scrubbed
 detail, not the token, then posts a notification. The notification
 names the count, the time window, the top three reasons, the top
 three client sources, and `protonmcp http status --debug`. A client
-source is the forwarded IP from a Tailscale or Funnel header when
-that header carries an IP, otherwise the remote address. Neither
-the notification, the audit row, nor `http status` records any part
+source is the right-most `X-Forwarded-For` address when
+`Tailscale-Funnel-Request` is `?1`, labelled as forwarded, and
+otherwise the remote address. `Tailscale-Client-Ip` is not read.
+Neither the notification, the audit row, nor `http status` records any part
 of a presented token or Authorization value. If that notification
 fails, the door stays off. If the
 counter file cannot be saved, the failure is still counted in memory
