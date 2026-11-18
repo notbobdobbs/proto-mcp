@@ -25,6 +25,7 @@ func startHTTPDoor(ctx context.Context, rt *serve.Runtime) *httpmcp.Service {
 		path = filepath.Join(dir, "http.yaml")
 	}
 	svc := httpmcp.New(rt.MCPServer, path, keystore.LoadHTTPToken)
+	svc.Audit = rt.Audit
 	svc.Clock = httpmcp.NewUnlockClock(nil)
 	svc.Reads = httpmcp.NewReadCap(rt.Store.DB, nil, svc.MaxReads)
 	rt.MCPServer.UseRemoteAllow(svc.Allows)

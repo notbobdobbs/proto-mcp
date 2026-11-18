@@ -427,7 +427,9 @@ raise any policy cap:
   Unix socket is unaffected. `0` in the file means the default, not
   unlimited.
 - Failed auth: 10 per minute, then `429`, one bucket for the whole
-  listener. A scanner must not be able to hold a Touch ID dialog
+  listener. Concurrent requests can pass the check together, so a
+  burst can run past 10 before the `429`s start. That overshoot is
+  known and is left as it is. A scanner must not be able to hold a Touch ID dialog
   open. The same bucket locks the real bot out for the rest of the
   window. That is accepted. Every connection arrives from loopback,
   so splitting the bucket by address would not separate the scanner
@@ -924,3 +926,74 @@ switch, the remote trash refusal, and the Grok account boundary
 without opening this plan. The commands in section 2 match the CLI
 reference, including clipboard show/rotate and `http activity`. No
 code change beyond comments that those docs require.
+
+### 5. Auto-disable remote access after repeated auth failures
+
+**Scope.** After the door is documented. Count HTTP auth failures
+per local calendar day: a bad bearer, a missing bearer, and any
+bearer in the query string, including `DELETE`. When the count
+reaches `auto_disable_after_auth_failures` in `http.yaml`, turn the
+door off. The default is 50. `0` means that default. The minimum is
+1. There is no value that turns the counter off. A number below 0
+or above the hard ceiling makes the file unusable. The ceiling stays
+10000.
+
+`warn_after_auth_failures` posts one warning when the persisted
+count first reaches that number in a local day. The default is 500.
+`0` means 500. The same ceiling applies. The warning is skipped when
+the auto-disable limit is at or below the warn threshold, because
+turning the door off already notifies. It fires at most once per
+local day. The flag is stored with the counter, so a restart does
+not post it again and does not skip it if the flag was never
+written. A notification failure does not change auth: the door stays
+up and the count still increments. The same request that turns the
+door off does not also post the "still on" warning.
+
+Both the warning and the auto-disable notification stay short: the
+count, the time window, the top three failure reasons, the top three
+client sources, and `protonmcp http status --debug`. The full detail
+goes to the audit row and to that command. Detail is the first and
+last failure times, the peak failures per minute, the breakdown
+(missing header, bad scheme, wrong token, query-string token, bad
+origin, rate-limited), the top sources, user agents, and
+method/path pairs, and the last 20 failures. A source is the right-most `X-Forwarded-For` address when
+`Tailscale-Funnel-Request` is `?1`, labelled as forwarded, and
+otherwise the remote address, labelled as remote.
+`Tailscale-Client-Ip` is not read. Bad origin and the per-minute
+lockout are kept in memory, written about once a second, and do not
+increment the daily count. A failed warning is not marked posted, so
+a later counted failure can try again. The door stays up.
+No part of a presented token or Authorization value is recorded, not
+a prefix and not a hash. Distinct keys and string lengths are capped.
+
+Reaching the auto-disable count atomically writes `enabled: false` to
+`http.yaml` (mode `0600`, other settings kept when the file still
+parses), closes the listener, and drops HTTP sessions. It writes an
+audit row that names the count and the scrubbed detail, not the
+token, then posts a macOS notification through the existing
+`OSNotify` path. The notification has no token and no caller secret.
+If the notification fails, the door still stays off.
+
+The door does not turn itself back on. Not at midnight, and not
+when the count is reset. The only re-enable is `protonmcp http
+enable`. That command also zeros today's failure count. The count
+resets by itself at local midnight. `http status` and `doctor`
+show today's failure count and an auto-disable event from today.
+`http status` also shows whether today's warning was posted, and
+`http status --debug` prints the scrubbed failure detail.
+
+This is not an idle lock and not an away lock. It does not add a
+daily remote-read notification. The count notification that
+already exists for completed days stays as it is.
+
+**Acceptance.** A threshold of N bad, missing, or query-string
+attempts, including `DELETE`, writes `enabled: false` at mode
+`0600`, and a listener that was open no longer accepts a
+connection. A notification error does not leave the listener up.
+After that, a new local day does not listen again. `protonmcp http
+enable` is what listens again, and it zeros the count. `http
+status` and `doctor` show the count and the event. `http status`
+shows whether the warning was posted today, and `--debug` shows the
+detail without any token. A threshold at or below the warn setting
+does not post the "still on" warning. Unix socket behavior is
+unchanged.

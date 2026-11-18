@@ -7,7 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,6 +21,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/just-an-oldsalt/proto-mcp/internal/audit"
 	"github.com/just-an-oldsalt/proto-mcp/internal/httpconfig"
 	"github.com/just-an-oldsalt/proto-mcp/internal/keystore"
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
@@ -46,17 +50,45 @@ type Service struct {
 	Now   func() time.Time
 	Clock *UnlockClock
 	Reads *ReadCap
+	// Audit records the auto-disable row. Nil skips that row.
+	Audit *audit.Writer
+	// Notify posts the auto-disable notice. Nil uses OSNotify.
+	// A returned error does not undo the disable.
+	Notify func(string) error
 
-	mu        sync.Mutex
-	cfg       httpconfig.Config
-	ln        net.Listener
-	httpSrv   *http.Server
-	sessions  map[string]*hsess
-	tokenFP   [32]byte
-	haveFP    bool
-	authFails *window
-	perMinute *window
-	inFlight  chan struct{}
+	mu     sync.Mutex
+	failMu sync.Mutex
+	// memDay and memFails count failed sign-ins even when the counter
+	// file cannot be written. blocked stays set until http enable
+	// clears it, including when both disable writes failed.
+	memDay         string
+	memFails       int
+	blocked        bool
+	blockedAt      int64
+	tokenStoreWarn time.Time
+	// deferred holds bad-Origin and per-minute lockout detail until
+	// the next save. Request handling writes it at most about once a
+	// second. A timer writes the rest about a second after the last
+	// change, and Close writes whatever is left. failMu guards it.
+	deferred      httpconfig.AuthTrace
+	deferredDay   string
+	deferredSave  time.Time
+	deferredTimer *time.Timer
+	deferredGen   uint64
+	// warnedMem remembers a warning whose notification was posted
+	// when the flag file could not be saved. failMu guards it.
+	warnedMem bool
+	// saveWarned persists that flag. Nil uses httpconfig.MarkWarned.
+	saveWarned func(path string, now time.Time) error
+	cfg        httpconfig.Config
+	ln         net.Listener
+	httpSrv    *http.Server
+	sessions   map[string]*hsess
+	tokenFP    [32]byte
+	haveFP     bool
+	authFails  *window
+	perMinute  *window
+	inFlight   chan struct{}
 }
 
 type hsess struct {
@@ -106,7 +138,7 @@ func (w *window) allow(now time.Time, limit int) bool {
 }
 
 func New(mcpSrv *mcp.Server, path string, token TokenFunc) *Service {
-	return &Service{
+	s := &Service{
 		MCP:       mcpSrv,
 		Path:      path,
 		Token:     token,
@@ -116,6 +148,11 @@ func New(mcpSrv *mcp.Server, path string, token TokenFunc) *Service {
 		perMinute: &window{},
 		inFlight:  make(chan struct{}, inFlightLimit),
 	}
+	// A restarted daemon must not forget failures already stored today.
+	s.failMu.Lock()
+	s.adoptStoredCount(s.now())
+	s.failMu.Unlock()
+	return s
 }
 
 func (s *Service) now() time.Time {
@@ -133,6 +170,9 @@ func (s *Service) now() time.Time {
 func (s *Service) Reload() error {
 	cfg, loadErr := httpconfig.Load(s.Path)
 	fp, have := s.currentFP()
+	// An auto-disable sticks until `protonmcp http enable` clears it.
+	// A hand-edit of http.yaml plus SIGHUP does not.
+	blocked := s.autoDisableBlocks(s.now())
 	s.mu.Lock()
 	var ret error
 	if loadErr != nil {
@@ -143,7 +183,8 @@ func (s *Service) Reload() error {
 		ret = loadErr
 	} else {
 		s.cfg = cfg
-		if !cfg.Enabled || !have {
+		if blocked || !cfg.Enabled || !have {
+			s.cfg.Enabled = cfg.Enabled && !blocked
 			s.sessions = map[string]*hsess{}
 			s.haveFP = false
 			s.stopLocked()
@@ -245,8 +286,15 @@ func SafeError(err error) string {
 	return tokenHex.ReplaceAllString(err.Error(), "[redacted]")
 }
 
-// Close stops the listener.
-func (s *Service) Close() { s.mu.Lock(); s.stopLocked(); s.mu.Unlock() }
+// Close saves any pending auth-failure detail, then stops the listener.
+func (s *Service) Close() {
+	s.failMu.Lock()
+	s.flushDeferredLocked(s.now())
+	s.failMu.Unlock()
+	s.mu.Lock()
+	s.stopLocked()
+	s.mu.Unlock()
+}
 
 // Listening reports whether a TCP listener is open.
 func (s *Service) Listening() bool {
@@ -320,6 +368,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	now := s.now()
 	if s.authFails.over(now, authFailLimit) {
+		s.noteAuthEvent(now, authEvent(r, httpconfig.ReasonRateLimited, now))
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
@@ -328,6 +377,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// for every method, including GET and DELETE. The query is not logged.
 	if hasBearerQuery(r) {
 		s.authFails.add(now)
+		s.recordAuthFailure(r.Context(), now, authEvent(r, httpconfig.ReasonQueryToken, now))
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -343,13 +393,30 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	cfg := s.cfg
 	s.mu.Unlock()
-	if !hostOK(r.Host, cfg.AllowedHosts) || !originOK(r.Header.Get("Origin"), cfg.AllowedOrigins) {
+	if !hostOK(r.Host, cfg.AllowedHosts) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-	tok, ok := s.bearer(r)
-	if !ok {
+	if !originOK(r.Header.Get("Origin"), cfg.AllowedOrigins) {
+		s.noteAuthEvent(now, authEvent(r, httpconfig.ReasonBadOrigin, now))
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	tok, err := s.bearer(r)
+	if err != nil {
+		if errors.Is(err, errTokenStore) {
+			// Same per-minute bucket as a bad bearer, so a Keychain
+			// outage cannot be used to hammer the door. It is not a
+			// failed sign-in, so the daily counter is left alone.
+			s.authFails.add(now)
+			if s.noteTokenStoreWarn(now) {
+				slog.Warn("remote door could not read the bearer token", "err", SafeError(err))
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		s.authFails.add(now)
+		s.recordAuthFailure(r.Context(), now, authEvent(r, rejectReason(r), now))
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -495,30 +562,79 @@ func (s *Service) dropOldestLocked() {
 	}
 }
 
-func (s *Service) bearer(r *http.Request) ([]byte, bool) {
+// noteTokenStoreWarn is true for at most one Keychain warning per minute.
+func (s *Service) noteTokenStoreWarn(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.tokenStoreWarn.IsZero() && now.Sub(s.tokenStoreWarn) < time.Minute {
+		return false
+	}
+	s.tokenStoreWarn = now
+	return true
+}
+
+// errTokenRejected is a bad or missing bearer. errTokenStore is a
+// failure to read the Keychain (or whatever Token uses). A store
+// error is not a failed sign-in.
+var (
+	errTokenRejected = errors.New("httpmcp: bearer rejected")
+	errTokenStore    = errors.New("httpmcp: token store")
+)
+
+func authEvent(r *http.Request, reason string, now time.Time) httpconfig.AuthEvent {
+	ip := httpconfig.FunnelClientIP(r.Header.Get("Tailscale-Funnel-Request"), r.Header.Get("X-Forwarded-For"))
+	path := ""
+	if r.URL != nil {
+		path = r.URL.Path
+	}
+	return httpconfig.AuthEvent{
+		Reason:  reason,
+		Source:  httpconfig.ClientSource(ip, r.RemoteAddr),
+		Agent:   r.Header.Get("User-Agent"),
+		Request: r.Method + " " + path,
+		At:      now,
+	}
+}
+
+func rejectReason(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if strings.TrimSpace(h) == "" {
+		return httpconfig.ReasonMissingHeader
+	}
+	const p = "Bearer "
+	if len(h) < len(p) || !strings.EqualFold(h[:len(p)], p) {
+		return httpconfig.ReasonBadScheme
+	}
+	return httpconfig.ReasonWrongToken
+}
+
+func (s *Service) bearer(r *http.Request) ([]byte, error) {
 	if s.Token == nil {
-		return nil, false
+		return nil, errTokenRejected
 	}
 	stored, err := s.Token()
 	if err != nil {
-		return nil, false
+		if errors.Is(err, keystore.ErrHTTPTokenNotFound) {
+			return nil, errTokenRejected
+		}
+		return nil, fmt.Errorf("%w: %s", errTokenStore, SafeError(err))
 	}
 	defer stored.Zero()
 	if len(stored.Bytes()) != keystore.HTTPTokenLen {
-		return nil, false
+		return nil, errTokenRejected
 	}
 	h := r.Header.Get("Authorization")
 	const p = "Bearer "
 	if len(h) < len(p) || !strings.EqualFold(h[:len(p)], p) {
-		return nil, false
+		return nil, errTokenRejected
 	}
 	presented := strings.TrimSpace(h[len(p):])
 	if !keystore.HTTPTokenMatches(stored.Bytes(), presented) {
-		return nil, false
+		return nil, errTokenRejected
 	}
 	out := make([]byte, len(stored.Bytes()))
 	copy(out, stored.Bytes())
-	return out, true
+	return out, nil
 }
 
 func (s *Service) noteToken(raw []byte) {

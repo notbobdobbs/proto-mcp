@@ -139,6 +139,46 @@ func TestLoadRefusesGroupOrWorldWritable(t *testing.T) {
 	}
 }
 
+func TestAutoDisableThresholdCannotBeTurnedOff(t *testing.T) {
+	cfg, err := Parse([]byte("enabled: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AutoDisableAfterAuthFailures != DefaultAutoDisableAfterAuthFailures {
+		t.Fatalf("omitted = %d", cfg.AutoDisableAfterAuthFailures)
+	}
+	if cfg.WarnAfterAuthFailures != DefaultWarnAfterAuthFailures {
+		t.Fatalf("omitted warn = %d", cfg.WarnAfterAuthFailures)
+	}
+	cfg, err = Parse([]byte("auto_disable_after_auth_failures: 0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AutoDisableAfterAuthFailures != 50 {
+		t.Fatalf("zero = %d, want the default", cfg.AutoDisableAfterAuthFailures)
+	}
+	cfg, err = Parse([]byte("auto_disable_after_auth_failures: 1\n"))
+	if err != nil || cfg.AutoDisableAfterAuthFailures != 1 {
+		t.Fatalf("one = %+v err %v", cfg.AutoDisableAfterAuthFailures, err)
+	}
+	if _, err := Parse([]byte("auto_disable_after_auth_failures: -1\n")); !errors.Is(err, ErrBadFile) {
+		t.Fatalf("negative err = %v", err)
+	}
+	if _, err := Parse([]byte("auto_disable_after_auth_failures: 10001\n")); !errors.Is(err, ErrBadFile) {
+		t.Fatalf("above ceiling err = %v", err)
+	}
+	if _, err := Parse([]byte("auto_disable_after_auth_failures: 10000\n")); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Parse([]byte("warn_after_auth_failures: 0\n"))
+	if err != nil || cfg.WarnAfterAuthFailures != 500 {
+		t.Fatalf("warn zero = %d err %v", cfg.WarnAfterAuthFailures, err)
+	}
+	if _, err := Parse([]byte("warn_after_auth_failures: -1\n")); !errors.Is(err, ErrBadFile) {
+		t.Fatalf("warn negative err = %v", err)
+	}
+}
+
 func TestAllowedOriginsAreExactAndNotDerivedFromHosts(t *testing.T) {
 	cfg, err := Parse([]byte("allowed_hosts: [127.0.0.1:4765]\n"))
 	if err != nil {
