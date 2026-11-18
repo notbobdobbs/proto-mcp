@@ -134,8 +134,11 @@ never a *liability*. The guarantees that make that true:
 - **🏠 Local socket, optional loopback door.** The daemon listens on a
   `0600` Unix socket. It also listens on `127.0.0.1` (or `::1`) only
   when `http.yaml` is enabled and a Keychain token exists. It does not
-  open a public port. Mail content goes to Proton over TLS. A remote
-  bot sees the mail it reads; that trade-off is in
+  open a public port. At 500 failed remote sign-ins in a local day it
+  posts one warning, if auto-disable is set higher than that.
+  `protonmcp http status --debug` shows the scrubbed detail and never
+  the token. Mail content goes to Proton over TLS. A remote bot sees
+  the mail it reads; that trade-off is in
   [docs/security.md](docs/security.md).
 
 What a prompt actually looks like:

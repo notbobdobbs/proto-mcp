@@ -2,6 +2,8 @@ package httpmcp
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"net"
@@ -82,7 +84,7 @@ func TestAuthFailuresCloseTheListenerAndKeepTheFile(t *testing.T) {
 	if err != nil || loaded.Enabled || loaded.AutoDisableAfterAuthFailures != 3 {
 		t.Fatalf("reloaded %+v err %v", loaded, err)
 	}
-	if len(notes) != 1 || strings.Contains(notes[0], text) || strings.Contains(notes[0], "Bearer") {
+	if len(notes) != 1 || strings.Contains(notes[0], text) || strings.Contains(notes[0], "Bearer") || !strings.Contains(notes[0], "http status --debug") {
 		t.Fatalf("notice = %v", notes)
 	}
 	var tool, args string
@@ -399,6 +401,234 @@ func TestRestartContinuesTodaysAuthFailureCount(t *testing.T) {
 	}
 	if s2.Listening() {
 		t.Fatal("the second failure after restart left the listener open")
+	}
+}
+
+func TestAuthWarnFiresOnceAcrossRestartAndResetsNextDay(t *testing.T) {
+	s, st, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.WarnAfterAuthFailures = 2
+	cfg.AutoDisableAfterAuthFailures = 10
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	aw, err := audit.New(st.DB, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Audit = aw
+	token := strings.Repeat("cd", 32)
+	var notes []string
+	s.Notify = func(msg string) error {
+		notes = append(notes, msg)
+		return nil
+	}
+	fail := func(svc *Service) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:4765/mcp", strings.NewReader(`{}`))
+		req.Host = "127.0.0.1:4765"
+		req.RemoteAddr = "127.0.0.1:9"
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("User-Agent", "bot\x00 "+token+" tail")
+		req.Header.Set("X-Forwarded-For", token)
+		req.Header.Set("Tailscale-Client-Ip", "100.64.1.8")
+		svc.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	fail(s)
+	fail(s)
+	fail(s)
+	if len(notes) != 1 || !strings.Contains(notes[0], "still on") || !strings.Contains(notes[0], "http status --debug") || !strings.Contains(notes[0], "wrong token") || !strings.Contains(notes[0], "forwarded 100.64.1.8") {
+		t.Fatalf("warning = %v", notes)
+	}
+	if !s.Listening() {
+		t.Fatal("the warning closed the door")
+	}
+	assertNoToken(t, token, notes[0])
+	var args string
+	if err := st.DB.QueryRow(`SELECT args_json FROM audit_log WHERE tool = 'http_auth_warn'`).Scan(&args); err != nil {
+		t.Fatal(err)
+	}
+	assertNoToken(t, token, args)
+	detail := httpconfig.FormatAuthDebug(httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now()))
+	assertNoToken(t, token, detail)
+	if !strings.Contains(detail, "wrong token") || !strings.Contains(detail, "forwarded 100.64.1.8") || !strings.Contains(detail, "POST /mcp") || !strings.Contains(detail, "first:") || !strings.Contains(detail, "peak per minute:") || !strings.Contains(detail, "sample:") {
+		t.Fatalf("detail = %s", detail)
+	}
+	raw, err := os.ReadFile(httpconfig.AuthStatePath(s.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoToken(t, token, string(raw))
+	s.Close()
+
+	s2 := New(s.MCP, s.Path, s.Token)
+	s2.Audit = aw
+	var again []string
+	s2.Notify = func(msg string) error {
+		again = append(again, msg)
+		return nil
+	}
+	t.Cleanup(s2.Close)
+	if err := s2.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	fail(s2)
+	if len(again) != 0 {
+		t.Fatalf("restart re-fired the warning: %v", again)
+	}
+	if !s2.Listening() {
+		t.Fatal("restart closed the door")
+	}
+
+	next := time.Now().Add(48 * time.Hour)
+	s2.Now = func() time.Time { return next }
+	fail(s2)
+	fail(s2)
+	if len(again) != 1 || !strings.Contains(again[0], "still on") {
+		t.Fatalf("next day warning = %v", again)
+	}
+	assertNoToken(t, token, again[0])
+}
+
+func TestNoAuthWarnWhenDisableComesFirst(t *testing.T) {
+	for _, lim := range [][2]int{{2, 5}, {4, 4}} {
+		disable, warn := lim[0], lim[1]
+		s, _, _, _ := testService(t)
+		cfg := httpconfig.Default()
+		cfg.Enabled = true
+		cfg.WarnAfterAuthFailures = warn
+		cfg.AutoDisableAfterAuthFailures = disable
+		cfg.Listen = freeLoopback(t)
+		if err := httpconfig.Save(s.Path, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Reload(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(s.Close)
+		var notes []string
+		s.Notify = func(msg string) error {
+			notes = append(notes, msg)
+			return errors.New("osascript failed")
+		}
+		for i := 0; i < disable; i++ {
+			post(s, "", "127.0.0.1:4765", "", `{}`)
+		}
+		if s.Listening() {
+			t.Fatalf("disable %d warn %d left the door open", disable, warn)
+		}
+		for _, n := range notes {
+			if strings.Contains(n, "still on") {
+				t.Fatalf("warned even though disable %d is at or below warn %d: %s", disable, warn, n)
+			}
+		}
+		got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+		if got.Warned {
+			t.Fatalf("warned flag set when disable %d warn %d skips the warning", disable, warn)
+		}
+	}
+}
+
+func TestAuthWarnFailureDoesNotChangeAuth(t *testing.T) {
+	s, _, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.WarnAfterAuthFailures = 1
+	cfg.AutoDisableAfterAuthFailures = 10
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	s.Notify = func(string) error { return errors.New("osascript failed") }
+	post(s, "", "127.0.0.1:4765", "", `{}`)
+	if !s.Listening() {
+		t.Fatal("a failed warning closed the door")
+	}
+	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	if got.Failures != 1 || !got.Warned {
+		t.Fatalf("after failed warning %+v", got)
+	}
+}
+
+func TestAuthTraceSkipsTheDailyCountForOriginAndRateLimit(t *testing.T) {
+	s, _, _, _ := testService(t)
+	cfg := httpconfig.Default()
+	cfg.Enabled = true
+	cfg.AutoDisableAfterAuthFailures = 10000
+	cfg.WarnAfterAuthFailures = 500
+	cfg.Listen = freeLoopback(t)
+	if err := httpconfig.Save(s.Path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	token := strings.Repeat("ef", 32)
+	host := "127.0.0.1:4765"
+	origin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:4765/mcp", strings.NewReader(`{}`))
+	origin.Host = host
+	origin.RemoteAddr = "127.0.0.1:9"
+	origin.Header.Set("Origin", "http://evil.example/"+token)
+	origin.Header.Set("User-Agent", "origin "+token)
+	s.ServeHTTP(httptest.NewRecorder(), origin)
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:4765/mcp?access_token="+token, strings.NewReader(`{}`))
+	req.Host = host
+	req.RemoteAddr = "127.0.0.1:9"
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "ua "+token)
+	req.Header.Set("X-Forwarded-For", token+", 203.0.113.9")
+	s.ServeHTTP(httptest.NewRecorder(), req)
+	basic := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:4765/mcp", strings.NewReader(`{}`))
+	basic.Host = host
+	basic.RemoteAddr = "127.0.0.1:9"
+	basic.Header.Set("Authorization", "Basic "+token)
+	s.ServeHTTP(httptest.NewRecorder(), basic)
+	wrong := strings.Repeat("12", 32)
+	post(s, wrong, host, "", `{}`)
+	for i := 0; i < authFailLimit-3; i++ {
+		post(s, "", host, "", `{}`)
+	}
+	post(s, "", host, "", `{}`)
+
+	got := httpconfig.ReadAuthDay(httpconfig.AuthStatePath(s.Path), time.Now())
+	if got.Failures != authFailLimit {
+		t.Fatalf("failures = %d, origin and rate-limit must not count", got.Failures)
+	}
+	if got.Trace.Reasons[httpconfig.ReasonQueryToken] != 1 || got.Trace.Reasons[httpconfig.ReasonBadScheme] != 1 || got.Trace.Reasons[httpconfig.ReasonWrongToken] != 1 || got.Trace.Reasons[httpconfig.ReasonMissingHeader] != authFailLimit-3 || got.Trace.Reasons[httpconfig.ReasonRateLimited] != 1 || got.Trace.Reasons[httpconfig.ReasonBadOrigin] != 1 {
+		t.Fatalf("reasons = %#v", got.Trace.Reasons)
+	}
+	assertNoToken(t, wrong, httpconfig.FormatAuthDebug(got))
+	if got.Trace.Sources["forwarded 203.0.113.9"] != 1 || got.Trace.Sources["remote 127.0.0.1"] == 0 {
+		t.Fatalf("sources = %#v", got.Trace.Sources)
+	}
+	if !s.Listening() {
+		t.Fatal("trace-only rejections closed the door")
+	}
+	blob := httpconfig.FormatAuthDebug(got)
+	raw, err := os.ReadFile(httpconfig.AuthStatePath(s.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoToken(t, token, blob+"\n"+string(raw))
+}
+
+func assertNoToken(t *testing.T, token, text string) {
+	t.Helper()
+	sum := sha256.Sum256([]byte(token))
+	hash := hex.EncodeToString(sum[:])
+	lower := strings.ToLower(text)
+	if strings.Contains(text, token) || strings.Contains(text, token[:8]) || strings.Contains(lower, hash) || strings.Contains(lower, "bearer") || strings.Contains(lower, "authorization") {
+		t.Fatalf("output contains a token or Authorization material: %s", text)
 	}
 }
 

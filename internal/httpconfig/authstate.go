@@ -16,6 +16,11 @@ type AuthDay struct {
 	Failures       int    `json:"failures"`
 	AutoDisabled   bool   `json:"auto_disabled"`
 	AutoDisabledAt string `json:"auto_disabled_at,omitempty"`
+	// Warned is set the first time today's count reaches the warn
+	// threshold. A restart sees it and does not post the warning again.
+	Warned   bool      `json:"warned,omitempty"`
+	WarnedAt string    `json:"warned_at,omitempty"`
+	Trace    AuthTrace `json:"trace,omitempty"`
 	// ClearedUnixNano is set by `protonmcp http enable`. A hand-edit
 	// of http.yaml does not set it. The daemon uses it to tell an
 	// enable apart from a reload after a failed disable write.
@@ -40,15 +45,53 @@ func ReadAuthDay(path string, now time.Time) AuthDay {
 // AddAuthFailure adds one failure for now's local day and returns the
 // updated day. A day change starts the count at 1.
 func AddAuthFailure(path string, now time.Time) (AuthDay, error) {
+	return AddAuthFailureEvent(path, now, AuthEvent{})
+}
+
+// AddAuthFailureEvent counts one sign-in failure and stores ev.
+// An empty Reason still counts, without a trace row.
+func AddAuthFailureEvent(path string, now time.Time, ev AuthEvent) (AuthDay, error) {
 	authMu.Lock()
 	defer authMu.Unlock()
 	rec := readAuthDay(path, now)
 	rec.Day = dayKey(now)
 	rec.Failures++
+	if ev.Reason != "" {
+		if ev.At.IsZero() {
+			ev.At = now
+		}
+		rec.Trace.Add(ev)
+	}
 	if err := writeAuthDay(path, rec); err != nil {
 		return AuthDay{}, err
 	}
 	return rec, nil
+}
+
+// AddAuthEvent stores a rejection that is not a counted sign-in
+// failure, such as a bad Origin or a per-minute lockout.
+func AddAuthEvent(path string, now time.Time, ev AuthEvent) error {
+	authMu.Lock()
+	defer authMu.Unlock()
+	rec := readAuthDay(path, now)
+	rec.Day = dayKey(now)
+	if ev.At.IsZero() {
+		ev.At = now
+	}
+	rec.Trace.Add(ev)
+	return writeAuthDay(path, rec)
+}
+
+// MarkWarned records that today's warning was posted. The failure
+// count is left as it is.
+func MarkWarned(path string, now time.Time) error {
+	authMu.Lock()
+	defer authMu.Unlock()
+	rec := readAuthDay(path, now)
+	rec.Day = dayKey(now)
+	rec.Warned = true
+	rec.WarnedAt = now.Format(time.RFC3339)
+	return writeAuthDay(path, rec)
 }
 
 // MarkAutoDisabled records that today tripped the threshold. The
@@ -74,6 +117,9 @@ func ResetAuthFailures(path string, now time.Time) error {
 	rec.Failures = 0
 	rec.AutoDisabled = false
 	rec.AutoDisabledAt = ""
+	rec.Warned = false
+	rec.WarnedAt = ""
+	rec.Trace = AuthTrace{}
 	rec.ClearedUnixNano = now.UnixNano()
 	return writeAuthDay(path, rec)
 }
@@ -89,10 +135,13 @@ func readAuthDay(path string, now time.Time) AuthDay {
 		return AuthDay{Day: today}
 	}
 	if rec.Day != today {
-		// The failure count is per local day. The auto-disable block
-		// stays until http enable clears it.
+		// The failure count and the once-a-day warning are per local
+		// day. The auto-disable block stays until http enable clears it.
 		rec.Day = today
 		rec.Failures = 0
+		rec.Warned = false
+		rec.WarnedAt = ""
+		rec.Trace = AuthTrace{}
 	}
 	return rec
 }

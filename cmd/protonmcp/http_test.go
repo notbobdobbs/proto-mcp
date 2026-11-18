@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -204,6 +206,9 @@ func TestHTTPEnableResetsTodayAuthFailures(t *testing.T) {
 	if err := httpconfig.MarkAutoDisabled(path, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	if err := httpconfig.MarkWarned(path, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	if err := runHTTPWith(context.Background(), []string{"enable"}, deps); err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +217,7 @@ func TestHTTPEnableResetsTodayAuthFailures(t *testing.T) {
 		t.Fatalf("enabled %+v %v", cfg.Enabled, err)
 	}
 	got := httpconfig.ReadAuthDay(path, time.Now())
-	if got.Failures != 0 || got.AutoDisabled || got.ClearedUnixNano == 0 {
+	if got.Failures != 0 || got.AutoDisabled || got.Warned || got.ClearedUnixNano == 0 || len(got.Trace.Sample) != 0 {
 		t.Fatalf("auth day after enable = %+v", got)
 	}
 	if !strings.Contains(stdout.String(), "enabled") {
@@ -500,6 +505,32 @@ func TestHTTPStatusDoesNotPrintTheToken(t *testing.T) {
 	}
 	if strings.Contains(out+stderr.String(), mustHex(t, tok)) {
 		t.Fatal("status printed the token")
+	}
+}
+
+func TestHTTPStatusDebugOmitsPresentedTokens(t *testing.T) {
+	deps, _, _, stdout, stderr := testDeps(t)
+	token := strings.Repeat("ab", 32)
+	day := time.Now().Format("2006-01-02")
+	body := []byte(`{"day":"` + day + `","failures":2,"warned":true,"trace":{"first_unix":1763500000,"last_unix":1763500060,"peak_per_minute":2,"reasons":{"wrong token":2},"sources":{"remote 127.0.0.1":2},"agents":{"bot ` + token + `":2},"requests":{"POST /mcp":2},"sample":[{"unix":1763500060,"reason":"wrong token","source":"remote 127.0.0.1","request":"POST /mcp Authorization: Bearer ` + token + `","agent":"` + token + `"}]}}` + "\n")
+	if err := os.WriteFile(httpconfig.AuthStatePath(deps.configPath), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runHTTPWith(context.Background(), []string{"status", "--debug"}, deps); err != nil {
+		t.Fatal(err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "warned today: true") || !strings.Contains(out, "auth failure detail") || !strings.Contains(out, "peak per minute:") || !strings.Contains(out, "first:") || !strings.Contains(out, "wrong token") {
+		t.Fatalf("status = %q", out)
+	}
+	sum := sha256.Sum256([]byte(token))
+	hash := hex.EncodeToString(sum[:])
+	if strings.Contains(out, token) || strings.Contains(out, token[:8]) || strings.Contains(out, hash) || strings.Contains(strings.ToLower(out+stderr.String()), "bearer") {
+		t.Fatal("status --debug printed token material")
+	}
+	err := runHTTPWith(context.Background(), []string{"status", "--debug", token}, deps)
+	if err == nil || strings.Contains(err.Error(), token) {
+		t.Fatalf("status echoed an argument: %v", err)
 	}
 }
 

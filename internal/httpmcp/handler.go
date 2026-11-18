@@ -347,6 +347,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	now := s.now()
 	if s.authFails.over(now, authFailLimit) {
+		s.noteAuthEvent(now, authEvent(r, httpconfig.ReasonRateLimited, now))
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
@@ -355,7 +356,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// for every method, including GET and DELETE. The query is not logged.
 	if hasBearerQuery(r) {
 		s.authFails.add(now)
-		s.recordAuthFailure(r.Context(), now)
+		s.recordAuthFailure(r.Context(), now, authEvent(r, httpconfig.ReasonQueryToken, now))
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -371,7 +372,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	cfg := s.cfg
 	s.mu.Unlock()
-	if !hostOK(r.Host, cfg.AllowedHosts) || !originOK(r.Header.Get("Origin"), cfg.AllowedOrigins) {
+	if !hostOK(r.Host, cfg.AllowedHosts) {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	if !originOK(r.Header.Get("Origin"), cfg.AllowedOrigins) {
+		s.noteAuthEvent(now, authEvent(r, httpconfig.ReasonBadOrigin, now))
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
@@ -389,7 +395,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.authFails.add(now)
-		s.recordAuthFailure(r.Context(), now)
+		s.recordAuthFailure(r.Context(), now, authEvent(r, rejectReason(r), now))
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -553,6 +559,33 @@ var (
 	errTokenRejected = errors.New("httpmcp: bearer rejected")
 	errTokenStore    = errors.New("httpmcp: token store")
 )
+
+func authEvent(r *http.Request, reason string, now time.Time) httpconfig.AuthEvent {
+	ip := httpconfig.ForwardedIP(r.Header.Get("Tailscale-Client-Ip"), r.Header.Get("X-Forwarded-For"))
+	path := ""
+	if r.URL != nil {
+		path = r.URL.Path
+	}
+	return httpconfig.AuthEvent{
+		Reason:  reason,
+		Source:  httpconfig.ClientSource(ip, r.RemoteAddr),
+		Agent:   r.Header.Get("User-Agent"),
+		Request: r.Method + " " + path,
+		At:      now,
+	}
+}
+
+func rejectReason(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if strings.TrimSpace(h) == "" {
+		return httpconfig.ReasonMissingHeader
+	}
+	const p = "Bearer "
+	if len(h) < len(p) || !strings.EqualFold(h[:len(p)], p) {
+		return httpconfig.ReasonBadScheme
+	}
+	return httpconfig.ReasonWrongToken
+}
 
 func (s *Service) bearer(r *http.Request) ([]byte, error) {
 	if s.Token == nil {

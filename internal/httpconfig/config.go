@@ -27,6 +27,10 @@ const (
 	// count that turns the door off. 0 in the file means this value.
 	// There is no setting that disables the counter.
 	DefaultAutoDisableAfterAuthFailures = 50
+	// DefaultWarnAfterAuthFailures is the day's count that posts one
+	// warning. 0 in the file means this value. The warning is skipped
+	// when the auto-disable limit is at or below it.
+	DefaultWarnAfterAuthFailures = 500
 
 	maxRequestsPerMinuteCeiling     = 600
 	maxRemoteReadsPerDayCeiling     = 5000
@@ -128,6 +132,9 @@ type Config struct {
 	// AutoDisableAfterAuthFailures is the local-day count of failed
 	// HTTP auths that writes enabled:false. It is never 0.
 	AutoDisableAfterAuthFailures int
+	// WarnAfterAuthFailures is the local-day count that posts one
+	// warning while the door stays on. It is never 0.
+	WarnAfterAuthFailures int
 	// RemoteTools is the effective allowlist. It is never "every tool".
 	RemoteTools []string
 	// RemoteToolsSet is true when the file named a non-empty list.
@@ -147,6 +154,7 @@ func Default() Config {
 		MaxRemoteReadsPerDay:         DefaultMaxRemoteReadsPerDay,
 		MaxUnlockHours:               DefaultMaxUnlockHours,
 		AutoDisableAfterAuthFailures: DefaultAutoDisableAfterAuthFailures,
+		WarnAfterAuthFailures:        DefaultWarnAfterAuthFailures,
 		RemoteTools:                  append([]string(nil), DefaultRemoteTools...),
 	}
 }
@@ -161,6 +169,7 @@ type rawFile struct {
 	MaxRemoteReadsPerDay         *int      `yaml:"max_remote_reads_per_day"`
 	MaxUnlockHours               *int      `yaml:"max_unlock_hours"`
 	AutoDisableAfterAuthFailures *int      `yaml:"auto_disable_after_auth_failures"`
+	WarnAfterAuthFailures        *int      `yaml:"warn_after_auth_failures"`
 	RemoteTools                  *[]string `yaml:"remote_tools"`
 }
 
@@ -212,6 +221,11 @@ func Parse(data []byte) (Config, error) {
 		return Config{}, err
 	}
 	cfg.AutoDisableAfterAuthFailures = disableAfter
+	warnAfter, err := capOrDefault(raw.WarnAfterAuthFailures, DefaultWarnAfterAuthFailures, maxAutoDisableAfterAuthFailures, "warn_after_auth_failures")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.WarnAfterAuthFailures = warnAfter
 	tools, set, err := remoteTools(raw.RemoteTools)
 	if err != nil {
 		return Config{}, err
@@ -361,6 +375,7 @@ func Save(path string, cfg Config) error {
 		"max_remote_reads_per_day":         cfg.MaxRemoteReadsPerDay,
 		"max_unlock_hours":                 cfg.MaxUnlockHours,
 		"auto_disable_after_auth_failures": cfg.AutoDisableAfterAuthFailures,
+		"warn_after_auth_failures":         cfg.WarnAfterAuthFailures,
 	}
 	if cfg.RemoteToolsSet {
 		doc["remote_tools"] = cfg.RemoteTools

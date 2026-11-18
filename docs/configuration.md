@@ -92,6 +92,7 @@ max_requests_per_minute: 60    # 0 means 60, never unlimited; hard ceiling 600
 max_remote_reads_per_day: 500  # 0 means 500, never unlimited; hard ceiling 5000
 max_unlock_hours: 8            # 0 means 8; allowed 1–24; no unlimited value
 auto_disable_after_auth_failures: 50  # 0 means 50; allowed 1–10000; cannot be turned off
+warn_after_auth_failures: 500         # 0 means 500; one warning that day; skipped when auto-disable is at or below this
 # remote_tools omitted means the built-in default, not every tool.
 ```
 
@@ -141,6 +142,7 @@ protonmcp http token revoke    # delete the token and signal the daemon; logout 
 protonmcp http enable          # refuses without a token; warns if screen lock is off, and still enables
 protonmcp http disable         # writes enabled: false even if the file is broken, then closes the listener
 protonmcp http status          # enabled, listen address, token present or absent, live sessions, unlock age, listening
+protonmcp http status --debug  # also today's auth-failure detail; never a token
 protonmcp http activity        # remote call counts; --ids also prints message ids; never a body
 ```
 
@@ -154,19 +156,36 @@ show and rotate. Rotate signals the daemon before the wait, so old
 HTTP sessions drop. `http status` reads the session count, unlock
 age, and listening flag from the daemon's status file, and only while
 that process is still running. It also prints today's auth-failure
-count and an auto-disable time from today, when there is one. It
-never prints the token. `doctor` says the door is listening whenever
+count, whether today's warning was posted, and an auto-disable time
+from today, when there is one. `http status --debug` adds the
+failure detail: first and last times, the busiest minute, reasons,
+client sources, user agents, method and path, and the last 20
+failures. It never prints the token. `doctor` says the door is listening whenever
 that process still has the listener open, including when `http.yaml`
 is not usable. It does not say the door is off while the listener is
 up. It shows the same auth-failure count and auto-disable event.
 
 Failed HTTP sign-ins are counted per local day: a missing bearer, a
 wrong bearer, and any bearer in the query string, including
-`DELETE`. At `auto_disable_after_auth_failures` the daemon writes
-`enabled: false` (mode `0600`, other settings kept when the file
-still parses), closes the listener, and drops HTTP sessions. It
-writes an audit row with the count and not the token, then posts a
-notification. If that notification fails, the door stays off. If the
+`DELETE`. A bad Origin and the per-minute lockout are recorded in
+the detail and do not add to this count. At
+`warn_after_auth_failures` (default 500; `0` means 500) the daemon
+posts one notification that remote access is still on, and writes
+an audit row with the same detail. That happens once per local day,
+including across a restart, and only when the auto-disable limit is
+above the warn threshold. A failed notification leaves the door up,
+and the failure still counts. At `auto_disable_after_auth_failures` the
+daemon writes `enabled: false` (mode `0600`, other settings kept
+when the file still parses), closes the listener, and drops HTTP
+sessions. It writes an audit row with the count and the scrubbed
+detail, not the token, then posts a notification. The notification
+names the count, the time window, the top three reasons, the top
+three client sources, and `protonmcp http status --debug`. A client
+source is the forwarded IP from a Tailscale or Funnel header when
+that header carries an IP, otherwise the remote address. Neither
+the notification, the audit row, nor `http status` records any part
+of a presented token or Authorization value. If that notification
+fails, the door stays off. If the
 counter file cannot be saved, the failure is still counted in memory
 and the door turns off. A Keychain read error is a 401 and is not
 counted as a failed sign-in. The count resets at local midnight and

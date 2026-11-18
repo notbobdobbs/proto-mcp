@@ -220,17 +220,29 @@ The socket's peer checks stay; they simply do not apply to HTTP.
 - **Repeated auth failures turn the door off for the day.** A bad
   bearer, a missing bearer, and a bearer in the query string count,
   including `DELETE`. The default is 50 in a local calendar day.
-  `0` means 50. There is no value that turns the counter off. At the
-  threshold the daemon writes `enabled: false`, closes the listener,
-  drops HTTP sessions, writes an audit row that does not contain the
-  token, and posts a notification. A failed notification leaves the
-  door off. A counter file that cannot be written still counts in
-  memory and still turns the door off. A Keychain read error is a
-  401 and is not one of those failures; the log does not contain the
-  token. Midnight resets the count and does not turn the door back
-  on. Editing `http.yaml` and reloading does not turn it back on
-  either. The only re-enable is `protonmcp http enable`, which clears
-  the auto-disable and zeros today's count. This is not an idle lock.
+  `0` means 50. There is no value that turns the counter off. The
+  ceiling stays 10000. At 500 in a local day (or
+  `warn_after_auth_failures`; `0` means 500) the daemon posts one
+  warning that remote access is still on, once that day, including
+  after a restart. It skips that warning when the auto-disable limit
+  is at or below 500, because turning the door off already notifies.
+  A failed warning leaves the door up. At the auto-disable threshold
+  the daemon writes `enabled: false`, closes the listener, drops HTTP
+  sessions, writes an audit row, and posts a notification. Both
+  notifications stay short and point at `protonmcp http status
+  --debug` for the scrubbed detail: times, the busiest minute,
+  reasons, client sources, user agents, method and path, and the last
+  20 failures. A source is the forwarded client IP from a Tailscale
+  or Funnel header when one is present, otherwise the remote address.
+  No part of a presented token or Authorization value is recorded.
+  A failed disable notification leaves the door off. A counter file
+  that cannot be written still counts in memory and still turns the
+  door off. A Keychain read error is a 401 and is not one of those
+  failures; the log does not contain the token. Midnight resets the
+  count and does not turn the door back on. Editing `http.yaml` and
+  reloading does not turn it back on either. The only re-enable is
+  `protonmcp http enable`, which clears the auto-disable and zeros
+  today's count. This is not an idle lock.
 - **Prompt injection from mail the bot reads.** A hostile message can
   tell the bot to trash, download, or send. Download and recoverable
   trash are on the default remote list and still require Touch ID.

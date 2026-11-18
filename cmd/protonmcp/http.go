@@ -191,7 +191,10 @@ func (d httpDeps) disable(args []string) error {
 }
 
 func (d httpDeps) status(args []string) error {
-	if len(args) > 0 {
+	fs := flag.NewFlagSet("http status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	debug := fs.Bool("debug", false, "print today's auth-failure detail")
+	if err := fs.Parse(args); err != nil || fs.NArg() > 0 {
 		return errors.New("http status takes no arguments")
 	}
 	cfg, cfgErr := httpconfig.Load(d.configPath)
@@ -215,8 +218,15 @@ func (d httpDeps) status(args []string) error {
 	if auth.AutoDisabled {
 		auto = auth.AutoDisabledAt
 	}
-	fmt.Fprintf(d.stdout, "enabled: %s\nlisten: %s\ntoken: %s\nsessions: %d\nunlock age: %s\nlistening: %t\nauth failures today: %d\nauto-disabled: %s\n",
-		enabled, listen, tokenLine, live.Sessions, httpconfig.FormatUnlockAge(live.UnlockUnix, time.Now()), live.Listening, auth.Failures, auto)
+	warned := "false"
+	if auth.Warned {
+		warned = "true"
+	}
+	fmt.Fprintf(d.stdout, "enabled: %s\nlisten: %s\ntoken: %s\nsessions: %d\nunlock age: %s\nlistening: %t\nauth failures today: %d\nauto-disabled: %s\nwarned today: %s\n",
+		enabled, listen, tokenLine, live.Sessions, httpconfig.FormatUnlockAge(live.UnlockUnix, time.Now()), live.Listening, auth.Failures, auto, warned)
+	if *debug {
+		fmt.Fprint(d.stdout, httpconfig.FormatAuthDebug(auth))
+	}
 	return cfgErr
 }
 
