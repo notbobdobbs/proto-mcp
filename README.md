@@ -54,8 +54,9 @@ protonmcp setup
 ```
 
 That's the whole thing. `setup` signs you in, copies your mailbox index
-into a local database, and starts the background service, so MCP clients
-such as Grok Bot (remote) or Claude Desktop (local) can use the mailbox.
+into a local database, and starts the background service, so a local MCP
+client such as Claude Desktop can use the mailbox. Remote access for
+clients such as Grok Bot stays off until you run `protonmcp http enable`.
 The last step is optional local-client registration for Claude Desktop
 and Claude Code. Restart a local client afterwards and the tools show up
 under `protonmcp`.

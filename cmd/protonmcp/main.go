@@ -136,6 +136,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `protonmcp — bridge Proton Mail to MCP clients such as Grok Bot (remote) or Claude Desktop (local).
+Remote access stays off until you run `+"`protonmcp http enable`"+`.
 Version: `+buildinfo.String()+`
 
 Usage:
@@ -144,7 +145,8 @@ Usage:
 First-time setup — run this one command:
   protonmcp setup
   It signs you in, copies your mailbox index, starts the background
-  service, and can register optional local clients. Safe to re-run; it
+  service, and can register optional local clients. Remote access stays
+  off until you run `+"`protonmcp http enable`"+`. Safe to re-run; it
   skips what's done.
 
 Commands:

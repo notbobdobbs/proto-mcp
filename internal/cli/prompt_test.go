@@ -75,6 +75,42 @@ func TestReadMaskedPasswordRuneBackspace(t *testing.T) {
 	}
 }
 
+func TestReadMaskedPasswordBareEscKeepsNextCharacter(t *testing.T) {
+	in := bytes.NewReader([]byte{0x1b, 'a', 0x1b, '[', 'D', 'b', '\n'})
+	var out bytes.Buffer
+	got, err := readMaskedPassword(in, &out)
+	if err != nil {
+		t.Fatalf("readMaskedPassword: %v", err)
+	}
+	defer zero(got)
+	if string(got) != "ab" {
+		t.Fatalf("result = %q, want %q", got, "ab")
+	}
+	if strings.ContainsAny(out.String(), "ab[D") || bytes.Contains(out.Bytes(), []byte{0x1b}) {
+		t.Fatalf("output leaked input: %q", out.String())
+	}
+	if strings.Count(out.String(), "*") != 2 {
+		t.Fatalf("output %q, want two stars", out.String())
+	}
+}
+
+func TestReadMaskedPasswordGrowsWithoutLosingBytes(t *testing.T) {
+	body := bytes.Repeat([]byte{'p'}, passwordCap+3)
+	in := append(append([]byte{}, body...), '\n')
+	var out bytes.Buffer
+	got, err := readMaskedPassword(bytes.NewReader(in), &out)
+	if err != nil {
+		t.Fatalf("readMaskedPassword: %v", err)
+	}
+	defer zero(got)
+	if !bytes.Equal(got, body) {
+		t.Fatalf("len %d, want %d", len(got), len(body))
+	}
+	if strings.ContainsRune(out.String(), 'p') {
+		t.Fatal("output leaked a typed character")
+	}
+}
+
 func TestReadPasswordNotTerminalDoesNotBlock(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -87,7 +123,7 @@ func TestReadPasswordNotTerminalDoesNotBlock(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		buf, err := readPassword(r)
+		buf, err := readPassword(r, &ttyCtl{f: r}, r)
 		zero(buf)
 		done <- err
 	}()

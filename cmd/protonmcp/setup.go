@@ -80,9 +80,9 @@ func runSetup(ctx context.Context, args []string) error {
 		},
 		{
 			title: "Start the background service",
-			why: "Registers a login item that keeps one unlocked session for MCP\n" +
-				"clients such as Grok Bot (remote) or Claude Desktop (local),\n" +
-				"and starts it now.",
+			why: "Registers a login item that keeps one unlocked session for local\n" +
+				"MCP clients such as Claude Desktop, and starts it now. Remote\n" +
+				"access stays off until you run `protonmcp http enable`.",
 			done: func() (bool, string) {
 				if p, err := daemonPlistPath(); err == nil {
 					if _, serr := os.Stat(p); serr == nil && labelLoaded() {
@@ -122,8 +122,9 @@ func runSetup(ctx context.Context, args []string) error {
 
 	fmt.Println("proto-mcp setup")
 	fmt.Println()
-	fmt.Println("This connects your Proton mailbox to MCP clients such as Grok Bot (remote)")
-	fmt.Println("or Claude Desktop (local). Four steps, and you can stop and re-run this")
+	fmt.Println("This connects your Proton mailbox to local MCP clients such as Claude Desktop.")
+	fmt.Println("Remote access for clients such as Grok Bot stays off until you run")
+	fmt.Println("`protonmcp http enable`. Four steps, and you can stop and re-run this")
 	fmt.Println("at any time — it picks up where it left off.")
 	fmt.Println()
 
@@ -164,9 +165,10 @@ func runSetup(ctx context.Context, args []string) error {
 	fmt.Println()
 	fmt.Println("Setup complete.")
 	fmt.Println()
-	fmt.Println("  MCP clients such as Grok Bot (remote) or Claude Desktop (local)")
-	fmt.Println("  can use the mailbox. If you registered a local client, quit and")
-	fmt.Println("  reopen it — it only reads the tool list at startup.")
+	fmt.Println("  Local clients such as Claude Desktop can use the mailbox. If you")
+	fmt.Println("  registered one, quit and reopen it — it only reads the tool list")
+	fmt.Println("  at startup.")
+	fmt.Println("  Remote access stays off until you run `protonmcp http enable`.")
 	fmt.Println()
 	fmt.Println("Then try asking:")
 	fmt.Println()

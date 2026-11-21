@@ -420,3 +420,40 @@ func TestHVWebURL(t *testing.T) {
 		t.Error("hvWebURL should return empty for missing/garbage details")
 	}
 }
+
+func TestHVWebURLLengthCap(t *testing.T) {
+	base := "https://verify.proton.me/"
+	ok := base + strings.Repeat("a", maxHVWebURLLen-len(base))
+	if len(ok) != maxHVWebURLLen {
+		t.Fatalf("fixture length %d", len(ok))
+	}
+	long := ok + "b"
+	for _, tt := range []struct {
+		in, want string
+	}{
+		{ok, ok},
+		{long, ""},
+	} {
+		details, err := json.Marshal(map[string]string{"WebUrl": tt.in})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := hvWebURL(details); got != tt.want {
+			t.Errorf("len %d: got len %d, want len %d", len(tt.in), len(got), len(tt.want))
+		}
+	}
+}
+
+func TestHVMethodErrorQuotesNames(t *testing.T) {
+	err := hvMethodError([]string{"captcha\x1b[2J"}, errors.New("nope"))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "\x1b") {
+		t.Fatalf("raw escape leaked into error: %q", msg)
+	}
+	if !strings.Contains(msg, `"captcha\x1b[2J"`) {
+		t.Fatalf("method name not quoted: %s", msg)
+	}
+}

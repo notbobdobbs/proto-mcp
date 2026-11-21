@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,7 +80,12 @@ var dumpHeaderRedactRE = regexp.MustCompile(`(?im)^(Authorization|Cookie|Set-Coo
 // The quoted-name-then-colon anchoring keeps prefixes unambiguous:
 // "RecoverySecret" cannot match inside "RecoverySecretSignature", because
 // the pattern requires a closing quote immediately after the name.
-var dumpBodyTokenRE = regexp.MustCompile(`"(AccessToken|RefreshToken|TwoFactorCode|TwoFA|Password|MailboxPassword|SaltedKeyPass[A-Za-z]*|ClientProof|ClientEphemeral|ServerProof|UID|PrivateKey|RecoverySecret|RecoverySecretSignature|KeySalt|Token|Passphrase)"\s*:\s*"[^"]*"`)
+var dumpBodyTokenRE = regexp.MustCompile(`"(AccessToken|RefreshToken|TwoFactorCode|TwoFA|Password|MailboxPassword|SaltedKeyPass[A-Za-z]*|ClientProof|ClientEphemeral|ServerProof|UID|PrivateKey|RecoverySecret|RecoverySecretSignature|KeySalt|HumanVerificationToken|Token|Passphrase)"\s*:\s*"[^"]*"`)
+
+// dumpQueryTokenRE redacts token= query values, including the token
+// Proton puts on a verify.proton.me WebUrl. The parameter name stays
+// so the dump still shows that a token was present.
+var dumpQueryTokenRE = regexp.MustCompile(`(?i)([?&]token=)[^&\s"\\]*`)
 
 // dumpArmoredKeyRE matches an armored PGP private key block anywhere in
 // the dump. This is a backstop, not the primary defence: dumpBodyTokenRE
@@ -111,6 +117,7 @@ func redactDump(b []byte) []byte {
 		}
 		return append(append([]byte{}, match[:idx]...), []byte(`: "[REDACTED]"`)...)
 	})
+	b = dumpQueryTokenRE.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	b = dumpArmoredKeyRE.ReplaceAll(b, []byte("[REDACTED PGP PRIVATE KEY]"))
 	return b
 }
@@ -419,11 +426,53 @@ func NewManager(jar http.CookieJar) *gpa.Manager {
 		}))
 	}
 	m := gpa.New(opts...)
-	m.AddPreRequestHook(func(_ *resty.Client, req *resty.Request) error {
+	m.AddPreRequestHook(func(c *resty.Client, req *resty.Request) error {
 		req.SetHeader("User-Agent", UserAgent)
+		// The SDK's resty client is a stock http.Client. It follows
+		// redirects, and Go only strips Authorization and Cookie on a
+		// cross-host hop — x-pm-human-verification-* is copied to the
+		// new host. Stop that for /auth and for any request that
+		// carries those headers.
+		installRedirectGuard(c)
 		return nil
 	})
 	return m
+}
+
+// installRedirectGuard replaces the client's redirect policy. Ordinary
+// requests still follow up to 10 redirects. /auth and any request that
+// already carries a human-verification header do not follow at all, so
+// the token cannot be replayed onto another host.
+func installRedirectGuard(c *resty.Client) {
+	if c == nil || c.GetClient() == nil {
+		return
+	}
+	c.GetClient().CheckRedirect = redirectGuard
+}
+
+func redirectGuard(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if len(via) > 0 && blockHVRedirect(via[0]) {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}
+
+func blockHVRedirect(orig *http.Request) bool {
+	if orig == nil {
+		return false
+	}
+	if orig.Header.Get("x-pm-human-verification-token") != "" ||
+		orig.Header.Get("x-pm-human-verification-token-type") != "" {
+		return true
+	}
+	if orig.URL == nil {
+		return false
+	}
+	p := orig.URL.Path
+	return p == "/auth" || strings.HasPrefix(p, "/auth/")
 }
 
 func doTOTP(ctx context.Context, client *gpa.Client, creds *Credentials) error {
@@ -693,17 +742,25 @@ func tryWithHV[T any](ctx context.Context, creds *Credentials, call func(*gpa.AP
 // re-entering password and TOTP), but not indefinitely.
 const maxHVAttempts = 3
 
+// maxHVWebURLLen is the longest WebUrl printed to the terminal. A longer
+// value is withheld the same way a hostile host is: there is nothing
+// safe to show.
+const maxHVWebURLLen = 2048
+
 // hvWebURL extracts Details.WebUrl from a 9001 response, returning it
 // only if it's an https link to verify.proton.me made of printable
-// ASCII. It is written straight to the user's terminal as the thing to
-// open, so anything else — another host, escape sequences, lookalike
-// Unicode — is withheld and the caller falls back to "log in at
-// mail.proton.me".
+// ASCII and no longer than maxHVWebURLLen. It is written straight to
+// the user's terminal as the thing to open, so anything else — another
+// host, escape sequences, lookalike Unicode, an oversized string — is
+// withheld and the caller falls back to "log in at mail.proton.me".
 func hvWebURL(details []byte) string {
 	var raw struct {
 		WebURL string `json:"WebUrl"`
 	}
 	if len(details) == 0 || json.Unmarshal(details, &raw) != nil {
+		return ""
+	}
+	if len(raw.WebURL) == 0 || len(raw.WebURL) > maxHVWebURLLen {
 		return ""
 	}
 	for _, r := range raw.WebURL {
@@ -734,14 +791,28 @@ func hvMethodSupported(methods []string, webURL string) bool {
 // user. The WebUrl is never included: a hostile link has already been
 // withheld by hvWebURL, and a missing link has nothing safe to show.
 func hvMethodError(methods []string, err error) error {
+	shown := quotedMethods(methods)
 	if hasCaptchaMethod(methods) && !hasOwnershipMethod(methods) {
 		return fmt.Errorf(
-			"proton: Proton asked for a CAPTCHA (%v) but did not return a usable https://verify.proton.me link. Sign in at https://mail.proton.me first and retry later: %w",
-			methods, err)
+			"proton: Proton asked for a CAPTCHA (%s) but did not return a usable https://verify.proton.me link. Sign in at https://mail.proton.me first and retry later: %w",
+			shown, err)
 	}
 	return fmt.Errorf(
-		"proton: account requires human verification via %v, which protonmcp cannot complete in the browser. Sign in at https://mail.proton.me first and retry later: %w",
-		methods, err)
+		"proton: account requires human verification via %s, which protonmcp cannot complete in the browser. Sign in at https://mail.proton.me first and retry later: %w",
+		shown, err)
+}
+
+// quotedMethods prints method names with %q so a value Proton sent
+// cannot inject terminal controls or extra format text into the error.
+func quotedMethods(methods []string) string {
+	if len(methods) == 0 {
+		return "[]"
+	}
+	parts := make([]string, len(methods))
+	for i, m := range methods {
+		parts[i] = fmt.Sprintf("%q", m)
+	}
+	return "[" + strings.Join(parts, " ") + "]"
 }
 
 // hasCaptchaMethod reports whether methods includes the method named
