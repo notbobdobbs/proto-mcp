@@ -18,7 +18,7 @@ import (
 // must restore cooked mode before the tty is closed, and the read must
 // return without waiting for Enter.
 func TestPromptSecretCancelRestoresTerminal(t *testing.T) {
-	_, slave := openPTY(t)
+	master, slave := openPTY(t)
 	dupfd, err := unix.Dup(int(slave.Fd()))
 	if err != nil {
 		t.Fatalf("dup slave: %v", err)
@@ -71,4 +71,8 @@ func TestPromptSecretCancelRestoresTerminal(t *testing.T) {
 	if !reflect.DeepEqual(before, after) {
 		t.Fatal("terminal was left in raw mode after cancel")
 	}
+	// The blocking read is still in the kernel. Feed it a newline so
+	// it exits before this pty's fd number is reused by the next test.
+	_, _ = master.Write([]byte{'\n'})
+	time.Sleep(50 * time.Millisecond)
 }

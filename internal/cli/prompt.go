@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -37,10 +39,10 @@ func openTTY() (*os.File, error) {
 }
 
 // watchCancel spawns a goroutine that runs onCancel as soon as ctx is
-// cancelled. onCancel must restore a raw terminal before closing the
-// tty: closing first makes term.Restore fail on the dead fd and leaves
-// the user's shell in raw mode. Closing still has to happen, so the
-// in-flight Read returns instead of waiting for Enter.
+// cancelled. For the password prompt, onCancel restores cooked mode
+// and does not close the tty: closing does not wake a blocked read,
+// and term.Restore on a closed fd leaves the shell raw. PromptLine
+// still closes its tty so bufio's read returns.
 //
 // The watcher exits when stop is closed (the prompt finished normally)
 // so it never leaks. Returns a function the prompt must call before
@@ -57,19 +59,16 @@ func watchCancel(ctx context.Context, onCancel func()) func() {
 	return func() { close(stop) }
 }
 
-// ttyCtl restores raw mode and unblocks a read on cancel. Closing the
-// tty from another goroutine does not wake a blocked terminal read
-// (and can deadlock the poller), and term.Restore on that closed fd
-// fails, so the shell stays raw until Enter. Restore uses a dup of the
-// fd. The read polls a wake pipe and returns as soon as cancel writes
-// to it.
+// ttyCtl restores raw mode from a dup of the tty fd. Closing the tty
+// from another goroutine does not wake a blocked terminal read, and
+// term.Restore on that closed fd fails, so the shell stays raw until
+// Enter. The dup stays open for the restore.
 type ttyCtl struct {
 	mu         sync.Mutex
 	f          *os.File
 	raw        *term.State
 	restoreFD  int
 	hasRestore bool
-	wakeW      *os.File
 }
 
 func (c *ttyCtl) enterRaw() error {
@@ -86,12 +85,57 @@ func (c *ttyCtl) enterRaw() error {
 		c.restoreFD = d
 		c.hasRestore = true
 	}
-	st, err := term.MakeRaw(int(c.f.Fd()))
+	fd := int(c.f.Fd())
+	st, err := makeRawKeepISIG(fd)
 	if err != nil {
+		return err
+	}
+	if err := setBlocking(fd); err != nil {
+		_ = term.Restore(fd, st)
 		return err
 	}
 	c.raw = st
 	return nil
+}
+
+// makeRawKeepISIG is term.MakeRaw without clearing ISIG, in one
+// termios update. A second update flushes bytes that arrived between
+// the two calls. ISIG stays on so Ctrl+C is a kernel SIGINT. On macOS
+// the masked read never observed the 0x03 byte, and with ISIG off the
+// signal was not delivered either.
+func makeRawKeepISIG(fd int) (*term.State, error) {
+	old, err := term.GetState(fd)
+	if err != nil {
+		return nil, err
+	}
+	t, err := unix.IoctlGetTermios(fd, ioctlReadTermios)
+	if err != nil {
+		return nil, err
+	}
+	t.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
+	t.Oflag &^= unix.OPOST
+	t.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.IEXTEN
+	t.Lflag |= unix.ISIG
+	t.Cflag &^= unix.CSIZE | unix.PARENB
+	t.Cflag |= unix.CS8
+	t.Cc[unix.VMIN] = 1
+	t.Cc[unix.VTIME] = 0
+	if err := unix.IoctlSetTermios(fd, ioctlWriteTermios, t); err != nil {
+		return nil, err
+	}
+	return old, nil
+}
+
+func setBlocking(fd int) error {
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	if err != nil {
+		return err
+	}
+	if flags&unix.O_NONBLOCK == 0 {
+		return nil
+	}
+	_, err = unix.FcntlInt(uintptr(fd), unix.F_SETFL, flags&^unix.O_NONBLOCK)
+	return err
 }
 
 func (c *ttyCtl) restore() {
@@ -112,18 +156,6 @@ func (c *ttyCtl) restoreLocked() {
 		_ = term.Restore(fd, c.raw)
 	}
 	c.raw = nil
-}
-
-// cancel restores cooked mode, then wakes the blocked read. The prompt
-// fd stays open.
-func (c *ttyCtl) cancel() {
-	c.mu.Lock()
-	c.restoreLocked()
-	w := c.wakeW
-	c.mu.Unlock()
-	if w != nil {
-		_, _ = w.Write([]byte{1})
-	}
 }
 
 // release restores if needed and closes the dup. The caller's file is
@@ -175,10 +207,15 @@ func PromptLine(ctx context.Context, label string) (string, error) {
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
-// errInterrupted is returned by the masked reader when the user types
-// Ctrl-C. Raw mode does not turn that byte into SIGINT, so PromptSecret
-// raises the signal itself after the terminal is restored.
+// errInterrupted is returned when a raw read actually receives 0x03.
+// With ISIG left on, a real terminal turns Ctrl+C into SIGINT instead,
+// and the prompt returns via ctx. PromptSecret still raises SIGINT if
+// the byte shows up, so both paths cancel the process.
 var errInterrupted = errors.New("interrupted")
+
+// errHangup is returned when SIGHUP arrives during the password prompt.
+// The terminal is restored first.
+var errHangup = errors.New("hangup")
 
 // PromptSecret writes label to /dev/tty and reads a line, returning the
 // result wrapped in a secret.Secret. On a terminal each typed character
@@ -187,8 +224,9 @@ var errInterrupted = errors.New("interrupted")
 // (no echo). The read buffer is zeroed before return so the password
 // material doesn't sit on the heap waiting for GC.
 //
-// As with PromptLine, ctx cancellation closes the tty and surfaces
-// ctx.Err() — Ctrl-C escapes the prompt cleanly.
+// SIGINT, SIGTERM and SIGHUP restore cooked mode and return ctx.Err()
+// or a hangup error without waiting for Enter. Ctrl-C is a kernel
+// SIGINT because raw mode leaves ISIG on.
 func PromptSecret(ctx context.Context, label string) (secret.Secret, error) {
 	tty, err := openTTY()
 	if err != nil {
@@ -199,19 +237,25 @@ func PromptSecret(ctx context.Context, label string) (secret.Secret, error) {
 }
 
 // promptSecretTTY is PromptSecret against an already-open terminal.
-// It does not close tty. Cancellation restores cooked mode and unblocks
-// the read.
+// It does not close tty. SIGTERM (ctx), SIGINT and SIGHUP restore
+// cooked mode and return without waiting for Enter. A read still
+// blocked in the kernel is discarded and zeroed when it eventually
+// returns; it is not waited on.
 func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Secret, error) {
-	wakeR, wakeW, err := os.Pipe()
-	if err != nil {
-		return secret.Secret{}, err
-	}
-	defer wakeR.Close()
-	defer wakeW.Close()
-	ctl := &ttyCtl{f: tty, wakeW: wakeW}
+	promptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ctl := &ttyCtl{f: tty}
 	defer ctl.release()
-	stop := watchCancel(ctx, ctl.cancel)
+	stop := watchCancel(promptCtx, func() {
+		ctl.restore()
+		cancel()
+	})
 	defer stop()
+	stopHUP := watchHUP(func() {
+		ctl.restore()
+		cancel()
+	})
+	defer stopHUP()
 
 	if _, err := io.WriteString(tty, label); err != nil {
 		if ctx.Err() != nil {
@@ -219,13 +263,17 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 		}
 		return secret.Secret{}, err
 	}
-	pw, err := readPassword(tty, ctl, wakeR)
+	pw, err := readPassword(promptCtx, tty, ctl)
 	fmt.Fprintln(tty)
 	// Same ctx-first rule as PromptLine: closed-tty after cancel can
 	// surface as a clean return on some platforms.
 	if ctx.Err() != nil {
 		zero(pw)
 		return secret.Secret{}, ctx.Err()
+	}
+	if errors.Is(err, errHangup) || (promptCtx.Err() != nil && ctx.Err() == nil) {
+		zero(pw)
+		return secret.Secret{}, errHangup
 	}
 	if errors.Is(err, errInterrupted) {
 		zero(pw)
@@ -255,11 +303,37 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 	return s, nil
 }
 
+// watchHUP invokes onHangup when the terminal session hangs up. SIGHUP
+// is not on the process-wide NotifyContext: serve-stdio uses it to
+// reload policy. The password prompt watches it only while raw mode is
+// on, so the shell is not left raw if the session drops.
+func watchHUP(onHangup func()) func() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGHUP)
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-ch:
+			onHangup()
+		case <-stop:
+		}
+	}()
+	return func() {
+		signal.Stop(ch)
+		close(stop)
+	}
+}
+
 // readPassword masks input when fd is a terminal. Otherwise it uses
 // term.ReadPassword, the previous no-echo read. MakeRaw failure takes
-// the same fallback. ctl.restore runs on the way out, and ctl.close
-// (the cancel path) restores before it closes the fd.
-func readPassword(tty *os.File, ctl *ttyCtl, wake *os.File) ([]byte, error) {
+// the same fallback.
+//
+// Keystrokes are blocking unix.Read calls, the same shape as
+// golang.org/x/term ReadPassword. poll/select on /dev/tty does not
+// report input on macOS, so the mask must not wait that way. Cancel
+// restores the terminal and returns; a read that completes later is
+// discarded and zeroed.
+func readPassword(ctx context.Context, tty *os.File, ctl *ttyCtl) ([]byte, error) {
 	fd := int(tty.Fd())
 	if !term.IsTerminal(fd) {
 		return term.ReadPassword(fd)
@@ -271,48 +345,63 @@ func readPassword(tty *os.File, ctl *ttyCtl, wake *os.File) ([]byte, error) {
 		return term.ReadPassword(fd)
 	}
 	defer ctl.restore()
-	return readMaskedPassword(&ttyReader{fd: fd, wake: int(wake.Fd())}, tty)
+
+	type result struct {
+		pw  []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		pw, err := readMaskedPassword(blockingFD(fd), tty)
+		done <- result{pw, err}
+	}()
+	select {
+	case r := <-done:
+		if ctx.Err() != nil {
+			zero(r.pw)
+			return nil, ctx.Err()
+		}
+		return r.pw, r.err
+	case <-ctx.Done():
+		ctl.restore()
+		go func() {
+			r := <-done
+			zero(r.pw)
+		}()
+		return nil, ctx.Err()
+	}
 }
 
-// errPromptCanceled is the wake-pipe signal. It is not a typed Ctrl-C.
-var errPromptCanceled = errors.New("prompt canceled")
+// blockingFD is a one-byte unix.Read. A zero-length read is EOF.
+type blockingFD int
 
-// ttyReader reads one byte at a time from a terminal, returning
-// errPromptCanceled when the wake pipe becomes readable.
-type ttyReader struct {
-	fd   int
-	wake int
-}
-
-func (r *ttyReader) Read(p []byte) (int, error) {
+func (f blockingFD) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	fds := []unix.PollFd{
-		{Fd: int32(r.fd), Events: unix.POLLIN},
-		{Fd: int32(r.wake), Events: unix.POLLIN},
-	}
 	for {
-		fds[0].Revents = 0
-		fds[1].Revents = 0
-		_, err := unix.Poll(fds, -1)
+		n, err := unix.Read(int(f), p[:1])
 		if errors.Is(err, unix.EINTR) {
 			continue
 		}
-		if err != nil {
-			return 0, err
-		}
-		if fds[1].Revents != 0 {
-			return 0, errPromptCanceled
-		}
-		if fds[0].Revents&(unix.POLLIN|unix.POLLERR|unix.POLLHUP) == 0 {
-			continue
-		}
-		n, err := unix.Read(r.fd, p[:1])
-		if errors.Is(err, unix.EINTR) {
-			continue
+		if n == 0 && err == nil {
+			return 0, io.EOF
 		}
 		return n, err
+	}
+}
+
+type secretBufs struct {
+	pw      []byte
+	idx     []int
+	pending []byte
+}
+
+func newSecretBufs() *secretBufs {
+	return &secretBufs{
+		pw:      make([]byte, 0, passwordCap),
+		idx:     make([]int, 0, 64),
+		pending: make([]byte, 0, utf8.UTFMax),
 	}
 }
 
@@ -321,14 +410,21 @@ func (r *ttyReader) Read(p []byte) (int, error) {
 // abandoned copy does not keep the secret.
 const passwordCap = 256
 
+var (
+	starByte = []byte{'*'}
+	eraseSeq = []byte{'\b', ' ', '\b'}
+)
+
 // readMaskedPassword reads a secret from r and writes one '*' to w per
 // typed character. Backspace (DEL or BS) deletes the last character and
 // erases its star. The returned slice is the caller's to zero; this
 // function zeros every other buffer it used.
 func readMaskedPassword(r io.Reader, w io.Writer) ([]byte, error) {
-	pw := make([]byte, 0, passwordCap)
-	var runeLen []int
-	var pending []byte
+	// Heap buffers so growing the password can zero the abandoned array.
+	hold := newSecretBufs()
+	pw := hold.pw
+	runeLen := hold.idx
+	pending := hold.pending
 	one := make([]byte, 1)
 	defer zero(one)
 
@@ -342,12 +438,27 @@ func readMaskedPassword(r io.Reader, w io.Writer) ([]byte, error) {
 		}
 		return pw, nil
 	}
-	commit := func(p []byte) error {
-		need := len(pw) + len(p)
-		if need > cap(pw) {
+	commitByte := func(b byte) error {
+		if len(pw)+1 > cap(pw) {
 			ncap := cap(pw) * 2
-			if ncap < need {
-				ncap = need
+			if ncap < len(pw)+1 {
+				ncap = len(pw) + 1
+			}
+			next := make([]byte, len(pw), ncap)
+			copy(next, pw)
+			zero(pw[:cap(pw)])
+			pw = next
+		}
+		pw = append(pw, b)
+		runeLen = append(runeLen, 1)
+		_, err := w.Write(starByte)
+		return err
+	}
+	commitCopy := func(p []byte) error {
+		if len(pw)+len(p) > cap(pw) {
+			ncap := cap(pw) * 2
+			if ncap < len(pw)+len(p) {
+				ncap = len(pw) + len(p)
 			}
 			next := make([]byte, len(pw), ncap)
 			copy(next, pw)
@@ -356,7 +467,7 @@ func readMaskedPassword(r io.Reader, w io.Writer) ([]byte, error) {
 		}
 		pw = append(pw, p...)
 		runeLen = append(runeLen, len(p))
-		_, err := w.Write([]byte{'*'})
+		_, err := w.Write(starByte)
 		return err
 	}
 	backspace := func() error {
@@ -369,86 +480,98 @@ func readMaskedPassword(r io.Reader, w io.Writer) ([]byte, error) {
 			pw[i] = 0
 		}
 		pw = pw[:len(pw)-n]
-		_, err := w.Write([]byte("\b \b"))
+		_, err := w.Write(eraseSeq)
 		return err
 	}
 
 	for {
-		_, err := r.Read(one)
-		if err != nil {
-			if err == io.EOF {
+		n, err := r.Read(one)
+		if n == 0 {
+			// A zero-length read is EOF even when the error is nil.
+			if err == nil || errors.Is(err, io.EOF) {
 				return finish(nil)
 			}
 			return finish(err)
 		}
 		b := one[0]
 		one[0] = 0
-
-		if len(pending) == 1 && pending[0] == 0x1b && b != '[' && b != 'O' {
-			// A bare Esc is not the start of a sequence. Drop it and
-			// handle this byte as a normal key so it is not eaten.
-			zero(pending)
-			pending = nil
-		} else if len(pending) > 0 && pending[0] == 0x1b {
-			pending = append(pending, b)
-			if escapeDone(pending) || len(pending) > 8 {
-				zero(pending)
-				pending = nil
+		if len(pending) > 0 || b == 0x1b || b >= utf8.RuneSelf {
+			handled, err := acceptByte(&pending, b, commitCopy)
+			if err != nil {
+				return finish(err)
 			}
-			continue
-		}
-
-		if len(pending) == 0 {
-			switch b {
-			case '\n', '\r':
-				return finish(nil)
-			case 0x7f, 0x08:
-				if werr := backspace(); werr != nil {
-					return finish(werr)
-				}
+			if handled {
 				continue
-			case 0x03:
-				return finish(errInterrupted)
-			case 0x1b:
-				pending = append(pending, b)
-				continue
-			default:
-				if b < 0x20 {
-					continue
-				}
-				if b < utf8.RuneSelf {
-					chunk := []byte{b}
-					werr := commit(chunk)
-					zero(chunk)
-					if werr != nil {
-						return finish(werr)
-					}
-					continue
-				}
-				pending = append(pending, b)
 			}
-		} else {
-			pending = append(pending, b)
 		}
+		switch b {
+		case '\n', '\r', 0x04:
+			return finish(nil)
+		case 0x7f, 0x08:
+			if werr := backspace(); werr != nil {
+				return finish(werr)
+			}
+		case 0x03:
+			return finish(errInterrupted)
+		default:
+			if b < 0x20 || b >= utf8.RuneSelf {
+				continue
+			}
+			if werr := commitByte(b); werr != nil {
+				return finish(werr)
+			}
+		}
+	}
+}
 
-		if len(pending) == 0 || pending[0] == 0x1b || !utf8.FullRune(pending) {
-			continue
+// acceptByte handles Esc sequences and UTF-8 tails. It reports handled
+// when b is not an ordinary ASCII key. The ASCII path stays in the
+// caller so a pty read cannot drop those bytes.
+func acceptByte(pending *[]byte, b byte, commitCopy func([]byte) error) (bool, error) {
+	p := *pending
+	if len(p) > 0 && p[0] == 0x1b {
+		if len(p) == 1 && b != '[' && b != 'O' {
+			zero(p)
+			*pending = nil
+			return false, nil
 		}
-		decoded, size := utf8.DecodeRune(pending)
+		p = append(p, b)
+		if escapeDone(p) || len(p) > 8 {
+			zero(p)
+			*pending = nil
+			return true, nil
+		}
+		*pending = p
+		return true, nil
+	}
+	if b == 0x1b {
+		*pending = []byte{b}
+		return true, nil
+	}
+	if len(p) > 0 {
+		p = append(p, b)
+		if !utf8.FullRune(p) && len(p) < utf8.UTFMax {
+			*pending = p
+			return true, nil
+		}
+		r, size := utf8.DecodeRune(p)
 		take := size
-		if decoded == utf8.RuneError && size == 1 {
+		if r == utf8.RuneError && size == 1 {
 			take = 1
 		}
-		chunk := append([]byte(nil), pending[:take]...)
-		werr := commit(chunk)
-		zero(chunk)
-		if werr != nil {
-			return finish(werr)
+		if err := commitCopy(p[:take]); err != nil {
+			return true, err
 		}
-		rest := append([]byte(nil), pending[take:]...)
-		zero(pending)
-		pending = rest
+		rest := append([]byte(nil), p[take:]...)
+		zero(p)
+		*pending = rest
+		return true, nil
 	}
+	if b >= utf8.RuneSelf {
+		*pending = []byte{b}
+		return true, nil
+	}
+	return false, nil
 }
 
 // escapeDone reports whether seq is a complete escape sequence (arrows

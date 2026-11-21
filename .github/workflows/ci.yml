@@ -44,6 +44,24 @@ jobs:
       - name: go test -race
         run: go test -race ./...
 
+  # Real darwin pty: poll on /dev/tty does not deliver keystrokes, and
+  # raw mode with ISIG off swallows Ctrl+C. This job is the check that
+  # the masked password prompt types, backspaces, accepts CR and LF,
+  # and cancels on Ctrl+C, SIGTERM and SIGHUP.
+  prompt-macos:
+    name: macOS password prompt
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: pty prompt tests
+        run: go test -count=1 -timeout 180s ./internal/cli/ -run 'TestPromptPTY|TestPromptSecretCancel|TestReadMasked'
+
   vulncheck:
     # macOS runner because internal/keystore depends on keybase/go-keychain
     # which is a cgo wrapper over Security.framework — Linux can't link

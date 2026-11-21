@@ -1,6 +1,7 @@
 package proton
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -73,6 +74,19 @@ func TestRedirectGuardStopsAuthAndHV(t *testing.T) {
 	}
 	if otherHits.Load() != 0 {
 		t.Fatalf("redirect target was hit %d times", otherHits.Load())
+	}
+}
+
+func TestNewManagerInstallsRedirectGuardAtBuild(t *testing.T) {
+	m := NewManager(nil)
+	t.Cleanup(m.Close)
+	hc := managerResty(m).GetClient()
+	if hc.CheckRedirect == nil {
+		t.Fatal("CheckRedirect was not set when the manager was built")
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://mail-api.proton.me/auth/v4", nil)
+	if err := hc.CheckRedirect(req, []*http.Request{req}); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("auth redirect: %v", err)
 	}
 }
 

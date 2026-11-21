@@ -377,7 +377,7 @@ func checkLockState(r *report) {
 			st.Since.Local().Format("15:04 on Jan 2"), st.Reason)
 	}
 	r.add("lock state", stateWarn, detail,
-		"protonmcp unlock   — prompts Touch ID, then clients such as Grok Bot (remote) or Claude Desktop (local) work again")
+		"protonmcp unlock   — prompts Touch ID, then clients such as Grok Bot (remote) or Claude Desktop (local) work again. Remote access also needs `protonmcp http enable`")
 }
 
 // checkIntegrity compares the recorded SHA-256 against the protonmcpd

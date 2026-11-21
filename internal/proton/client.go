@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
@@ -426,17 +427,24 @@ func NewManager(jar http.CookieJar) *gpa.Manager {
 		}))
 	}
 	m := gpa.New(opts...)
-	m.AddPreRequestHook(func(c *resty.Client, req *resty.Request) error {
+	// The SDK does not export its resty client. rc is the first field.
+	// Set CheckRedirect once here. Doing it from the pre-request hook
+	// reassigned the policy on every call.
+	installRedirectGuard(managerResty(m))
+	m.AddPreRequestHook(func(_ *resty.Client, req *resty.Request) error {
 		req.SetHeader("User-Agent", UserAgent)
-		// The SDK's resty client is a stock http.Client. It follows
-		// redirects, and Go only strips Authorization and Cookie on a
-		// cross-host hop — x-pm-human-verification-* is copied to the
-		// new host. Stop that for /auth and for any request that
-		// carries those headers.
-		installRedirectGuard(c)
 		return nil
 	})
 	return m
+}
+
+// managerResty returns the SDK manager's resty client. The field is
+// unexported; it is the first field of gpa.Manager.
+func managerResty(m *gpa.Manager) *resty.Client {
+	type head struct {
+		rc *resty.Client
+	}
+	return (*head)(unsafe.Pointer(m)).rc
 }
 
 // installRedirectGuard replaces the client's redirect policy. Ordinary
