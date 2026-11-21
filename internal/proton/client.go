@@ -186,18 +186,19 @@ type Credentials struct {
 
 	// AskHVBrowserConfirm is invoked when Proton's human-verification gate
 	// (API code 9001) blocks a call. webURL is Proton's own
-	// verify.proton.me link (from the error's WebUrl field) for completing
-	// ownership-email/ownership-sms verification in a browser; it may be
-	// empty if Proton's response didn't include one. The callback should
-	// display webURL, wait for the user to complete verification there,
-	// and return once they confirm — protonmcp then retries with the same
-	// verification token Proton originally issued. Never invoked for a
-	// captcha-only offer, which this CLI can't satisfy.
+	// verify.proton.me link (from the error's WebUrl field). The user
+	// completes the check in a browser — ownership-email, ownership-sms,
+	// or a CAPTCHA rendered on that page — and the callback returns once
+	// they confirm. protonmcp then retries with the same verification
+	// token Proton originally issued. A captcha-only offer with no valid
+	// link is refused before this callback runs: there is no page to open.
 	//
 	// webURL is only ever a https://verify.proton.me link; anything else
-	// in the response is withheld as "". again is true when the previous
-	// confirmation was followed by another 9001 — typically Enter pressed
-	// before the browser flow finished — so the prompt can say so.
+	// in the response is withheld as "". It may also be empty when the
+	// methods are ownership-email or ownership-sms and Proton omitted
+	// WebUrl. again is true when the previous confirmation was followed
+	// by another 9001 — typically Enter pressed before the browser flow
+	// finished — so the prompt can say so.
 	AskHVBrowserConfirm func(ctx context.Context, webURL string, again bool) error
 }
 
@@ -458,10 +459,24 @@ func Login(ctx context.Context, mgr *gpa.Manager, creds *Credentials) (*Session,
 		return nil, errors.New("proton: email and password are required")
 	}
 
-	client, auth, err := mgr.NewClientWithLogin(ctx, creds.Email, creds.Password.Bytes())
+	// SRP auth info is single-use. NewClientWithLoginWithHVToken starts
+	// with AuthInfo on every call, so a 9001 retry redoes the exchange
+	// with fresh proofs and echoes the HumanVerificationToken Proton
+	// just issued. The token is not minted or modified here.
+	loggedIn, err := tryWithHV(ctx, creds, func(hv *gpa.APIHVDetails) (srpLogin, error) {
+		c, a, callErr := mgr.NewClientWithLoginWithHVToken(ctx, creds.Email, creds.Password.Bytes(), hv)
+		if callErr != nil {
+			if c != nil {
+				c.Close()
+			}
+			return srpLogin{}, callErr
+		}
+		return srpLogin{client: c, auth: a}, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("srp login: %w", err)
 	}
+	client, auth := loggedIn.client, loggedIn.auth
 
 	// Build the Session shell + install the AuthHandler immediately,
 	// before any subsequent API call. Proton can rotate tokens
@@ -469,7 +484,7 @@ func Login(ctx context.Context, mgr *gpa.Manager, creds *Credentials) (*Session,
 	// GetSalts (the SDK's auto-refresh-on-401 path calls AuthHandler
 	// with the new bundle). Without an early install, a silent
 	// mid-Login rotation would leave the Session holding the
-	// *original* tokens from NewClientWithLogin — the Keychain blob
+	// *original* tokens from NewClientWithLoginWithHVToken — the Keychain blob
 	// would then be saved with stale credentials and the next process
 	// would hit 400 / 422 on its own resume.
 	sess := &Session{
@@ -597,18 +612,24 @@ func Login(ctx context.Context, mgr *gpa.Manager, creds *Credentials) (*Session,
 	return sess, nil
 }
 
+// srpLogin is the pair NewClientWithLoginWithHVToken returns. tryWithHV
+// has a single result type, so the auth bundle rides along with the client.
+type srpLogin struct {
+	client *gpa.Client
+	auth   gpa.Auth
+}
+
 // tryWithHV runs call(nil); if Proton responds with a 9001
 // human-verification error, it sends the user to Proton's own
 // verify.proton.me page (via WebUrl in the error response) to complete
-// verification in a browser, then retries once with the *same*
-// HumanVerificationToken/Methods Proton issued in the original error.
+// verification in a browser, then retries with the *same*
+// HumanVerificationToken/Methods Proton issued in that error.
 //
 // The 9001 response's HumanVerificationToken identifies a verification
 // session on Proton's side — it is not a code for us to solve and is not
-// replaced by one. verify.proton.me handles proving ownership of
-// whatever recovery email/phone is on the account (which may itself
-// involve Proton emailing a short-lived code, entirely within their
-// page); once that page reports success, the same token Proton handed
+// replaced by one. verify.proton.me handles the check. That can be an
+// ownership-email or ownership-sms proof, or a CAPTCHA drawn on Proton's
+// page. Once that page reports success, the same token Proton handed
 // us becomes valid to echo back via the X-Pm-Human-Verification-Token /
 // X-Pm-Human-Verification-Token-Type headers (see go-proton-api's
 // addHVToRequest). A prior version of this function tried to run its
@@ -618,8 +639,15 @@ func Login(ctx context.Context, mgr *gpa.Manager, creds *Credentials) (*Session,
 // 12087) because the token that comes back never matches what
 // verify.proton.me actually validated.
 //
-// Captcha-only offers aren't supported: solving a captcha needs a
-// browser-embedded challenge widget, not a URL a human can just visit.
+// A method named "captcha" is accepted only when WebUrl passes hvWebURL.
+// The CAPTCHA is completed in the user's browser; this process never
+// sees the challenge. With no usable link there is nothing to open, so
+// the call fails and tells the user to sign in at mail.proton.me first
+// and retry later.
+//
+// call runs again from scratch on every retry. For SRP login that means
+// a new AuthInfo exchange: the proofs from the attempt Proton rejected
+// cannot be reused.
 func tryWithHV[T any](ctx context.Context, creds *Credentials, call func(*gpa.APIHVDetails) (T, error)) (T, error) {
 	result, err := call(nil)
 	for attempt := 1; ; attempt++ {
@@ -638,14 +666,10 @@ func tryWithHV[T any](ctx context.Context, creds *Credentials, call func(*gpa.AP
 		if hvErr != nil {
 			return result, fmt.Errorf("%w (also failed to parse HV details: %v)", err, hvErr)
 		}
-		if !hasOwnershipMethod(hv.Methods) {
-			return result, fmt.Errorf(
-				"proton: account requires human verification via %v, which protonmcp only supports through the browser-based ownership-email/ownership-sms flow (not captcha). "+
-					"Log into mail.proton.me (or Proton Bridge) from this device/network once to establish trust, then retry: %w",
-				hv.Methods, err)
-		}
-
 		webURL := hvWebURL(apiErr.Details)
+		if !hvMethodSupported(hv.Methods, webURL) {
+			return result, hvMethodError(hv.Methods, err)
+		}
 		if creds.AskHVBrowserConfirm == nil {
 			if webURL == "" {
 				return result, fmt.Errorf("proton: human verification required, but no prompt is available (log in at https://mail.proton.me to clear it, then retry): %w", err)
@@ -694,16 +718,52 @@ func hvWebURL(details []byte) string {
 	return raw.WebURL
 }
 
-// hasOwnershipMethod reports whether methods offers the browser-based
-// ownership-email/ownership-sms verification protonmcp supports, as
-// opposed to (or in addition to) a captcha-only offer.
+// hvMethodSupported reports whether the user can finish this challenge
+// in a browser. ownership-email and ownership-sms are completed on
+// verify.proton.me. The method named "captcha" is too, but only when
+// Proton included a WebUrl that hvWebURL accepts — the CAPTCHA runs on
+// that page, not in this process. Anything else fails closed.
+func hvMethodSupported(methods []string, webURL string) bool {
+	if hasOwnershipMethod(methods) {
+		return true
+	}
+	return hasCaptchaMethod(methods) && webURL != ""
+}
+
+// hvMethodError is the refusal for a challenge we will not hand to the
+// user. The WebUrl is never included: a hostile link has already been
+// withheld by hvWebURL, and a missing link has nothing safe to show.
+func hvMethodError(methods []string, err error) error {
+	if hasCaptchaMethod(methods) && !hasOwnershipMethod(methods) {
+		return fmt.Errorf(
+			"proton: Proton asked for a CAPTCHA (%v) but did not return a usable https://verify.proton.me link. Sign in at https://mail.proton.me first and retry later: %w",
+			methods, err)
+	}
+	return fmt.Errorf(
+		"proton: account requires human verification via %v, which protonmcp cannot complete in the browser. Sign in at https://mail.proton.me first and retry later: %w",
+		methods, err)
+}
+
+// hasCaptchaMethod reports whether methods includes the method named
+// exactly "captcha". Other names that merely contain the word are not
+// this flow.
+func hasCaptchaMethod(methods []string) bool {
+	for _, m := range methods {
+		if m == "captcha" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasOwnershipMethod reports whether methods offers ownership-email or
+// ownership-sms.
 //
-// Matched by exact name rather than an "ownership" prefix check: the
-// contract we can actually honour is "a URL a human opens and completes",
-// and a future ownership-* method needn't be that (an ownership-captcha
-// would still need an embedded challenge widget). Failing closed on an
-// unrecognised method gives a clear error instead of a browser round-trip
-// that can't succeed.
+// Matched by exact name rather than an "ownership" prefix check: a
+// future ownership-* method needn't be a page the user can open.
+// Failing closed on an unrecognised method gives a clear error instead
+// of a browser round-trip that can't succeed. The method named "captcha"
+// is decided in hvMethodSupported, and only with a valid WebUrl.
 func hasOwnershipMethod(methods []string) bool {
 	for _, m := range methods {
 		switch m {

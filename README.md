@@ -54,21 +54,23 @@ protonmcp setup
 ```
 
 That's the whole thing. `setup` signs you in, copies your mailbox index
-into a local database, starts the background service, and connects both
-Claude clients — explaining each step as it goes. Restart Claude
-afterwards and the tools show up under `protonmcp` in `/mcp`.
+into a local database, and starts the background service, so MCP clients
+such as Grok Bot (remote) or Claude Desktop (local) can use the mailbox.
+The last step is optional local-client registration for Claude Desktop
+and Claude Code. Restart a local client afterwards and the tools show up
+under `protonmcp`.
 
 It's safe to re-run: completed steps are skipped, so it doubles as a
 repair command.
 
 <details>
-<summary>Prefer to run the four steps yourself?</summary>
+<summary>Prefer to run the steps yourself?</summary>
 
 ```sh
 protonmcp login            # Proton SRP password + 2FA + key unlock
 protonmcp backfill         # one-time: pull your message envelopes into the local mirror
 protonmcp daemon install   # register + start the background daemon
-protonmcp install          # connect it to Claude Desktop + Claude Code
+protonmcp install          # optional local-client registration (Claude Desktop and Claude Code)
 ```
 
 </details>

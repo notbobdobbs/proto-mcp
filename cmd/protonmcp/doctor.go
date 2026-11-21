@@ -377,7 +377,7 @@ func checkLockState(r *report) {
 			st.Since.Local().Format("15:04 on Jan 2"), st.Reason)
 	}
 	r.add("lock state", stateWarn, detail,
-		"protonmcp unlock   — prompts Touch ID, then Claude works again")
+		"protonmcp unlock   — prompts Touch ID, then clients such as Grok Bot (remote) or Claude Desktop (local) work again")
 }
 
 // checkIntegrity compares the recorded SHA-256 against the protonmcpd
@@ -447,8 +447,10 @@ func checkClients(r *report) {
 			continue
 		}
 		if !ok {
-			r.add(t.name, stateWarn, "protonmcp not registered",
-				"protonmcp install --client "+t.id)
+			// Local Claude registration is optional. Remote clients such
+			// as Grok Bot never write these files, so a missing entry is
+			// informational rather than a broken install.
+			r.add(t.name, stateInfo, "optional local client, not registered (protonmcp install --client "+t.id+")", "")
 			continue
 		}
 		if _, err := os.Stat(entry.Command); err != nil {
@@ -457,6 +459,6 @@ func checkClients(r *report) {
 				"protonmcp install --client "+t.id)
 			continue
 		}
-		r.add(t.name, stateOK, "registered → "+entry.Command, "")
+		r.add(t.name, stateOK, "optional local client, registered → "+entry.Command, "")
 	}
 }

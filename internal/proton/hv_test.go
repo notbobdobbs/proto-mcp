@@ -123,11 +123,11 @@ func TestTryWithHV_NoRetryOnSuccess(t *testing.T) {
 	}
 }
 
-// TestTryWithHV_CaptchaOnlyRejected ensures a captcha-only offer fails
-// fast with a message pointing at the browser-trust workaround, rather
-// than invoking AskHVBrowserConfirm — protonmcp has no way to render or
-// solve a captcha challenge.
-func TestTryWithHV_CaptchaOnlyRejected(t *testing.T) {
+// TestTryWithHV_CaptchaOnlyWithoutWebURLRejected: a captcha offer with
+// no usable verify.proton.me link fails closed. The guidance tells the
+// user to sign in at mail.proton.me first and retry later, and the
+// browser prompt is not shown — there is no page to open.
+func TestTryWithHV_CaptchaOnlyWithoutWebURLRejected(t *testing.T) {
 	captchaErr := &gpa.APIError{
 		Status: 422,
 		Code:   gpa.HumanVerificationRequired,
@@ -138,7 +138,7 @@ func TestTryWithHV_CaptchaOnlyRejected(t *testing.T) {
 	}
 	creds := &Credentials{
 		AskHVBrowserConfirm: func(context.Context, string, bool) error {
-			t.Fatal("AskHVBrowserConfirm should not be called for a captcha-only offer")
+			t.Fatal("AskHVBrowserConfirm should not be called when captcha has no valid WebUrl")
 			return nil
 		},
 	}
@@ -146,8 +146,104 @@ func TestTryWithHV_CaptchaOnlyRejected(t *testing.T) {
 		return 0, captchaErr
 	})
 	if err == nil {
-		t.Fatal("expected an error for a captcha-only offer, got nil")
+		t.Fatal("expected an error for a captcha-only offer with no WebUrl, got nil")
 	}
+	if !strings.Contains(err.Error(), "mail.proton.me") || !strings.Contains(err.Error(), "retry later") {
+		t.Errorf("err = %v, want guidance to sign in at mail.proton.me and retry later", err)
+	}
+}
+
+// TestTryWithHV_CaptchaWithWebURLAccepted: Proton's CAPTCHA is completed
+// on verify.proton.me in the user's browser. A captcha-only 9001 that
+// carries a valid WebUrl is accepted, and the retry echoes the token
+// and methods Proton issued.
+func TestTryWithHV_CaptchaWithWebURLAccepted(t *testing.T) {
+	const (
+		token  = "captcha-token-issued"
+		webURL = "https://verify.proton.me/?methods=captcha&token=captcha-token-issued"
+	)
+	captchaErr := captchaOffer(token, webURL)
+	var shown string
+	creds := &Credentials{
+		AskHVBrowserConfirm: func(_ context.Context, got string, again bool) error {
+			if again {
+				t.Error("first confirmation should not be flagged again")
+			}
+			shown = got
+			return nil
+		},
+	}
+	var gotRetry *gpa.APIHVDetails
+	calls := 0
+	result, err := tryWithHV(context.Background(), creds, func(hv *gpa.APIHVDetails) (string, error) {
+		calls++
+		if calls == 1 {
+			if hv != nil {
+				t.Errorf("first call hv = %+v, want nil", hv)
+			}
+			return "", captchaErr
+		}
+		gotRetry = hv
+		return "ok", nil
+	})
+	if err != nil || result != "ok" {
+		t.Fatalf("tryWithHV = %q, %v; want ok", result, err)
+	}
+	if shown != webURL {
+		t.Errorf("shown url = %q, want %q", shown, webURL)
+	}
+	if gotRetry == nil || gotRetry.Token != token {
+		t.Fatalf("retry hv = %+v, want token %q unmodified", gotRetry, token)
+	}
+	if len(gotRetry.Methods) != 1 || gotRetry.Methods[0] != "captcha" {
+		t.Errorf("retry methods = %v, want [captcha]", gotRetry.Methods)
+	}
+}
+
+// TestTryWithHV_CaptchaHostileWebURLWithheld: a captcha offer whose
+// WebUrl is not exactly https://verify.proton.me is not shown and not
+// opened. The error carries the mail.proton.me guidance and none of the
+// hostile text.
+func TestTryWithHV_CaptchaHostileWebURLWithheld(t *testing.T) {
+	hostile := []struct {
+		name, webURL string
+	}{
+		{"other host", "https://evil.example/captcha"},
+		{"escape sequence", "https://verify.proton.me/\x1b[2J"},
+	}
+	for _, tt := range hostile {
+		t.Run(tt.name, func(t *testing.T) {
+			webURL := tt.webURL
+			creds := &Credentials{
+				AskHVBrowserConfirm: func(context.Context, string, bool) error {
+					t.Fatal("hostile WebUrl must not be shown")
+					return nil
+				},
+			}
+			_, err := tryWithHV(context.Background(), creds, func(*gpa.APIHVDetails) (int, error) {
+				return 0, captchaOffer("tok", webURL)
+			})
+			if err == nil {
+				t.Fatal("expected a refusal")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, "evil.example") || strings.Contains(msg, "\x1b") {
+				t.Errorf("hostile WebUrl leaked into error: %q", msg)
+			}
+			if !strings.Contains(msg, "mail.proton.me") || !strings.Contains(msg, "retry later") {
+				t.Errorf("err = %v, want mail.proton.me guidance", err)
+			}
+		})
+	}
+}
+
+func captchaOffer(token, webURL string) *gpa.APIError {
+	d, _ := json.Marshal(map[string]any{
+		"HumanVerificationToken":   token,
+		"HumanVerificationMethods": []string{"captcha"},
+		"WebUrl":                   webURL,
+	})
+	return &gpa.APIError{Status: 422, Code: gpa.HumanVerificationRequired, Details: gpa.ErrDetails(d)}
 }
 
 // TestTryWithHV_NoPromptAvailable ensures a nil AskHVBrowserConfirm
