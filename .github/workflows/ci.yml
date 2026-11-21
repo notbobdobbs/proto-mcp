@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # pull_request on the default branch only matches PRs into main, so a
+    # stacked PR never starts this workflow. Push of this branch does.
+    branches:
+      - main
+      - cursor/hv-login-captcha-mask-51bf
   pull_request:
 
 permissions:
