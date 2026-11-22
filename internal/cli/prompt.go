@@ -435,6 +435,12 @@ func readMaskedTTY(ctx context.Context, fd int, w io.Writer) ([]byte, error) {
 		}
 		n, err := unix.Read(fd, one[:])
 		if errors.Is(err, unix.EINTR) {
+			// The signal handler may not have cancelled yet. A tight
+			// retry blocks in Read again before that runs.
+			if err := ctx.Err(); err != nil {
+				return k.finish(err)
+			}
+			time.Sleep(ttyReadWait)
 			continue
 		}
 		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) || (n == 0 && err == nil) {
