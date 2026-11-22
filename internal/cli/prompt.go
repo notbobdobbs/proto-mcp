@@ -248,18 +248,23 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 	ctl := &ttyCtl{f: tty}
 	defer ctl.release()
 	stop := watchCancel(promptCtx, func() {
-		// Do not restore here. On macOS tcsetattr waits for a pending
-		// read, and Ctrl-C is consumed as SIGINT, so restoring while
-		// the read is blocked deadlocks. readPassword closes the tty
-		// and restores after that read returns.
+		ctl.restore()
 		cancel()
 	})
 	defer stop()
-	stopHUP := watchHUP(func() {
+	stopHUP := watchSignal(syscall.SIGHUP, func() {
 		ctl.restore()
 		cancel()
 	})
 	defer stopHUP()
+	// Ctrl-C is SIGINT from the tty. Watch it here as well as on the
+	// caller's context: a raw read does not see the byte, so this is
+	// what has to return.
+	stopINT := watchSignal(syscall.SIGINT, func() {
+		ctl.restore()
+		cancel()
+	})
+	defer stopINT()
 
 	if _, err := io.WriteString(tty, label); err != nil {
 		if ctx.Err() != nil {
@@ -307,18 +312,19 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 	return s, nil
 }
 
-// watchHUP invokes onHangup when the terminal session hangs up. SIGHUP
+// watchSignal invokes onSignal for one signal, then ignores it. SIGHUP
 // is not on the process-wide NotifyContext: serve-stdio uses it to
-// reload policy. The password prompt watches it only while raw mode is
-// on, so the shell is not left raw if the session drops.
-func watchHUP(onHangup func()) func() {
+// reload policy. The password prompt watches SIGHUP and SIGINT only
+// while the prompt is up, so the shell is not left raw if the session
+// drops or the user hits Ctrl-C.
+func watchSignal(sig os.Signal, onSignal func()) func() {
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGHUP)
+	signal.Notify(ch, sig)
 	stop := make(chan struct{})
 	go func() {
 		select {
 		case <-ch:
-			onHangup()
+			onSignal()
 		case <-stop:
 		}
 	}()
@@ -367,18 +373,11 @@ func readPassword(ctx context.Context, tty *os.File, ctl *ttyCtl) ([]byte, error
 		}
 		return r.pw, r.err
 	case <-ctx.Done():
-		// Closing the read fd lets the blocked read return. Restoring
-		// termios first deadlocks on macOS, which waits for that read.
-		_ = tty.Close()
-		select {
-		case r := <-done:
+		ctl.restore()
+		go func() {
+			r := <-done
 			zero(r.pw)
-		case <-time.After(200 * time.Millisecond):
-			go func() {
-				r := <-done
-				zero(r.pw)
-			}()
-		}
+		}()
 		return nil, ctx.Err()
 	}
 }
