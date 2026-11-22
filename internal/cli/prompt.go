@@ -118,6 +118,7 @@ func makeRawKeepISIG(fd int) (*term.State, error) {
 	t.Lflag |= unix.ISIG
 	t.Cflag &^= unix.CSIZE | unix.PARENB
 	t.Cflag |= unix.CS8
+	t.Cc[unix.VINTR] = 3
 	t.Cc[unix.VMIN] = 1
 	t.Cc[unix.VTIME] = 0
 	if err := unix.IoctlSetTermios(fd, ioctlWriteTermios, t); err != nil {

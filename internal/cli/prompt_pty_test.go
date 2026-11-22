@@ -146,6 +146,13 @@ func runPromptCtrlCChild() {
 		fmt.Fprintf(os.Stderr, "TIOCSCTTY: %v\n", err)
 		os.Exit(4)
 	}
+	// A new pty eats 0x03 as INTR and signals the foreground group.
+	// Until this process is that group, the signal is discarded and
+	// the read never sees the byte.
+	if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, os.Getpid()); err != nil {
+		fmt.Fprintf(os.Stderr, "TIOCSPGRP: %v\n", err)
+		os.Exit(5)
+	}
 	ctx, stop := signalNotifyInterrupt()
 	defer stop()
 	_, err := promptSecretTTY(ctx, os.Stdin, "Password: ")
