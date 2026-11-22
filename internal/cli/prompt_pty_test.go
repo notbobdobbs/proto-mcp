@@ -115,8 +115,12 @@ func TestPromptPTYCtrlC(t *testing.T) {
 		return
 	}
 	master, slave := openPTY(t)
+	path, err := slavePath(slave)
+	if err != nil {
+		t.Fatalf("slave path: %v", err)
+	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestPromptPTYCtrlC$")
-	cmd.Env = append(os.Environ(), "PROTONMCP_PROMPT_CHILD=1")
+	cmd.Env = append(os.Environ(), "PROTONMCP_PROMPT_CHILD=1", "PROTONMCP_PROMPT_TTY="+path)
 	cmd.Stdin = slave
 	cmd.Stdout = slave
 	var stderr bytes.Buffer
@@ -141,21 +145,31 @@ func TestPromptPTYCtrlC(t *testing.T) {
 }
 
 func runPromptCtrlCChild() {
-	fd := int(os.Stdin.Fd())
+	// Open the slave here, after setsid. An inherited fd was opened
+	// with O_NOCTTY in the parent, and on macOS that does not become
+	// this process's controlling terminal, so the kernel discards
+	// SIGINT and the read never sees 0x03.
+	if _, err := unix.Setsid(); err != nil && !errors.Is(err, unix.EPERM) {
+		fmt.Fprintf(os.Stderr, "setsid: %v\n", err)
+		os.Exit(4)
+	}
+	tty, err := os.OpenFile(os.Getenv("PROTONMCP_PROMPT_TTY"), os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open tty: %v\n", err)
+		os.Exit(4)
+	}
+	fd := int(tty.Fd())
 	if err := unix.IoctlSetInt(fd, unix.TIOCSCTTY, 0); err != nil {
 		fmt.Fprintf(os.Stderr, "TIOCSCTTY: %v\n", err)
 		os.Exit(4)
 	}
-	// A new pty eats 0x03 as INTR and signals the foreground group.
-	// Until this process is that group, the signal is discarded and
-	// the read never sees the byte.
 	if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, os.Getpid()); err != nil {
 		fmt.Fprintf(os.Stderr, "TIOCSPGRP: %v\n", err)
 		os.Exit(5)
 	}
 	ctx, stop := signalNotifyInterrupt()
 	defer stop()
-	_, err := promptSecretTTY(ctx, os.Stdin, "Password: ")
+	_, err = promptSecretTTY(ctx, tty, "Password: ")
 	if errors.Is(err, context.Canceled) || errors.Is(err, errInterrupted) {
 		os.Exit(0)
 	}
