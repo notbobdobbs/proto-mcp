@@ -47,10 +47,12 @@ jobs:
         # package timeout. A throwaway keychain is the runner setup,
         # not a change to how the daemon stores its key.
         run: |
-          security create-keychain -p "" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "" build.keychain
-          security set-keychain-settings -lut 3600 build.keychain
+          kc="$RUNNER_TEMP/build.keychain"
+          security create-keychain -p "" "$kc"
+          security list-keychains -d user -s "$kc"
+          security default-keychain -s "$kc"
+          security unlock-keychain -p "" "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
           go test -race ./...
 
   # Real darwin pty: poll on /dev/tty does not deliver keystrokes, and
