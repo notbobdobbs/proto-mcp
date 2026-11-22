@@ -257,10 +257,15 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 		cancel()
 	})
 	defer stopHUP()
-	// Ctrl-C is SIGINT from the tty. Watch it here as well as on the
-	// caller's context: a raw read does not see the byte, so this is
-	// what has to return.
+	// Ctrl-C is SIGINT from the tty. A raw read does not see the byte.
+	// Record it separately from SIGHUP: both cancel the local context,
+	// and a local-only cancel would otherwise look like a hangup.
+	interrupted := make(chan struct{}, 1)
 	stopINT := watchSignal(syscall.SIGINT, func() {
+		select {
+		case interrupted <- struct{}{}:
+		default:
+		}
 		ctl.restore()
 		cancel()
 	})
@@ -279,6 +284,12 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 	if ctx.Err() != nil {
 		zero(pw)
 		return secret.Secret{}, ctx.Err()
+	}
+	select {
+	case <-interrupted:
+		zero(pw)
+		return secret.Secret{}, errInterrupted
+	default:
 	}
 	if errors.Is(err, errHangup) || (promptCtx.Err() != nil && ctx.Err() == nil) {
 		zero(pw)

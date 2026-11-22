@@ -106,9 +106,9 @@ func TestPromptPTYTyping(t *testing.T) {
 	}
 }
 
-// TestPromptPTYCtrlC sends the interrupt character to a child whose
-// controlling terminal is the pty. ISIG is on, so the kernel delivers
-// SIGINT and the byte is not what the reader has to notice.
+// TestPromptPTYCtrlC checks that SIGINT during the prompt returns.
+// With ISIG left on, a real terminal turns Ctrl-C into that signal
+// and the read never observes 0x03.
 func TestPromptPTYCtrlC(t *testing.T) {
 	if os.Getenv("PROTONMCP_PROMPT_CHILD") == "1" {
 		runPromptCtrlCChild()
@@ -130,7 +130,12 @@ func TestPromptPTYCtrlC(t *testing.T) {
 		t.Fatalf("start child: %v", err)
 	}
 	waitFor(t, master, "Password:")
-	writeAll(t, int(master.Fd()), []byte{0x03})
+	// ISIG is on, so a terminal turns this key into SIGINT and the
+	// reader never sees 0x03. Signal the child directly. Writing the
+	// byte into a macOS CI pty does not deliver that signal.
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- cmd.Wait() }()
 	select {
