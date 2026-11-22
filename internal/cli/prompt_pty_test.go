@@ -150,8 +150,13 @@ func TestPromptPTYCtrlC(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if raw == nil || raw.Cc[unix.VINTR] != 3 || !quitAndStopDisarmed(raw.Cc[:]) {
-		t.Fatalf("raw termios ISIG/VINTR/VQUIT not set for Ctrl-C")
+	if raw == nil || raw.Cc[unix.VINTR] != 3 || raw.Cc[unix.VMIN] != 0 || raw.Cc[unix.VTIME] != 1 || !quitAndStopDisarmed(raw.Cc[:]) {
+		vmin, vtime := -1, -1
+		if raw != nil {
+			vmin = int(raw.Cc[unix.VMIN])
+			vtime = int(raw.Cc[unix.VTIME])
+		}
+		t.Fatalf("raw termios not ready for Ctrl-C vmin=%d vtime=%d", vmin, vtime)
 	}
 	writeAll(t, int(master.Fd()), []byte{0x03})
 	waitErr := make(chan error, 1)

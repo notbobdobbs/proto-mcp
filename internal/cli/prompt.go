@@ -323,7 +323,11 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 		return secret.Secret{}, err
 	}
 	pw, err := readPassword(promptCtx, tty, ctl)
-	fmt.Fprintln(tty)
+	// A newline after cancel can stop the process with SIGTTOU once
+	// the tty is cooked again, which leaves the prompt looking stuck.
+	if ctx.Err() == nil && promptCtx.Err() == nil && !errors.Is(err, errInterrupted) {
+		fmt.Fprintln(tty)
+	}
 	// Same ctx-first rule as PromptLine: closed-tty after cancel can
 	// surface as a clean return on some platforms.
 	if ctx.Err() != nil {
