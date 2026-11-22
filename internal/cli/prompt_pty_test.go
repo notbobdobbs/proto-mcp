@@ -291,6 +291,12 @@ func runPromptCtrlCChild() {
 		fmt.Fprintf(os.Stderr, "TIOCSPGRP: %v\n", err)
 		os.Exit(5)
 	}
+	gotSig := make(chan os.Signal, 1)
+	signal.Notify(gotSig, syscall.SIGINT)
+	go func() {
+		<-gotSig
+		fmt.Fprintf(os.Stderr, "child got SIGINT\n")
+	}()
 	ctx, stop := signalNotifyInterrupt()
 	defer stop()
 	_, err := promptSecretTTY(ctx, os.Stdin, "Password: ")

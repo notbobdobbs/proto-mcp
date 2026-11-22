@@ -123,12 +123,14 @@ func makeRawKeepISIG(fd int) (*term.State, error) {
 	// the process and leaves the tty raw. Darwin also has VDSUSP.
 	t.Cc[unix.VINTR] = 3
 	disarmQuitAndStop(t.Cc[:])
-	// VMIN 0: a read with no input returns immediately. VMIN 1 blocks
-	// inside the tty even when O_NONBLOCK is set, so a tty SIGINT
-	// (the byte is consumed, not delivered) never returns to the
-	// cancel check.
+	// VMIN 0 and VTIME 1 (a tenth of a second): the read returns when a
+	// byte is waiting or when the timer fires. VMIN 1 blocks inside
+	// the tty on macOS even with O_NONBLOCK, so a Ctrl-C, which is
+	// consumed as SIGINT and not delivered as a byte, never gets back
+	// to the cancel check. VMIN 0 with VTIME 0 does not time out on
+	// that pty either.
 	t.Cc[unix.VMIN] = 0
-	t.Cc[unix.VTIME] = 0
+	t.Cc[unix.VTIME] = 1
 	if err := unix.IoctlSetTermios(fd, ioctlWriteTermios, t); err != nil {
 		return nil, err
 	}
