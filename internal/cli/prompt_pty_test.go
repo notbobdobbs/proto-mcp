@@ -163,7 +163,13 @@ func TestPromptPTYCtrlC(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		_ = cmd.Process.Kill()
-		t.Fatalf("Ctrl-C byte did not cancel the prompt\nstderr: %s", stderr.String())
+		cur, _ := unix.IoctlGetTermios(dupfd, ioctlReadTermios)
+		vmin, vtime := 0, 0
+		if cur != nil {
+			vmin = int(cur.Cc[unix.VMIN])
+			vtime = int(cur.Cc[unix.VTIME])
+		}
+		t.Fatalf("Ctrl-C byte did not cancel the prompt vmin=%d vtime=%d\nstderr: %s", vmin, vtime, stderr.String())
 	}
 }
 
