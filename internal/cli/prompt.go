@@ -123,7 +123,11 @@ func makeRawKeepISIG(fd int) (*term.State, error) {
 	// the process and leaves the tty raw. Darwin also has VDSUSP.
 	t.Cc[unix.VINTR] = 3
 	disarmQuitAndStop(t.Cc[:])
-	t.Cc[unix.VMIN] = 1
+	// VMIN 0: a read with no input returns immediately. VMIN 1 blocks
+	// inside the tty even when O_NONBLOCK is set, so a tty SIGINT
+	// (the byte is consumed, not delivered) never returns to the
+	// cancel check.
+	t.Cc[unix.VMIN] = 0
 	t.Cc[unix.VTIME] = 0
 	if err := unix.IoctlSetTermios(fd, ioctlWriteTermios, t); err != nil {
 		return nil, err
@@ -414,14 +418,14 @@ func readMaskedTTY(ctx context.Context, fd int, w io.Writer) ([]byte, error) {
 		if errors.Is(err, unix.EINTR) {
 			continue
 		}
-		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) || (n == 0 && err == nil) {
+			// No byte yet. VMIN 0 and O_NONBLOCK both report that
+			// this way. A zero-length read here is not EOF; Ctrl-D
+			// arrives as the byte 0x04.
 			time.Sleep(ttyReadWait)
 			continue
 		}
 		if n == 0 {
-			if err == nil || errors.Is(err, io.EOF) {
-				return k.finish(nil)
-			}
 			return k.finish(err)
 		}
 		b := one[0]

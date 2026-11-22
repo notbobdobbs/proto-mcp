@@ -287,21 +287,10 @@ func TestPromptPTYSIGHUPRestores(t *testing.T) {
 
 func runPromptCtrlCChild() {
 	fd := int(os.Stdin.Fd())
-	if err := unix.IoctlSetInt(fd, unix.TIOCSCTTY, 1); err != nil {
-		fmt.Fprintf(os.Stderr, "TIOCSCTTY: %v\n", err)
-	}
 	if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, os.Getpid()); err != nil {
 		fmt.Fprintf(os.Stderr, "TIOCSPGRP: %v\n", err)
 		os.Exit(5)
 	}
-	pgrp, gerr := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
-	fmt.Fprintf(os.Stderr, "pid=%d pgrp=%d err=%v\n", os.Getpid(), pgrp, gerr)
-	got := make(chan os.Signal, 1)
-	signal.Notify(got, syscall.SIGINT)
-	go func() {
-		<-got
-		fmt.Fprintf(os.Stderr, "child got SIGINT\n")
-	}()
 	ctx, stop := signalNotifyInterrupt()
 	defer stop()
 	_, err := promptSecretTTY(ctx, os.Stdin, "Password: ")
