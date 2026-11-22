@@ -20,3 +20,9 @@ func disarmQuitAndStop(cc []byte) {
 func quitAndStopDisarmed(cc []byte) bool {
 	return cc[unix.VQUIT] == posixVDisable && cc[unix.VSUSP] == posixVDisable
 }
+
+// flushInput drops unread tty input. TCIFLUSH is 0; x/sys does not
+// export that selector.
+func flushInput(fd int) {
+	_ = unix.IoctlSetInt(fd, unix.TCFLSH, 0)
+}

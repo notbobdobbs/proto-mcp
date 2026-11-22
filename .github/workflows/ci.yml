@@ -2,11 +2,7 @@ name: CI
 
 on:
   push:
-    # pull_request on the default branch only matches PRs into main, so a
-    # stacked PR never starts this workflow. Push of this branch does.
-    branches:
-      - main
-      - cursor/hv-login-captcha-mask-51bf
+    branches: [main]
   pull_request:
 
 permissions:
@@ -64,7 +60,7 @@ jobs:
           cache: true
 
       - name: pty prompt tests
-        run: go test -count=1 -timeout 180s ./internal/cli/ -run 'TestPromptPTY|TestPromptSecretCancel|TestReadMasked'
+        run: go test -count=1 -timeout 180s ./internal/cli/ -run 'TestPromptPTY|TestPromptSecretCancel|TestReadMasked|TestPTYRawBurst'
 
   vulncheck:
     # macOS runner because internal/keystore depends on keybase/go-keychain

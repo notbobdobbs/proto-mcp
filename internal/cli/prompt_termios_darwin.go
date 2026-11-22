@@ -22,3 +22,8 @@ func quitAndStopDisarmed(cc []byte) bool {
 		cc[unix.VSUSP] == posixVDisable &&
 		cc[unix.VDSUSP] == posixVDisable
 }
+
+// flushInput drops unread tty input. FREAD (1) selects the input queue.
+func flushInput(fd int) {
+	_ = unix.IoctlSetPointerInt(fd, unix.TIOCFLUSH, 1)
+}

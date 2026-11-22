@@ -142,6 +142,26 @@ type zeroLenReader struct{}
 
 func (zeroLenReader) Read([]byte) (int, error) { return 0, nil }
 
+func TestReadMaskedPasswordBadUTF8DoesNotSwallowNextKey(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{string([]byte{0xc3, '\n'}), ""},
+		{string([]byte{0xc3, 0x7f, 'a', '\n'}), "a"},
+	}
+	for _, tt := range cases {
+		var out bytes.Buffer
+		got, err := readMaskedPassword(bytes.NewReader([]byte(tt.in)), &out)
+		if err != nil {
+			t.Fatalf("input %q: %v", tt.in, err)
+		}
+		if string(got) != tt.want {
+			t.Fatalf("input %q result %q, want %q", tt.in, got, tt.want)
+		}
+		zero(got)
+	}
+}
+
 func TestReadMaskedPasswordZeroLengthIsEOF(t *testing.T) {
 	got, err := readMaskedPassword(zeroLenReader{}, io.Discard)
 	if err != nil {

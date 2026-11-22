@@ -143,6 +143,18 @@ func setBlocking(fd int) error {
 	return err
 }
 
+func setNonblock(fd int) error {
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	if err != nil {
+		return err
+	}
+	if flags&unix.O_NONBLOCK != 0 {
+		return nil
+	}
+	_, err = unix.FcntlInt(uintptr(fd), unix.F_SETFL, flags|unix.O_NONBLOCK)
+	return err
+}
+
 func (c *ttyCtl) restore() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -157,8 +169,14 @@ func (c *ttyCtl) restoreLocked() {
 	if !c.hasRestore && c.f != nil {
 		fd = int(c.f.Fd())
 	}
-	if c.hasRestore || c.f != nil {
-		_ = term.Restore(fd, c.raw)
+	if !(c.hasRestore || c.f != nil) {
+		return
+	}
+	// Drop bytes typed while raw, before cooked echo is turned back on.
+	flushInput(fd)
+	if err := term.Restore(fd, c.raw); err != nil {
+		// Keep c.raw so a later restore can retry.
+		return
 	}
 	c.raw = nil
 }
@@ -243,9 +261,8 @@ func PromptSecret(ctx context.Context, label string) (secret.Secret, error) {
 
 // promptSecretTTY is PromptSecret against an already-open terminal.
 // It does not close tty. SIGTERM (ctx), SIGINT and SIGHUP restore
-// cooked mode and return without waiting for Enter. A read still
-// blocked in the kernel is discarded and zeroed when it eventually
-// returns; it is not waited on.
+// cooked mode and return without waiting for Enter. The read runs on
+// this goroutine and is not left blocked in the kernel.
 func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Secret, error) {
 	promptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -349,15 +366,18 @@ func watchSignal(sig os.Signal, onSignal func()) func() {
 	}
 }
 
+// ttyReadWait is how long a non-blocking tty read waits before checking
+// cancel again. poll and select on /dev/tty do not report input on macOS.
+const ttyReadWait = 15 * time.Millisecond
+
 // readPassword masks input when fd is a terminal. Otherwise it uses
 // term.ReadPassword, the previous no-echo read. MakeRaw failure takes
 // the same fallback.
 //
-// Keystrokes are blocking unix.Read calls, the same shape as
-// golang.org/x/term ReadPassword. poll/select on /dev/tty does not
-// report input on macOS, so the mask must not wait that way. Cancel
-// restores the terminal and returns; a read that completes later is
-// discarded and zeroed.
+// The masked read runs on this goroutine. The fd is non-blocking;
+// EAGAIN sleeps briefly and tries again. Cancel returns through
+// finish, which zeros the password before this function returns, so
+// nothing stays blocked in unix.Read.
 func readPassword(ctx context.Context, tty *os.File, ctl *ttyCtl) ([]byte, error) {
 	fd := int(tty.Fd())
 	if !term.IsTerminal(fd) {
@@ -369,66 +389,77 @@ func readPassword(ctx context.Context, tty *os.File, ctl *ttyCtl) ([]byte, error
 		}
 		return term.ReadPassword(fd)
 	}
-	defer ctl.restore()
-
-	type result struct {
-		pw  []byte
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		pw, err := readMaskedPassword(blockingFD(fd), tty)
-		done <- result{pw, err}
-	}()
-	select {
-	case r := <-done:
-		if ctx.Err() != nil {
-			zero(r.pw)
-			return nil, ctx.Err()
-		}
-		return r.pw, r.err
-	case <-ctx.Done():
+	if err := setNonblock(fd); err != nil {
 		ctl.restore()
-		go func() {
-			r := <-done
-			zero(r.pw)
-		}()
-		return nil, ctx.Err()
+		return nil, err
 	}
+	defer func() {
+		_ = setBlocking(fd)
+		ctl.restore()
+	}()
+	return readMaskedTTY(ctx, fd, tty)
 }
 
-// blockingFD is a one-byte unix.Read. A zero-length read is EOF.
-type blockingFD int
-
-func (f blockingFD) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
+// readMaskedTTY reads a secret from a non-blocking tty fd.
+func readMaskedTTY(ctx context.Context, fd int, w io.Writer) ([]byte, error) {
+	k := newKeyState(w)
+	var one [1]byte
+	defer zero(one[:])
 	for {
-		n, err := unix.Read(int(f), p[:1])
+		if err := ctx.Err(); err != nil {
+			return k.finish(err)
+		}
+		n, err := unix.Read(fd, one[:])
 		if errors.Is(err, unix.EINTR) {
 			continue
 		}
-		if n == 0 && err == nil {
-			return 0, io.EOF
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+			time.Sleep(ttyReadWait)
+			continue
 		}
-		return n, err
+		if n == 0 {
+			if err == nil || errors.Is(err, io.EOF) {
+				return k.finish(nil)
+			}
+			return k.finish(err)
+		}
+		b := one[0]
+		one[0] = 0
+		if done, err := k.byte(b); done || err != nil {
+			return k.finish(err)
+		}
 	}
 }
 
-type secretBufs struct {
-	pw      []byte
-	idx     []int
-	pending []byte
-}
-
-func newSecretBufs() *secretBufs {
-	return &secretBufs{
-		pw:      make([]byte, 0, passwordCap),
-		idx:     make([]int, 0, 64),
-		pending: make([]byte, 0, utf8.UTFMax),
+// readMaskedPassword reads a secret from r and writes one '*' to w per
+// typed character. Backspace (DEL or BS) deletes the last character and
+// erases its star. The returned slice is the caller's to zero; this
+// function zeros every other buffer it used.
+func readMaskedPassword(r io.Reader, w io.Writer) ([]byte, error) {
+	k := newKeyState(w)
+	one := make([]byte, 1)
+	defer zero(one)
+	for {
+		n, err := r.Read(one)
+		if n == 0 {
+			// A zero-length read is EOF even when the error is nil.
+			if err == nil || errors.Is(err, io.EOF) {
+				return k.finish(nil)
+			}
+			return k.finish(err)
+		}
+		b := one[0]
+		one[0] = 0
+		if done, err := k.byte(b); done || err != nil {
+			return k.finish(err)
+		}
 	}
 }
+
+// pendingCap is max(utf8.UTFMax, 8). Escape and UTF-8 bytes are written
+// into this array in place so a grow cannot leave a secret in an old
+// backing array.
+const pendingCap = 8
 
 // passwordCap is the initial backing array for a typed secret. Growing
 // past it copies into a new array; the old one is zeroed first so the
@@ -440,160 +471,173 @@ var (
 	eraseSeq = []byte{'\b', ' ', '\b'}
 )
 
-// readMaskedPassword reads a secret from r and writes one '*' to w per
-// typed character. Backspace (DEL or BS) deletes the last character and
-// erases its star. The returned slice is the caller's to zero; this
-// function zeros every other buffer it used.
-func readMaskedPassword(r io.Reader, w io.Writer) ([]byte, error) {
-	// Heap buffers so growing the password can zero the abandoned array.
-	hold := newSecretBufs()
-	pw := hold.pw
-	runeLen := hold.idx
-	pending := hold.pending
-	one := make([]byte, 1)
-	defer zero(one)
+// keyState is the masked-input state machine. byte reports done when
+// the line is finished.
+type keyState struct {
+	pw      []byte
+	runeLen []int
+	pending [pendingCap]byte
+	npend   int
+	w       io.Writer
+}
 
-	finish := func(retErr error) ([]byte, error) {
-		zero(pending[:cap(pending)])
-		pending = nil
-		if retErr != nil {
-			zero(pw[:cap(pw)])
-			pw = nil
-			return nil, retErr
-		}
-		return pw, nil
-	}
-	commitByte := func(b byte) error {
-		if len(pw)+1 > cap(pw) {
-			ncap := cap(pw) * 2
-			if ncap < len(pw)+1 {
-				ncap = len(pw) + 1
-			}
-			next := make([]byte, len(pw), ncap)
-			copy(next, pw)
-			zero(pw[:cap(pw)])
-			pw = next
-		}
-		pw = append(pw, b)
-		runeLen = append(runeLen, 1)
-		_, err := w.Write(starByte)
-		return err
-	}
-	commitCopy := func(p []byte) error {
-		if len(pw)+len(p) > cap(pw) {
-			ncap := cap(pw) * 2
-			if ncap < len(pw)+len(p) {
-				ncap = len(pw) + len(p)
-			}
-			next := make([]byte, len(pw), ncap)
-			copy(next, pw)
-			zero(pw[:cap(pw)])
-			pw = next
-		}
-		pw = append(pw, p...)
-		runeLen = append(runeLen, len(p))
-		_, err := w.Write(starByte)
-		return err
-	}
-	backspace := func() error {
-		if len(runeLen) == 0 {
-			return nil
-		}
-		n := runeLen[len(runeLen)-1]
-		runeLen = runeLen[:len(runeLen)-1]
-		for i := len(pw) - n; i < len(pw); i++ {
-			pw[i] = 0
-		}
-		pw = pw[:len(pw)-n]
-		_, err := w.Write(eraseSeq)
-		return err
-	}
-
-	for {
-		n, err := r.Read(one)
-		if n == 0 {
-			// A zero-length read is EOF even when the error is nil.
-			if err == nil || errors.Is(err, io.EOF) {
-				return finish(nil)
-			}
-			return finish(err)
-		}
-		b := one[0]
-		one[0] = 0
-		if len(pending) > 0 || b == 0x1b || b >= utf8.RuneSelf {
-			handled, err := acceptByte(&pending, b, commitCopy)
-			if err != nil {
-				return finish(err)
-			}
-			if handled {
-				continue
-			}
-		}
-		switch b {
-		case '\n', '\r', 0x04:
-			return finish(nil)
-		case 0x7f, 0x08:
-			if werr := backspace(); werr != nil {
-				return finish(werr)
-			}
-		case 0x03:
-			return finish(errInterrupted)
-		default:
-			if b < 0x20 || b >= utf8.RuneSelf {
-				continue
-			}
-			if werr := commitByte(b); werr != nil {
-				return finish(werr)
-			}
-		}
+func newKeyState(w io.Writer) *keyState {
+	return &keyState{
+		pw:      make([]byte, 0, passwordCap),
+		runeLen: make([]int, 0, 64),
+		w:       w,
 	}
 }
 
-// acceptByte handles Esc sequences and UTF-8 tails. It reports handled
-// when b is not an ordinary ASCII key. The ASCII path stays in the
-// caller so a pty read cannot drop those bytes.
-func acceptByte(pending *[]byte, b byte, commitCopy func([]byte) error) (bool, error) {
-	p := *pending
-	if len(p) > 0 && p[0] == 0x1b {
-		if len(p) == 1 && b != '[' && b != 'O' {
-			zero(p)
-			*pending = nil
+func (k *keyState) finish(retErr error) ([]byte, error) {
+	k.clearPending()
+	if retErr != nil {
+		zero(k.pw[:cap(k.pw)])
+		k.pw = nil
+		return nil, retErr
+	}
+	return k.pw, nil
+}
+
+func (k *keyState) clearPending() {
+	for i := 0; i < k.npend; i++ {
+		k.pending[i] = 0
+	}
+	k.npend = 0
+}
+
+func (k *keyState) commitByte(b byte) error {
+	if len(k.pw)+1 > cap(k.pw) {
+		ncap := cap(k.pw) * 2
+		if ncap < len(k.pw)+1 {
+			ncap = len(k.pw) + 1
+		}
+		next := make([]byte, len(k.pw), ncap)
+		copy(next, k.pw)
+		zero(k.pw[:cap(k.pw)])
+		k.pw = next
+	}
+	k.pw = append(k.pw, b)
+	k.runeLen = append(k.runeLen, 1)
+	_, err := k.w.Write(starByte)
+	return err
+}
+
+func (k *keyState) commitCopy(p []byte) error {
+	if len(k.pw)+len(p) > cap(k.pw) {
+		ncap := cap(k.pw) * 2
+		if ncap < len(k.pw)+len(p) {
+			ncap = len(k.pw) + len(p)
+		}
+		next := make([]byte, len(k.pw), ncap)
+		copy(next, k.pw)
+		zero(k.pw[:cap(k.pw)])
+		k.pw = next
+	}
+	k.pw = append(k.pw, p...)
+	k.runeLen = append(k.runeLen, len(p))
+	_, err := k.w.Write(starByte)
+	return err
+}
+
+func (k *keyState) backspace() error {
+	if len(k.runeLen) == 0 {
+		return nil
+	}
+	n := k.runeLen[len(k.runeLen)-1]
+	k.runeLen = k.runeLen[:len(k.runeLen)-1]
+	for i := len(k.pw) - n; i < len(k.pw); i++ {
+		k.pw[i] = 0
+	}
+	k.pw = k.pw[:len(k.pw)-n]
+	_, err := k.w.Write(eraseSeq)
+	return err
+}
+
+// byte handles one input byte. done is true when the line is complete.
+func (k *keyState) byte(b byte) (bool, error) {
+	if k.npend > 0 || b == 0x1b || b >= utf8.RuneSelf {
+		handled, err := k.accept(b)
+		if err != nil || handled {
+			return false, err
+		}
+	}
+	switch b {
+	case '\n', '\r', 0x04:
+		return true, nil
+	case 0x7f, 0x08:
+		return false, k.backspace()
+	case 0x03:
+		return true, errInterrupted
+	default:
+		if b < 0x20 || b >= utf8.RuneSelf {
 			return false, nil
 		}
-		p = append(p, b)
-		if escapeDone(p) || len(p) > 8 {
-			zero(p)
-			*pending = nil
+		return false, k.commitByte(b)
+	}
+}
+
+// accept handles Esc sequences and UTF-8 tails. It reports handled when
+// b is not an ordinary ASCII key. A bad UTF-8 lead (RuneError, 1) is
+// dropped and b is left for the main key switch, so Enter and backspace
+// after a stray 0xc3 still work.
+func (k *keyState) accept(b byte) (bool, error) {
+	if k.npend > 0 && k.pending[0] == 0x1b {
+		if k.npend == 1 && b != '[' && b != 'O' {
+			k.clearPending()
+			return false, nil
+		}
+		if k.npend >= len(k.pending) {
+			k.clearPending()
 			return true, nil
 		}
-		*pending = p
+		k.pending[k.npend] = b
+		k.npend++
+		if escapeDone(k.pending[:k.npend]) || k.npend > 8 {
+			k.clearPending()
+		}
 		return true, nil
 	}
-	if b == 0x1b {
-		*pending = []byte{b}
+	if b == 0x1b && k.npend == 0 {
+		k.pending[0] = b
+		k.npend = 1
 		return true, nil
 	}
-	if len(p) > 0 {
-		p = append(p, b)
-		if !utf8.FullRune(p) && len(p) < utf8.UTFMax {
-			*pending = p
+	if k.npend > 0 {
+		if k.npend >= len(k.pending) {
+			k.clearPending()
+			return false, nil
+		}
+		var trial [pendingCap]byte
+		copy(trial[:], k.pending[:k.npend])
+		trial[k.npend] = b
+		seq := trial[:k.npend+1]
+		if !utf8.FullRune(seq) && len(seq) < utf8.UTFMax {
+			k.pending[k.npend] = b
+			k.npend++
 			return true, nil
 		}
-		r, size := utf8.DecodeRune(p)
-		take := size
+		r, size := utf8.DecodeRune(seq)
 		if r == utf8.RuneError && size == 1 {
-			take = 1
+			k.clearPending()
+			return false, nil
 		}
-		if err := commitCopy(p[:take]); err != nil {
+		if err := k.commitCopy(seq[:size]); err != nil {
 			return true, err
 		}
-		rest := append([]byte(nil), p[take:]...)
-		zero(p)
-		*pending = rest
+		k.clearPending()
+		if size < len(seq) && seq[len(seq)-1] == b && size == len(seq)-1 {
+			return false, nil
+		}
+		if size < len(seq) {
+			copy(k.pending[:], seq[size:])
+			k.npend = len(seq) - size
+		}
 		return true, nil
 	}
 	if b >= utf8.RuneSelf {
-		*pending = []byte{b}
+		k.pending[0] = b
+		k.npend = 1
 		return true, nil
 	}
 	return false, nil
