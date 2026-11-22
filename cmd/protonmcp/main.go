@@ -118,6 +118,8 @@ func main() {
 		err = runSetup(ctx, args)
 	case "doctor":
 		err = runDoctor(ctx, args)
+	case "http":
+		err = runHTTP(ctx, args)
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -133,7 +135,8 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `protonmcp — bridge Proton Mail to Claude, locally.
+	fmt.Fprintln(os.Stderr, `protonmcp — bridge Proton Mail to MCP clients such as Grok Bot (remote) or Claude Desktop (local).
+Remote access stays off until you run `+"`protonmcp http enable`"+`.
 Version: `+buildinfo.String()+`
 
 Usage:
@@ -142,18 +145,21 @@ Usage:
 First-time setup — run this one command:
   protonmcp setup
   It signs you in, copies your mailbox index, starts the background
-  service, and connects Claude. Safe to re-run; it skips what's done.
+  service, and can register optional local clients. Remote access stays
+  off until you run `+"`protonmcp http enable`"+`. Safe to re-run; it
+  skips what's done.
 
 Commands:
   setup      Run first-time setup end to end: sign in, copy the mailbox
-             index, start the background service, connect Claude, then
-             verify. Skips any step already complete, so it doubles as a
-             repair command.
+             index, start the background service, optionally register
+             local clients (Claude Desktop and Claude Code), then verify.
+             Skips any step already complete, so it doubles as a repair
+             command.
              Flags: --db <path>, --force (re-run every step).
   doctor     Run every health check — login state, local mirror, daemon,
-             helper binaries, and Claude client registration — and print
-             what to do about anything broken. Start here when something
-             isn't working.
+             helper binaries, and optional local-client registration —
+             and print what to do about anything broken. Start here when
+             something isn't working.
              Flags: --db <path>.
   version    Print the build version, commit, and platform.
   login      Run the full Proton login flow and save the session to the
@@ -184,13 +190,14 @@ Commands:
              Flags: --db <path>.
   serve-stdio
              Run as a Model Context Protocol server over stdin/stdout
-             (JSON-RPC, NDJSON framed). What Claude Desktop spawns to
-             talk to the read tools. Don't run by hand; use install
-             to register with Claude Desktop instead.
+             (JSON-RPC, NDJSON framed). What a local client such as
+             Claude Desktop spawns. Don't run by hand; install does the
+             optional local-client registration.
              Flags: --db <path>.
-  install    Register protonmcp in Claude Desktop and/or Claude Code's
-             config so the chosen client launches it as an MCP server.
-             Idempotent.
+  install    Optional local-client registration. Writes protonmcp into
+             Claude Desktop and/or Claude Code's config so that client
+             launches it as an MCP server. Remote clients such as Grok
+             Bot do not use this. Idempotent.
              Flags: --client {desktop|code|all}  (default: all),
                     --dry-run (print what would be written).
   uninstall  Remove protonmcp from the selected client config(s).
@@ -216,6 +223,24 @@ Commands:
              acquire the session from the saved Keychain blob. Failure
              (denied biometric, missing Keychain entry) leaves the
              daemon locked; check audit log for the outcome.
+  http       Configure the remote door. The door stays off until you
+             enable it, and this command does not open a port.
+             Subcommands:
+               enable                  Write enabled: true. Refuses when no
+                                       token is stored. Warns if screen lock
+                                       is off, and still enables.
+               disable                 Write enabled: false.
+               status                  Print enabled, listen address, and
+                                       whether a token exists. Never the token.
+               activity                Print remote call counts. Never a body.
+                                       --ids also prints message ids.
+               token rotate            Replace the token and copy it to the
+                                       clipboard for about 60 seconds. The
+                                       token is not an argument and is not
+                                       printed.
+               token revoke            Delete the token.
+               token show              Copy the token to the clipboard after
+                                       Touch ID. Decline copies nothing.
   daemon     Manage the launchd LaunchAgent that runs protonmcpd.
              Subcommands:
                install                 Write the plist + bootstrap. Idempotent.
@@ -228,8 +253,8 @@ Commands:
 
 The session is persisted in the macOS Keychain (service
 "zone.dort.protonmcp") so credential prompts only happen on first
-run or after logout / token expiry. Passwords are entered on
-echo-off /dev/tty.
+run or after logout / token expiry. Passwords are masked on
+/dev/tty (one * per character).
 
 Environment (override prompts; useful for scripting). Secret-bearing
 vars are consumed and unset early so they do not survive in the
@@ -266,16 +291,17 @@ func collectCredentials(ctx context.Context) (*protonclient.Credentials, error) 
 			// Built as one PromptLine label rather than fmt.Print + prompt:
 			// the cli helpers write to /dev/tty on purpose, so `protonmcp
 			// login > log.txt` would otherwise put the link the user needs
-			// in the file and only the bare "Press Enter" on screen.
-			msg := "Proton needs to verify you're human. Open this link and complete verification there:\n  " + webURL + "\n"
+			// in the file and only the bare "press Enter" on screen.
+			msg := webURL + "\nOpen this link in your browser, complete Proton's check (it may be a CAPTCHA), then press Enter. "
 			if webURL == "" {
 				msg = "Proton needs to verify you're human, but didn't return a usable verification link.\n" +
-					"Log in at https://mail.proton.me to clear the prompt there.\n"
+					"Sign in at https://mail.proton.me first and retry later.\n" +
+					"Press Enter once that's done: "
 			}
 			if again {
 				msg = "Proton still reports verification as incomplete. Finish it in the browser before continuing.\n" + msg
 			}
-			_, err := cli.PromptLine(ctx, msg+"Press Enter once verification is complete: ")
+			_, err := cli.PromptLine(ctx, msg)
 			return err
 		},
 	}

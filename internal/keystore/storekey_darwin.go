@@ -12,17 +12,6 @@ import (
 	"github.com/just-an-oldsalt/proto-mcp/internal/secret"
 )
 
-const (
-	// StoreKeyAccount is the Keychain account for the mailbox-mirror
-	// data key. It sits next to the session item (Account) under the
-	// same service, and it is not the session secret: losing it makes
-	// the local mirror unreadable, not the Proton account.
-	StoreKeyAccount = "store-key"
-
-	// StoreKeyLabel is what Keychain Access shows for the item.
-	StoreKeyLabel = "Proton MCP mailbox mirror"
-)
-
 // LoadOrCreateStoreKey returns the 32-byte AES key that seals the
 // local mailbox mirror, creating it the first time. The item is
 // AccessibleWhenUnlocked and not iCloud-synced, same as the session

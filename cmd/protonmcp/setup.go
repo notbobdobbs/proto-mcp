@@ -80,8 +80,9 @@ func runSetup(ctx context.Context, args []string) error {
 		},
 		{
 			title: "Start the background service",
-			why: "Registers a login item that keeps one unlocked session shared by\n" +
-				"Claude Desktop and Claude Code, and starts it now.",
+			why: "Registers a login item that keeps one unlocked session for local\n" +
+				"MCP clients such as Claude Desktop, and starts it now. Remote\n" +
+				"access stays off until you run `protonmcp http enable`.",
 			done: func() (bool, string) {
 				if p, err := daemonPlistPath(); err == nil {
 					if _, serr := os.Stat(p); serr == nil && labelLoaded() {
@@ -95,9 +96,10 @@ func runSetup(ctx context.Context, args []string) error {
 			run: func(ctx context.Context) error { return runDaemonInstall(ctx, nil) },
 		},
 		{
-			title: "Connect Claude",
-			why: "Adds proto-mcp to Claude Desktop and Claude Code so the mail tools\n" +
-				"appear in both.",
+			title: "Optional local-client registration",
+			why: "Adds proto-mcp to Claude Desktop and Claude Code so those local\n" +
+				"clients see the mail tools. Remote clients such as Grok Bot do\n" +
+				"not need this step.",
 			done: func() (bool, string) {
 				for _, t := range clientTargets() {
 					p, err := t.path()
@@ -112,7 +114,7 @@ func runSetup(ctx context.Context, args []string) error {
 						return false, ""
 					}
 				}
-				return true, "already connected"
+				return true, "already registered"
 			},
 			run: func(ctx context.Context) error { return runInstall(ctx, nil) },
 		},
@@ -120,8 +122,10 @@ func runSetup(ctx context.Context, args []string) error {
 
 	fmt.Println("proto-mcp setup")
 	fmt.Println()
-	fmt.Println("This connects your Proton mailbox to Claude. Four steps, and you can")
-	fmt.Println("stop and re-run this at any time — it picks up where it left off.")
+	fmt.Println("This connects your Proton mailbox to local MCP clients such as Claude Desktop.")
+	fmt.Println("Remote access for clients such as Grok Bot stays off until you run")
+	fmt.Println("`protonmcp http enable`. Four steps, and you can stop and re-run this")
+	fmt.Println("at any time — it picks up where it left off.")
 	fmt.Println()
 
 	for i, s := range steps {
@@ -159,12 +163,14 @@ func runSetup(ctx context.Context, args []string) error {
 	}
 
 	fmt.Println()
-	fmt.Println("Setup complete. One last thing:")
+	fmt.Println("Setup complete.")
 	fmt.Println()
-	fmt.Println("  Quit and reopen Claude Desktop and Claude Code.")
+	fmt.Println("  Local clients such as Claude Desktop can use the mailbox. If you")
+	fmt.Println("  registered one, quit and reopen it — it only reads the tool list")
+	fmt.Println("  at startup.")
+	fmt.Println("  Remote access stays off until you run `protonmcp http enable`.")
 	fmt.Println()
-	fmt.Println("They only read the tool list at startup, so the mail tools won't")
-	fmt.Println("appear until you restart them. Then try asking Claude:")
+	fmt.Println("Then try asking:")
 	fmt.Println()
 	fmt.Println("    \"What's in my inbox from this week?\"")
 	return nil

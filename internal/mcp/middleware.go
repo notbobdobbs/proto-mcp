@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -97,6 +96,45 @@ type Middleware struct {
 	// (PROTO-132) and the copy captured at dispatch is stale. Set by
 	// Server.New.
 	lookupTool func(string) (Tool, bool)
+
+	// HTTP-only hooks. The Unix and stdio paths never call them. A nil
+	// hook denies the HTTP call it guards, so a forgotten wire-up
+	// cannot skip the allowlist, the read cap, the trash check, or
+	// the unlock clock. remoteAllow narrows; it cannot turn a deny
+	// into an allow. readCap and trashGuard run before the approval
+	// broker.
+	httpUnlock  func(context.Context) error
+	remoteAllow func(tool string) bool
+	readCap     func(tool string) error
+	trashGuard  func(context.Context, json.RawMessage) error
+}
+
+// httpReadTools consume the daily remote read cap. Keep this in step
+// with httpmcp.readTools. mail_sync, drafts, sends, and mail_trash
+// are not in it.
+var httpReadTools = map[string]struct{}{
+	"account_whoami":           {},
+	"mail_list":                {},
+	"mail_search":              {},
+	"mail_read":                {},
+	"mail_read_thread":         {},
+	"mail_list_attachments":    {},
+	"mail_draft_list":          {},
+	"labels_list":              {},
+	"folders_list":             {},
+	"calendar_list":            {},
+	"calendar_events":          {},
+	"calendar_read_event":      {},
+	"mail_download_attachment": {},
+}
+
+// UseApproval installs the Touch ID broker after New. Tests use it
+// to prove a remote denial does not start the helper.
+func (s *Server) UseApproval(b *approval.Broker) {
+	if s.middleware == nil {
+		s.middleware = &Middleware{}
+	}
+	s.middleware.broker = b
 }
 
 func (m *Middleware) ensureRate() {
@@ -133,20 +171,32 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 		started        = time.Now()
 	)
 
-	// SECURITY D20 — per-connection caller takes precedence over
-	// the process-wide Resolver. The daemon's accept loop stashes
-	// the peer's PID/UID/binary via caller.WithCaller(ctx, peer)
-	// after LOCAL_PEERCRED / LOCAL_PEERPID lookups, so each
-	// connection's audit row records the real connecting client
-	// rather than the daemon's own PID.
+	// SECURITY D20 — a caller stashed on the context is
+	// authoritative, including when PID is 0. The daemon's accept
+	// loop stashes the socket peer (transport unix). The HTTP door
+	// stashes a caller with PID 0, transport http, and a label.
+	// Treating PID 0 as absent used to fall through to the
+	// process-wide Resolver and audit that call as the daemon's
+	// parent (launchd).
 	//
-	// Resolver remains as the fallback for serve-stdio, where
-	// there's exactly one parent (the spawning Claude client)
-	// and the process-lifetime cache is the right semantics.
-	if c := caller.FromContext(ctx); c.PID != 0 {
+	// Resolver remains the fallback only when no caller was
+	// stashed: serve-stdio, where the parent is the client.
+	if c, ok := caller.FromContext(ctx); ok {
 		callerInfo = c
 	} else if m.resolver != nil {
 		callerInfo = m.resolver.Resolve()
+	}
+
+	// Absolute HTTP unlock. Idle bumps do not move this clock, and
+	// a Unix caller never reads it. A decline returns before the
+	// idle bump and before the audit row, same as a lock refusal.
+	if callerInfo.Transport == caller.TransportHTTP {
+		if m.httpUnlock == nil {
+			return ErrorResult("%s refused: the remote door is not configured", t.Name), nil
+		}
+		if err := m.httpUnlock(ctx); err != nil {
+			return ErrorResult("%s", err.Error()), nil
+		}
 	}
 
 	// Phase 6/E — locked daemon gates every tool call until it's
@@ -184,8 +234,9 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 
 	// Phase 7/A — idle-lock activity bump. Fired AFTER the lock-
 	// state check so a locked daemon's refused calls don't keep
-	// the idle timer alive. The observer is non-blocking by
-	// contract; runtime's implementation is a single atomic store.
+	// the idle timer alive. The absolute HTTP unlock check above
+	// also returns before this bump. The observer is non-blocking
+	// by contract; runtime's implementation is a single atomic store.
 	if m.onToolCallObserv != nil {
 		m.onToolCallObserv()
 	}
@@ -196,7 +247,13 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 			Tool:           t.Name,
 			ArgsJSON:       redact.JSON(args),
 			PolicyDecision: "",
+			ClaimedClient:  caller.ClaimedClient(ctx),
 		})
+		// A remote call that was not recorded must not run. Begin
+		// returns 0 when the write fails.
+		if auditID == 0 && callerInfo.Transport == caller.TransportHTTP {
+			return ErrorResult("%s refused: the audit log did not record this call", t.Name), nil
+		}
 	}
 
 	defer func() {
@@ -233,6 +290,30 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 		_ = updateDecision(ctx, m.audit, auditID, string(decision))
 	}
 
+	// Remote allowlist, HTTP only, after Decide. A policy deny is
+	// left for the switch below and cannot be undone by the list.
+	if callerInfo.Transport == caller.TransportHTTP && decision != policy.DecisionDeny {
+		if m.remoteAllow == nil || !m.remoteAllow(t.Name) {
+			outcome = audit.OutcomeDenied
+			errMsg = "not on the remote tool list"
+			return ErrorResult("tool %s is not available on the remote door", t.Name), nil
+		}
+	}
+	if callerInfo.Transport == caller.TransportHTTP {
+		if _, read := httpReadTools[t.Name]; read {
+			if m.readCap == nil {
+				outcome = audit.OutcomeDenied
+				errMsg = "remote read cap is not configured"
+				return ErrorResult("%s denied: remote read cap is not configured", t.Name), nil
+			}
+			if err := m.readCap(t.Name); err != nil {
+				outcome = audit.OutcomeDenied
+				errMsg = err.Error()
+				return ErrorResult("%s denied: %s", t.Name, err.Error()), nil
+			}
+		}
+	}
+
 	// Phase 5/D — rate limit check happens BEFORE recipient
 	// allowlist and BEFORE approval. A flood of denied calls
 	// doesn't burn through approval prompts; a flood of
@@ -240,7 +321,11 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 	// rate → recipients → broker → handler.
 	if pol != nil && pol.RateLimit != "" {
 		m.ensureRate()
-		key := t.Name + "|" + strconv.Itoa(callerInfo.PID)
+		// One bucket per tool. A per-PID key gave every new process
+		// — and an HTTP caller, whose PID is 0 — its own copy of a
+		// cap that was meant to be global. Old tool|pid rows in
+		// rate_limit_state are left behind and are not read.
+		key := t.Name
 		if ok, reason := m.rate.Allow(key, pol.RateLimit); !ok {
 			outcome = audit.OutcomeDenied
 			errMsg = reason
@@ -258,6 +343,23 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 			outcome = audit.OutcomeDenied
 			errMsg = "recipient " + bad + " not on allowlist"
 			return ErrorResult("%s denied: recipient %s not on allowlist", t.Name, bad), nil
+		}
+	}
+
+	// HTTP mail_trash refuses before the approval cache and before
+	// the handler when the mirror says the message is already in
+	// Trash, or when the mirror has no row. The Unix path does not
+	// call this.
+	if callerInfo.Transport == caller.TransportHTTP && t.Name == "mail_trash" {
+		if m.trashGuard == nil {
+			outcome = audit.OutcomeDenied
+			errMsg = "mail_trash refused: the trash check is not configured"
+			return ErrorResult("%s", errMsg), nil
+		}
+		if err := m.trashGuard(ctx, args); err != nil {
+			outcome = audit.OutcomeDenied
+			errMsg = err.Error()
+			return ErrorResult("%s", err.Error()), nil
 		}
 	}
 

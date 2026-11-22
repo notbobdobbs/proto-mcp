@@ -11,10 +11,12 @@ Protocol](https://modelcontextprotocol.io) tools — and every message
 that goes out needs your fingerprint on a prompt that names the real
 recipient.
 
-Nothing leaves your laptop except the mail itself.
+Mail leaves your laptop for Proton. The remote door is off by default.
+When you turn it on, the daemon listens on loopback only, and a tunnel
+you run yourself can carry that traffic off the machine.
 
 ![platform: macOS](https://img.shields.io/badge/platform-macOS%2013%2B-black?logo=apple)
-![Go 1.26.6+](https://img.shields.io/badge/Go-1.26.6%2B-00ADD8?logo=go&logoColor=white)
+![Go 1.27.4+](https://img.shields.io/badge/Go-1.27.4%2B-00ADD8?logo=go&logoColor=white)
 ![signed & notarized](https://img.shields.io/badge/Apple-signed%20%26%20notarized-success?logo=apple)
 ![MCP](https://img.shields.io/badge/Model%20Context%20Protocol-ready-8A63D2)
 ![license: GPLv3](https://img.shields.io/badge/license-GPLv3-blue)
@@ -52,26 +54,30 @@ protonmcp setup
 ```
 
 That's the whole thing. `setup` signs you in, copies your mailbox index
-into a local database, starts the background service, and connects both
-Claude clients — explaining each step as it goes. Restart Claude
-afterwards and the tools show up under `protonmcp` in `/mcp`.
+into a local database, and starts the background service, so a local MCP
+client such as Claude Desktop can use the mailbox. Remote access for
+clients such as Grok Bot stays off until you run `protonmcp http enable`.
+The last step is optional local-client registration for Claude Desktop
+and Claude Code. Restart a local client afterwards and the tools show up
+under `protonmcp`.
 
 It's safe to re-run: completed steps are skipped, so it doubles as a
 repair command.
 
 <details>
-<summary>Prefer to run the four steps yourself?</summary>
+<summary>Prefer to run the steps yourself?</summary>
 
 ```sh
 protonmcp login            # Proton SRP password + 2FA + key unlock
 protonmcp backfill         # one-time: pull your message envelopes into the local mirror
 protonmcp daemon install   # register + start the background daemon
-protonmcp install          # connect it to Claude Desktop + Claude Code
+protonmcp install          # optional local-client registration (Claude Desktop and Claude Code)
 ```
 
 </details>
 
-Signed, notarized binaries — no Gatekeeper warning, no network listener.
+Signed, notarized binaries — no Gatekeeper warning. The daemon does
+not listen on the network unless you enable the loopback door.
 
 Anything not working? **`protonmcp doctor`** checks every piece of the
 install and tells you the one command that fixes it:
@@ -128,8 +134,15 @@ never a *liability*. The guarantees that make that true:
 - **🧾 Honest, redacted audit log.** Every call is logged — secrets
   scrubbed, bodies reduced to `{sha256, bytes}`, recipients kept literal
   so the verification chain stays truthful.
-- **🏠 Local-only.** The daemon listens on a `0600` Unix socket, never a
-  network port. Mail content goes to Proton over TLS; nothing else leaves.
+- **🏠 Local socket, optional loopback door.** The daemon listens on a
+  `0600` Unix socket. It also listens on `127.0.0.1` (or `::1`) only
+  when `http.yaml` is enabled and a Keychain token exists. It does not
+  open a public port. At 500 failed remote sign-ins in a local day it
+  posts one warning, if auto-disable is set higher than that.
+  `protonmcp http status --debug` shows the scrubbed detail and never
+  the token. Mail content goes to Proton over TLS. A remote bot sees
+  the mail it reads; that trade-off is in
+  [docs/security.md](docs/security.md).
 
 What a prompt actually looks like:
 
@@ -185,7 +198,7 @@ Full reference, plus locking and the audit/observability commands:
 
 ## Build from source
 
-Requires macOS 13+, [Go 1.26.6+](https://go.dev/dl/), and Xcode Command
+Requires macOS 13+, [Go 1.27.4+](https://go.dev/dl/), and Xcode Command
 Line Tools (for `swiftc`).
 
 ```sh

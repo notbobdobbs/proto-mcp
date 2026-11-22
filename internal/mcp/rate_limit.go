@@ -8,7 +8,8 @@ import (
 	"time"
 )
 
-// rateLimiter is a token-bucket store keyed by (tool, pid).
+// rateLimiter is a token-bucket store. The middleware keys a
+// bucket by tool name only, so every caller shares that tool's cap.
 //
 // Phase 5/D shipped the in-memory version (one bucket per key, lost
 // on restart). Phase 6/E adds persistence via a pluggable
@@ -98,9 +99,9 @@ func (r *rateLimiter) setPersister(p RateLimitPersister) error {
 // Allow returns (true, "") if the call is within budget, or
 // (false, "reason") if it should be denied. limitSpec is the
 // policy's rate_limit string ("20/hour"); empty disables the
-// check. key uniquely identifies the bucket — middleware passes
-// (tool || pid) so concurrent Claude Desktop sessions don't share
-// a budget.
+// check. key uniquely identifies the bucket. Middleware passes
+// the tool name only. Rows persisted under the old "tool|pid"
+// key are left in the store and are not consulted.
 //
 // Tokens refill linearly between calls. A burst of N consecutive
 // calls within milliseconds drains the bucket; the (N+1)th waits

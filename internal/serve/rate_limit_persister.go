@@ -12,8 +12,9 @@ import (
 // otherwise reference each other; this file is the only point of
 // contact for Phase 6/E's bucket persistence.
 //
-// All translation is straight field-mapping. The composite key
-// ("tool|pid" — set by middleware.runTool) passes through unchanged.
+// All translation is straight field-mapping. The key (the tool
+// name, set by middleware.runTool) passes through unchanged.
+// Older "tool|pid" rows are left in the table and are not consulted.
 type rateLimitStoreAdapter struct {
 	st *store.Store
 }

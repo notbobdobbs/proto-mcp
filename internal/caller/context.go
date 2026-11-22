@@ -25,12 +25,31 @@ func WithCaller(parent context.Context, c Caller) context.Context {
 	return context.WithValue(parent, callerKey, c)
 }
 
-// FromContext returns the Caller stashed by WithCaller, or the
-// zero Caller if absent. Callers detect "no per-conn caller set"
-// by comparing the result against the zero value.
-func FromContext(ctx context.Context) Caller {
-	if c, ok := ctx.Value(callerKey).(Caller); ok {
-		return c
+// FromContext returns the Caller stashed by WithCaller.
+//
+// The boolean is false only when nothing was stashed. A stashed
+// caller is present even when PID is 0. HTTP has no peer process,
+// and treating PID 0 as "absent" made the middleware fall back to
+// the daemon's parent (launchd) and audit the wrong caller.
+func FromContext(ctx context.Context) (Caller, bool) {
+	c, ok := ctx.Value(callerKey).(Caller)
+	if !ok {
+		return Caller{}, false
 	}
-	return Caller{}
+	return c, true
+}
+
+type claimedKey struct{}
+
+// WithClaimedClient records the name from MCP initialize's clientInfo.
+// It is for the audit log only. It is never used to authorize.
+// Unix connections leave it unset.
+func WithClaimedClient(parent context.Context, name string) context.Context {
+	return context.WithValue(parent, claimedKey{}, name)
+}
+
+// ClaimedClient returns the initialize client name, or "" when unset.
+func ClaimedClient(ctx context.Context) string {
+	s, _ := ctx.Value(claimedKey{}).(string)
+	return s
 }

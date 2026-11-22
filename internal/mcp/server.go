@@ -227,6 +227,38 @@ func New(logger *slog.Logger, opts ...Option) *Server {
 	return s
 }
 
+func (s *Server) ensureMiddleware() *Middleware {
+	if s.middleware == nil {
+		s.middleware = &Middleware{lookupTool: s.lookupTool}
+	}
+	return s.middleware
+}
+
+// UseHTTPUnlock, UseRemoteAllow, UseReadCap, and UseTrashGuard are
+// the HTTP door's extra gates. They are not consulted for a Unix or
+// stdio caller.
+func (s *Server) UseHTTPUnlock(fn func(context.Context) error) {
+	s.ensureMiddleware().httpUnlock = fn
+}
+func (s *Server) UseRemoteAllow(fn func(string) bool) { s.ensureMiddleware().remoteAllow = fn }
+func (s *Server) UseReadCap(fn func(string) error)    { s.ensureMiddleware().readCap = fn }
+func (s *Server) UseTrashGuard(fn func(context.Context, json.RawMessage) error) {
+	s.ensureMiddleware().trashGuard = fn
+}
+
+// Conn is one MCP connection's initialized flag. The HTTP door keeps
+// one per session. The stdio and socket paths keep theirs inside Serve.
+type Conn struct{ connState }
+
+// Dispatch runs one JSON-RPC request on c. HTTP calls this; stdio
+// and the socket call it through Serve.
+func (s *Server) Dispatch(ctx context.Context, c *Conn, req *Request) *Response {
+	if c == nil {
+		c = &Conn{}
+	}
+	return s.dispatch(ctx, &c.connState, req)
+}
+
 // lookupTool returns the currently registered definition for name.
 // Distinct from Tools() in that it doesn't copy the whole registry —
 // and it always reflects the latest ReplaceTools.

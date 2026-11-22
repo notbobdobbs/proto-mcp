@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # pull_request on the default branch only matches PRs into main, so a
+    # stacked PR never starts this workflow. Push of this branch does.
+    branches:
+      - main
+      - cursor/hv-login-captcha-mask-51bf
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -17,13 +20,14 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          # Read the version straight from go.mod's `go` directive rather
-          # than pinning a literal here. "1.26.x" resolved to 1.26.4 even
-          # after 1.26.5 shipped, and setup-go exports GOTOOLCHAIN=local,
-          # so Go could not self-upgrade — raising the go.mod floor to
-          # clear a stdlib CVE broke every job with "go.mod requires go >=
-          # 1.26.5 (running go 1.26.4)". Sourcing both from one place
-          # means the toolchain and the floor cannot drift apart again.
+          # Read the release from go.mod's `go` line (1.27.4). Go 1.27
+          # drops a toolchain line that only repeats that version, and
+          # govulncheck refuses a module tidy would rewrite, so the go
+          # line is the pin. A floating "1.26.x" once resolved to an older
+          # patch, and setup-go exports GOTOOLCHAIN=local, so Go could not
+          # self-upgrade. The job then failed with "go.mod requires go >=
+          # … (running go …)". One source means the installed toolchain
+          # and the floor stay the same release.
           go-version-file: go.mod
           cache: true
 
@@ -41,8 +45,26 @@ jobs:
         # biometric hardware.
         run: make touchid
 
-      - name: go test
+      - name: go test -race
         run: go test -race ./...
+
+  # Real darwin pty: poll on /dev/tty does not deliver keystrokes, and
+  # raw mode with ISIG off swallows Ctrl+C. This job is the check that
+  # the masked password prompt types, backspaces, accepts CR and LF,
+  # and cancels on Ctrl+C, SIGTERM and SIGHUP.
+  prompt-macos:
+    name: macOS password prompt
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: pty prompt tests
+        run: go test -count=1 -timeout 180s ./internal/cli/ -run 'TestPromptPTY|TestPromptSecretCancel|TestReadMasked'
 
   vulncheck:
     # macOS runner because internal/keystore depends on keybase/go-keychain
@@ -54,8 +76,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          # See ci.yml: sourced from go.mod so the toolchain always
-          # satisfies the declared floor.
+          # Same go.mod `go` line as the test job (1.27.4).
           go-version-file: go.mod
           cache: true
 

@@ -42,6 +42,10 @@ type Entry struct {
 	Tool           string
 	ArgsJSON       json.RawMessage // already redacted
 	PolicyDecision string          // "allow" | "prompt" | "deny"
+	// ClaimedClient is the name from MCP initialize's clientInfo.
+	// It is stored on the row and is never used to authorize.
+	// Unix-socket rows leave it empty.
+	ClaimedClient string
 }
 
 // Outcome values the middleware passes to Complete. String-typed for
@@ -120,8 +124,10 @@ func (w *Writer) Begin(ctx context.Context, e *Entry) int64 {
 	detached, cancel := detachedAuditCtx(ctx)
 	defer cancel()
 	res, err := w.db.ExecContext(detached, `
-INSERT INTO audit_log (ts, caller_pid, caller_binary, caller_uid, tool, args_json, policy_decision)
-VALUES (?, ?, ?, ?, ?, ?, ?)`,
+INSERT INTO audit_log (
+    ts, caller_pid, caller_binary, caller_uid, tool, args_json, policy_decision,
+    transport, caller_label, claimed_client)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Timestamp.Unix(),
 		e.Caller.PID,
 		e.Caller.Binary,
@@ -133,15 +139,32 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		// naturally for "this column holds opaque bytes."
 		[]byte(e.ArgsJSON),
 		e.PolicyDecision,
+		e.Caller.Transport,
+		e.Caller.Label,
+		e.ClaimedClient,
 	)
 	if err != nil {
-		w.logger.Warn("audit Begin failed; tool call proceeds without audit row",
-			"tool", e.Tool, "err", err.Error())
+		// HTTP must fail closed: a remote call with no audit row is
+		// refused by the middleware. A socket or stdio call still
+		// proceeds, because losing the local tool is worse than a
+		// missing row.
+		if e.Caller.Transport == caller.TransportHTTP {
+			w.logger.Warn("audit Begin failed; HTTP call must not proceed",
+				"tool", e.Tool, "err", err.Error())
+		} else {
+			w.logger.Warn("audit Begin failed; tool call proceeds without audit row",
+				"tool", e.Tool, "err", err.Error())
+		}
 		return 0
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		w.logger.Warn("audit Begin: LastInsertId failed", "tool", e.Tool, "err", err.Error())
+		if e.Caller.Transport == caller.TransportHTTP {
+			w.logger.Warn("audit Begin: LastInsertId failed; HTTP call must not proceed",
+				"tool", e.Tool, "err", err.Error())
+		} else {
+			w.logger.Warn("audit Begin: LastInsertId failed", "tool", e.Tool, "err", err.Error())
+		}
 		return 0
 	}
 	e.ID = id
@@ -188,9 +211,13 @@ WHERE id = ?`,
 		// shouldn't need a SQLite query to know what the entry was.
 		var row jsonlContext
 		_ = w.db.QueryRowContext(detached, `
-SELECT tool, caller_pid, caller_binary, policy_decision, args_json
+SELECT tool, caller_pid, caller_binary, policy_decision, args_json,
+       transport, caller_label, claimed_client
   FROM audit_log WHERE id = ?
-`, id).Scan(&row.Tool, &row.CallerPID, &row.CallerBinary, &row.PolicyDecision, &row.ArgsJSON)
+`, id).Scan(
+			&row.Tool, &row.CallerPID, &row.CallerBinary, &row.PolicyDecision, &row.ArgsJSON,
+			&row.Transport, &row.CallerLabel, &row.ClaimedClient,
+		)
 
 		w.mu.Lock()
 		defer w.mu.Unlock()
@@ -210,6 +237,9 @@ type jsonlContext struct {
 	CallerBinary   string
 	PolicyDecision string
 	ArgsJSON       string
+	Transport      string
+	CallerLabel    string
+	ClaimedClient  string
 }
 
 // detachedAuditCtx returns a fresh context with a short timeout,

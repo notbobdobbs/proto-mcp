@@ -35,6 +35,20 @@ func TestStringFallback(t *testing.T) {
 	}
 }
 
+// HTTP dialog text is the door and the configured label. A binary
+// path on the struct must not replace it — the client can claim one.
+func TestStringHTTPLabel(t *testing.T) {
+	c := Caller{
+		Transport: TransportHTTP,
+		Label:     "remote",
+		PID:       0,
+		Binary:    "/sbin/launchd",
+	}
+	if got := c.String(); got != "http:remote" {
+		t.Errorf("HTTP caller string = %q, want http:remote", got)
+	}
+}
+
 func TestBasenameOf(t *testing.T) {
 	cases := map[string]string{
 		"/usr/local/bin/foo":      "foo",

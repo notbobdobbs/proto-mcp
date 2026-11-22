@@ -119,6 +119,31 @@ Content-Type: application/json
 	}
 }
 
+func TestRedactDumpHumanVerification(t *testing.T) {
+	const token = "issued-token-unchanged"
+	dump := []byte("POST /auth/v4?token=" + token + " HTTP/1.1\r\n" +
+		"Host: mail-api.proton.me\r\n" +
+		"X-Pm-Human-Verification-Token: " + token + "\r\n" +
+		"Content-Type: application/json\r\n\r\n" +
+		`{"Code":9001,"Details":{"HumanVerificationToken":"` + token + `","HumanVerificationMethods":["captcha"],"WebUrl":"https://verify.proton.me/?methods=captcha&token=` + token + `"}}`)
+	got := string(redactDump(dump))
+	if strings.Contains(got, token) {
+		t.Fatalf("human-verification token leaked: %s", got)
+	}
+	if !strings.Contains(got, "verify.proton.me") {
+		t.Fatalf("verification host should remain visible: %s", got)
+	}
+	if !strings.Contains(got, "token=[REDACTED]") {
+		t.Fatalf("query token was not redacted: %s", got)
+	}
+	if !strings.Contains(got, `"HumanVerificationToken": "[REDACTED]"`) {
+		t.Fatalf("JSON token field was not redacted: %s", got)
+	}
+	if !strings.Contains(got, "X-Pm-Human-Verification-Token: [REDACTED]") {
+		t.Fatalf("HV header was not redacted: %s", got)
+	}
+}
+
 func TestRedactDumpResponseBody(t *testing.T) {
 	// A /auth/v4 response shape.
 	dump := []byte(`HTTP/1.1 200 OK

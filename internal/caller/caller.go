@@ -18,17 +18,40 @@ import (
 	"sync"
 )
 
-// Caller is the resolved identity of whoever spawned us.
+// Transport values recorded on a Caller. The Unix socket and the
+// loopback HTTP door are different callers even when the numeric
+// ids match. The HTTP listener itself is a later change; this
+// package only names the door.
+const (
+	TransportUnix = "unix"
+	TransportHTTP = "http"
+)
+
+// Caller is the resolved identity of whoever invoked a tool.
+//
+// Transport and Label are part of that identity. A socket peer
+// keeps its PID, UID, and binary, with Transport "unix". An HTTP
+// caller has no peer process (PID 0) and a configured Label; the
+// approval dialog shows that as "http:<label>".
 type Caller struct {
-	PID    int
-	UID    int
-	Binary string // absolute path, empty if resolution failed
+	PID       int
+	UID       int
+	Binary    string // absolute path, empty if resolution failed
+	Transport string // TransportUnix, TransportHTTP, or empty for serve-stdio
+	Label     string // configured name of an HTTP caller; empty on the socket
 }
 
-// String formats for log / audit display: "Claude Desktop (pid 1234)".
-// Falls back to the binary basename + pid if the full path is
-// unhelpful, or just "pid 1234" if we couldn't resolve a path.
+// String formats for log / audit display and for the Touch ID
+// helper's "Requested by" line.
+//
+// HTTP returns "http:<label>" so the dialog names the remote door
+// instead of a binary path the caller could claim. Socket and
+// stdio callers stay "Claude (pid 1234)", or "pid 1234" when the
+// binary could not be resolved.
 func (c Caller) String() string {
+	if c.Transport == TransportHTTP {
+		return "http:" + c.Label
+	}
 	if c.Binary == "" {
 		return fmt.Sprintf("pid %d", c.PID)
 	}
