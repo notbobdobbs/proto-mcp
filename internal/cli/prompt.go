@@ -248,7 +248,10 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 	ctl := &ttyCtl{f: tty}
 	defer ctl.release()
 	stop := watchCancel(promptCtx, func() {
-		ctl.restore()
+		// Do not restore here. On macOS tcsetattr waits for a pending
+		// read, and Ctrl-C is consumed as SIGINT, so restoring while
+		// the read is blocked deadlocks. readPassword closes the tty
+		// and restores after that read returns.
 		cancel()
 	})
 	defer stop()
@@ -364,11 +367,18 @@ func readPassword(ctx context.Context, tty *os.File, ctl *ttyCtl) ([]byte, error
 		}
 		return r.pw, r.err
 	case <-ctx.Done():
-		ctl.restore()
-		go func() {
-			r := <-done
+		// Closing the read fd lets the blocked read return. Restoring
+		// termios first deadlocks on macOS, which waits for that read.
+		_ = tty.Close()
+		select {
+		case r := <-done:
 			zero(r.pw)
-		}()
+		case <-time.After(200 * time.Millisecond):
+			go func() {
+				r := <-done
+				zero(r.pw)
+			}()
+		}
 		return nil, ctx.Err()
 	}
 }
