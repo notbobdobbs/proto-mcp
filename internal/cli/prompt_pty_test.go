@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -174,12 +175,16 @@ func runPromptCtrlCChild() {
 	}
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT)
-	go func() {
-		<-sigCh
-		fmt.Fprintf(os.Stderr, "got SIGINT\n")
-	}()
 	ctx, stop := signalNotifyInterrupt()
 	defer stop()
+	go func() {
+		<-sigCh
+		time.Sleep(200 * time.Millisecond)
+		buf := make([]byte, 1<<16)
+		n := runtime.Stack(buf, true)
+		fmt.Fprintf(os.Stderr, "got SIGINT ctx=%v\n%s\n", ctx.Err(), buf[:n])
+		os.Exit(6)
+	}()
 	_, err = promptSecretTTY(ctx, tty, "Password: ")
 	if errors.Is(err, context.Canceled) || errors.Is(err, errInterrupted) {
 		os.Exit(0)
