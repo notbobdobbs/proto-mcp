@@ -40,16 +40,3 @@ func openPTY(t *testing.T) (master, slave *os.File) {
 	t.Cleanup(func() { _ = slave.Close() })
 	return master, slave
 }
-
-func slavePath(f *os.File) (string, error) {
-	buf := make([]byte, 1024)
-	_, _, errno := unix.Syscall(unix.SYS_FCNTL, f.Fd(), uintptr(unix.F_GETPATH), uintptr(unsafe.Pointer(&buf[0])))
-	if errno != 0 {
-		return "", errno
-	}
-	n := 0
-	for n < len(buf) && buf[n] != 0 {
-		n++
-	}
-	return string(buf[:n]), nil
-}

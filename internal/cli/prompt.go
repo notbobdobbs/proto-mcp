@@ -268,13 +268,15 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 	defer cancel()
 	ctl := &ttyCtl{f: tty}
 	defer ctl.release()
+	// Signals only cancel. The read loop is on this goroutine; it
+	// returns through finish (which zeros the password) and then
+	// flushes and restores. Restoring from the signal goroutine races
+	// the in-flight read.
 	stop := watchCancel(promptCtx, func() {
-		ctl.restore()
 		cancel()
 	})
 	defer stop()
 	stopHUP := watchSignal(syscall.SIGHUP, func() {
-		ctl.restore()
 		cancel()
 	})
 	defer stopHUP()
@@ -287,7 +289,6 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 		case interrupted <- struct{}{}:
 		default:
 		}
-		ctl.restore()
 		cancel()
 	})
 	defer stopINT()

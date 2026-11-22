@@ -120,10 +120,6 @@ func TestPromptPTYCtrlC(t *testing.T) {
 		return
 	}
 	master, slave := openPTY(t)
-	path, err := slavePath(slave)
-	if err != nil {
-		t.Fatalf("slave path: %v", err)
-	}
 	dupfd, err := unix.Dup(int(slave.Fd()))
 	if err != nil {
 		t.Fatal(err)
@@ -132,12 +128,14 @@ func TestPromptPTYCtrlC(t *testing.T) {
 	t.Cleanup(func() { _ = dup.Close() })
 
 	cmd := exec.Command(os.Args[0], "-test.run=^TestPromptPTYCtrlC$")
-	cmd.Env = append(os.Environ(), "PROTONMCP_PROMPT_CHILD=1", "PROTONMCP_PROMPT_TTY="+path)
+	cmd.Env = append(os.Environ(), "PROTONMCP_PROMPT_CHILD=1")
 	cmd.Stdin = slave
 	cmd.Stdout = slave
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// Ctty 0 is the child's stdin, the slave. That makes it the
+	// controlling terminal of the new session so 0x03 is SIGINT.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start child: %v", err)
 	}
@@ -288,29 +286,14 @@ func TestPromptPTYSIGHUPRestores(t *testing.T) {
 }
 
 func runPromptCtrlCChild() {
-	if _, err := unix.Setsid(); err != nil && !errors.Is(err, unix.EPERM) {
-		fmt.Fprintf(os.Stderr, "setsid: %v\n", err)
-		os.Exit(4)
-	}
-	tty, err := os.OpenFile(os.Getenv("PROTONMCP_PROMPT_TTY"), os.O_RDWR, 0)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "open tty: %v\n", err)
-		os.Exit(4)
-	}
-	fd := int(tty.Fd())
-	// Opening without O_NOCTTY may already have made this the
-	// controlling terminal. Forcing it is required when it did not.
-	if err := unix.IoctlSetInt(fd, unix.TIOCSCTTY, 0); err != nil && !errors.Is(err, unix.EPERM) {
-		fmt.Fprintf(os.Stderr, "TIOCSCTTY: %v\n", err)
-		os.Exit(4)
-	}
+	fd := int(os.Stdin.Fd())
 	if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, os.Getpid()); err != nil {
 		fmt.Fprintf(os.Stderr, "TIOCSPGRP: %v\n", err)
 		os.Exit(5)
 	}
 	ctx, stop := signalNotifyInterrupt()
 	defer stop()
-	_, err = promptSecretTTY(ctx, tty, "Password: ")
+	_, err := promptSecretTTY(ctx, os.Stdin, "Password: ")
 	if errors.Is(err, context.Canceled) || errors.Is(err, errInterrupted) {
 		os.Exit(0)
 	}
