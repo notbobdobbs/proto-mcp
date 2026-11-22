@@ -6,9 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"syscall"
 	"testing"
@@ -106,80 +104,47 @@ func TestPromptPTYTyping(t *testing.T) {
 	}
 }
 
-// TestPromptPTYCtrlC checks that SIGINT during the prompt returns.
-// With ISIG left on, a real terminal turns Ctrl-C into that signal
-// and the read never observes 0x03.
+// TestPromptPTYCtrlC checks that SIGINT during the prompt returns and
+// restores cooked mode. With ISIG left on, a real terminal turns
+// Ctrl-C into that signal and the read never observes 0x03.
 func TestPromptPTYCtrlC(t *testing.T) {
-	if os.Getenv("PROTONMCP_PROMPT_CHILD") == "1" {
-		runPromptCtrlCChild()
-		return
-	}
 	master, slave := openPTY(t)
-	path, err := slavePath(slave)
+	dupfd, err := unix.Dup(int(slave.Fd()))
 	if err != nil {
-		t.Fatalf("slave path: %v", err)
+		t.Fatal(err)
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestPromptPTYCtrlC$")
-	cmd.Env = append(os.Environ(), "PROTONMCP_PROMPT_CHILD=1", "PROTONMCP_PROMPT_TTY="+path)
-	cmd.Stdin = slave
-	cmd.Stdout = slave
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start child: %v", err)
+	dup := os.NewFile(uintptr(dupfd), "dup")
+	t.Cleanup(func() { _ = dup.Close() })
+	before, err := termState(dupfd)
+	if err != nil {
+		t.Fatal(err)
 	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := promptSecretTTY(context.Background(), slave, "Password: ")
+		done <- err
+	}()
 	waitFor(t, master, "Password:")
-	// ISIG is on, so a terminal turns this key into SIGINT and the
-	// reader never sees 0x03. Signal the child directly. Writing the
-	// byte into a macOS CI pty does not deliver that signal.
-	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
-		t.Fatalf("signal: %v", err)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
 	}
-	waitErr := make(chan error, 1)
-	go func() { waitErr <- cmd.Wait() }()
 	select {
-	case err := <-waitErr:
-		if err != nil {
-			t.Fatalf("child exited with error: %v\nstderr: %s", err, stderr.String())
+	case err := <-done:
+		if !errors.Is(err, errInterrupted) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("prompt error = %v, want interrupted", err)
 		}
-	case <-time.After(5 * time.Second):
-		_ = cmd.Process.Kill()
-		t.Fatalf("Ctrl-C did not cancel the prompt\nstderr: %s", stderr.String())
+	case <-time.After(3 * time.Second):
+		t.Fatal("SIGINT left the prompt blocked")
 	}
-}
-
-func runPromptCtrlCChild() {
-	// Open the slave here, after setsid. An inherited fd was opened
-	// with O_NOCTTY in the parent, and on macOS that does not become
-	// this process's controlling terminal, so the kernel discards
-	// SIGINT and the read never sees 0x03.
-	if _, err := unix.Setsid(); err != nil && !errors.Is(err, unix.EPERM) {
-		fmt.Fprintf(os.Stderr, "setsid: %v\n", err)
-		os.Exit(4)
-	}
-	tty, err := os.OpenFile(os.Getenv("PROTONMCP_PROMPT_TTY"), os.O_RDWR, 0)
+	after, err := termState(dupfd)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open tty: %v\n", err)
-		os.Exit(4)
+		t.Fatal(err)
 	}
-	fd := int(tty.Fd())
-	if err := unix.IoctlSetInt(fd, unix.TIOCSCTTY, 0); err != nil {
-		fmt.Fprintf(os.Stderr, "TIOCSCTTY: %v\n", err)
-		os.Exit(4)
+	if !termStatesEqual(before, after) {
+		t.Fatal("terminal was left in raw mode after SIGINT")
 	}
-	if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, os.Getpid()); err != nil {
-		fmt.Fprintf(os.Stderr, "TIOCSPGRP: %v\n", err)
-		os.Exit(5)
-	}
-	ctx, stop := signalNotifyInterrupt()
-	defer stop()
-	_, err = promptSecretTTY(ctx, tty, "Password: ")
-	if errors.Is(err, context.Canceled) || errors.Is(err, errInterrupted) {
-		os.Exit(0)
-	}
-	fmt.Fprintf(os.Stderr, "prompt: %v\n", err)
-	os.Exit(3)
+	_, _ = master.Write([]byte{'\n'})
+	time.Sleep(50 * time.Millisecond)
 }
 
 func TestPromptPTYSIGHUPRestores(t *testing.T) {

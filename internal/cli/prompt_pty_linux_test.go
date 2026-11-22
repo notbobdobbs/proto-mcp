@@ -31,7 +31,3 @@ func openPTY(t *testing.T) (master, slave *os.File) {
 	t.Cleanup(func() { _ = slave.Close() })
 	return master, slave
 }
-
-func slavePath(f *os.File) (string, error) {
-	return os.Readlink(fmt.Sprintf("/proc/self/fd/%d", int(f.Fd())))
-}
