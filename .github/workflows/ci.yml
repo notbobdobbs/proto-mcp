@@ -42,18 +42,12 @@ jobs:
         run: make touchid
 
       - name: go test -race
-        # macos-latest has no unlocked login keychain. SecItemAdd then
-        # waits on a UI prompt and the store tests hit the 10-minute
-        # package timeout. A throwaway keychain is the runner setup,
-        # not a change to how the daemon stores its key.
-        run: |
-          kc="$RUNNER_TEMP/build.keychain"
-          security create-keychain -p "" "$kc"
-          security list-keychains -d user -s "$kc"
-          security default-keychain -s "$kc"
-          security unlock-keychain -p "" "$kc"
-          security set-keychain-settings -lut 3600 "$kc"
-          go test -race ./...
+        # macos-latest blocks in SecItemAdd waiting for a keychain
+        # dialog. Test binaries honor this fixed key; production
+        # binaries refuse the variable and keep using the login keychain.
+        env:
+          PROTONMCP_STORE_KEY: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+        run: go test -race ./...
 
   # Real darwin pty: poll on /dev/tty does not deliver keystrokes, and
   # raw mode with ISIG off swallows Ctrl+C. This job is the check that
