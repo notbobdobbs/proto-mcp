@@ -413,15 +413,19 @@ func readPassword(ctx context.Context, tty *os.File, ctl *ttyCtl) ([]byte, error
 		}
 		return term.ReadPassword(fd)
 	}
-	if err := setNonblock(fd); err != nil {
+	// Read a new open of the tty. Go's os.File poller forces stdin
+	// back to blocking, so O_NONBLOCK and VTIME on that fd never
+	// surface and a tty SIGINT leaves Read stuck.
+	rfd, err := openNonblockTTY(fd)
+	if err != nil {
 		ctl.restore()
 		return nil, err
 	}
 	defer func() {
-		_ = setBlocking(fd)
+		_ = unix.Close(rfd)
 		ctl.restore()
 	}()
-	return readMaskedTTY(ctx, fd, tty)
+	return readMaskedTTY(ctx, rfd, tty)
 }
 
 // readMaskedTTY reads a secret from a non-blocking tty fd.

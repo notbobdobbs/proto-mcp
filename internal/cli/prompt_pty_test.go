@@ -162,8 +162,8 @@ func TestPromptPTYCtrlC(t *testing.T) {
 			t.Fatalf("child exited with error: %v\nstderr: %s", err, stderr.String())
 		}
 	case <-time.After(3 * time.Second):
-		_ = cmd.Process.Kill()
 		cur, _ := unix.IoctlGetTermios(dupfd, ioctlReadTermios)
+		_ = cmd.Process.Kill()
 		vmin, vtime := 0, 0
 		if cur != nil {
 			vmin = int(cur.Cc[unix.VMIN])
@@ -297,12 +297,6 @@ func runPromptCtrlCChild() {
 		fmt.Fprintf(os.Stderr, "TIOCSPGRP: %v\n", err)
 		os.Exit(5)
 	}
-	gotSig := make(chan os.Signal, 1)
-	signal.Notify(gotSig, syscall.SIGINT)
-	go func() {
-		<-gotSig
-		fmt.Fprintf(os.Stderr, "child got SIGINT\n")
-	}()
 	ctx, stop := signalNotifyInterrupt()
 	defer stop()
 	_, err := promptSecretTTY(ctx, os.Stdin, "Password: ")
