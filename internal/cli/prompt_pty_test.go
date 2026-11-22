@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/signal"
 	"strings"
 	"syscall"
 	"testing"
@@ -145,6 +146,86 @@ func TestPromptPTYCtrlC(t *testing.T) {
 	}
 	_, _ = master.Write([]byte{'\n'})
 	time.Sleep(50 * time.Millisecond)
+}
+
+// TestPromptPTYQuitAndStopAreBytes feeds Ctrl-\ and Ctrl-Z (and
+// Ctrl-Y, Darwin's delayed-suspend) while the prompt is raw. Those
+// slots are _POSIX_VDISABLE, so the bytes must not signal or stop
+// the process, and the tty must be cooked again when the prompt ends.
+func TestPromptPTYQuitAndStopAreBytes(t *testing.T) {
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGQUIT, syscall.SIGTSTP)
+	t.Cleanup(func() { signal.Stop(sigs) })
+
+	master, slave := openPTY(t)
+	dupfd, err := unix.Dup(int(slave.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dup := os.NewFile(uintptr(dupfd), "dup")
+	t.Cleanup(func() { _ = dup.Close() })
+	before, err := termState(dupfd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		pw  []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		s, err := promptSecretTTY(context.Background(), slave, "Password: ")
+		pw := append([]byte(nil), s.Bytes()...)
+		s.Zero()
+		done <- result{pw, err}
+	}()
+	waitFor(t, master, "Password:")
+	deadline := time.Now().Add(2 * time.Second)
+	var raw *unix.Termios
+	for time.Now().Before(deadline) {
+		cur, gerr := unix.IoctlGetTermios(dupfd, ioctlReadTermios)
+		if gerr == nil && cur.Lflag&unix.ICANON == 0 && cur.Lflag&unix.ISIG != 0 {
+			raw = cur
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if raw == nil {
+		t.Fatal("prompt did not enter raw mode")
+	}
+	if raw.Cc[unix.VINTR] != 3 || !quitAndStopDisarmed(raw.Cc[:]) {
+		t.Fatalf("special chars VINTR=%#x VQUIT=%#x VSUSP=%#x, want Ctrl-C only",
+			raw.Cc[unix.VINTR], raw.Cc[unix.VQUIT], raw.Cc[unix.VSUSP])
+	}
+	// 0x1c Ctrl-\, 0x1a Ctrl-Z, 0x19 Ctrl-Y (VDSUSP on Darwin).
+	writeAll(t, int(master.Fd()), []byte{0x1c, 0x1a, 0x19, 'p', '\r'})
+	var res result
+	select {
+	case res = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Ctrl-\\ or Ctrl-Z stopped the prompt")
+	}
+	select {
+	case sig := <-sigs:
+		t.Fatalf("byte generated %v", sig)
+	default:
+	}
+	if res.err != nil {
+		t.Fatalf("prompt: %v", res.err)
+	}
+	if string(res.pw) != "p" {
+		t.Fatalf("password = %q, want %q", res.pw, "p")
+	}
+	for i := range res.pw {
+		res.pw[i] = 0
+	}
+	after, err := termState(dupfd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !termStatesEqual(before, after) {
+		t.Fatal("terminal was left in raw mode")
+	}
 }
 
 func TestPromptPTYSIGHUPRestores(t *testing.T) {

@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -71,7 +71,7 @@ jobs:
     # which is a cgo wrapper over Security.framework — Linux can't link
     # the symbols, so govulncheck's `loading packages` step fails before
     # it gets to the vulnerability scan.
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
