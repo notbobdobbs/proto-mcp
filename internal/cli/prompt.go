@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
@@ -161,6 +162,15 @@ func setNonblock(fd int) error {
 	return err
 }
 
+// wake unblocks a tty read that the kernel did not interrupt.
+func (c *ttyCtl) wake() {
+	if c.f == nil {
+		return
+	}
+	var b byte
+	_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(c.f.Fd()), uintptr(unix.TIOCSTI), uintptr(unsafe.Pointer(&b)))
+}
+
 func (c *ttyCtl) restore() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -278,12 +288,18 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 	// returns through finish (which zeros the password) and then
 	// flushes and restores. Restoring from the signal goroutine races
 	// the in-flight read.
+	// Cancel, then push a byte into the tty. On macOS a read can stay
+	// blocked after the tty consumes Ctrl-C as SIGINT; close does not
+	// wake it, and TIOCSTI does. The read loop sees the cancel and
+	// drops that byte.
 	stop := watchCancel(promptCtx, func() {
 		cancel()
+		ctl.wake()
 	})
 	defer stop()
 	stopHUP := watchSignal(syscall.SIGHUP, func() {
 		cancel()
+		ctl.wake()
 	})
 	defer stopHUP()
 	// Ctrl-C is SIGINT from the tty. A raw read does not see the byte.
@@ -296,6 +312,7 @@ func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Se
 		default:
 		}
 		cancel()
+		ctl.wake()
 	})
 	defer stopINT()
 
@@ -428,6 +445,9 @@ func readMaskedTTY(ctx context.Context, fd int, w io.Writer) ([]byte, error) {
 			continue
 		}
 		if n == 0 {
+			return k.finish(err)
+		}
+		if err := ctx.Err(); err != nil {
 			return k.finish(err)
 		}
 		b := one[0]
