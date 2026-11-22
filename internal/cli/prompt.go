@@ -413,10 +413,10 @@ func readPassword(ctx context.Context, tty *os.File, ctl *ttyCtl) ([]byte, error
 		}
 		return term.ReadPassword(fd)
 	}
-	// Read a new open of the tty. Go's os.File poller forces stdin
-	// back to blocking, so O_NONBLOCK and VTIME on that fd never
-	// surface and a tty SIGINT leaves Read stuck.
-	rfd, err := openNonblockTTY(fd)
+	// Read a new open of the tty so Go's stdin poller is not the
+	// descriptor inside unix.Read. VTIME on that fd returns the
+	// read after Ctrl-C; the poller keeps stdin blocking.
+	rfd, err := reopenTTY(fd)
 	if err != nil {
 		ctl.restore()
 		return nil, err

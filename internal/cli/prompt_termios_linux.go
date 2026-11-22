@@ -32,13 +32,14 @@ func flushInput(fd int) {
 	_ = unix.IoctlSetInt(fd, unix.TCFLSH, 0)
 }
 
-// openNonblockTTY opens the same terminal again. The new file
-// description is O_NONBLOCK and is not Go's stdin poller, which keeps
-// a tty read blocking on macOS even after F_SETFL.
-func openNonblockTTY(fd int) (int, error) {
+// reopenTTY opens the same terminal again. The new file description
+// is not Go's stdin poller, which keeps a tty read blocking on macOS.
+func reopenTTY(fd int) (int, error) {
 	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
 	if err != nil {
 		return -1, err
 	}
-	return unix.Open(path, unix.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0)
+	// Blocking open. VMIN 0 / VTIME makes the read time out. O_NONBLOCK
+	// on this pty makes macOS ignore that timer and still block.
+	return unix.Open(path, unix.O_RDWR|unix.O_NOCTTY, 0)
 }
