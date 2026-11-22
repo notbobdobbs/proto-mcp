@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"syscall"
 	"testing"
@@ -167,6 +168,16 @@ func runPromptCtrlCChild() {
 		fmt.Fprintf(os.Stderr, "TIOCSPGRP: %v\n", err)
 		os.Exit(5)
 	}
+	if termios, terr := unix.IoctlGetTermios(fd, ioctlReadTermios); terr == nil {
+		pgrp, _ := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
+		fmt.Fprintf(os.Stderr, "ready pid=%d pgrp=%d lflag=%#x vintr=%d\n", os.Getpid(), pgrp, termios.Lflag, termios.Cc[unix.VINTR])
+	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+	go func() {
+		<-sigCh
+		fmt.Fprintf(os.Stderr, "got SIGINT\n")
+	}()
 	ctx, stop := signalNotifyInterrupt()
 	defer stop()
 	_, err = promptSecretTTY(ctx, tty, "Password: ")
