@@ -2,11 +2,7 @@ name: CI
 
 on:
   push:
-    # pull_request on the default branch only matches PRs into main, so a
-    # stacked PR never starts this workflow. Push of this branch does.
-    branches:
-      - main
-      - cursor/hv-login-captcha-mask-51bf
+    branches: [main]
   pull_request:
 
 permissions:
@@ -14,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -46,6 +42,11 @@ jobs:
         run: make touchid
 
       - name: go test -race
+        # macos-latest blocks in SecItemAdd waiting for a keychain
+        # dialog. Test binaries honor this fixed key; production
+        # binaries refuse the variable and keep using the login keychain.
+        env:
+          PROTONMCP_STORE_KEY: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
         run: go test -race ./...
 
   # Real darwin pty: poll on /dev/tty does not deliver keystrokes, and
@@ -64,14 +65,14 @@ jobs:
           cache: true
 
       - name: pty prompt tests
-        run: go test -count=1 -timeout 180s ./internal/cli/ -run 'TestPromptPTY|TestPromptSecretCancel|TestReadMasked'
+        run: go test -count=1 -timeout 180s ./internal/cli/ -run 'TestPromptPTY|TestPromptSecretCancel|TestReadMasked|TestPTYRawBurst'
 
   vulncheck:
     # macOS runner because internal/keystore depends on keybase/go-keychain
     # which is a cgo wrapper over Security.framework — Linux can't link
     # the symbols, so govulncheck's `loading packages` step fails before
     # it gets to the vulnerability scan.
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

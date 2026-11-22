@@ -3,10 +3,12 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,8 +73,26 @@ func TestPromptSecretCancelRestoresTerminal(t *testing.T) {
 	if !reflect.DeepEqual(before, after) {
 		t.Fatal("terminal was left in raw mode after cancel")
 	}
-	// The blocking read is still in the kernel. Feed it a newline so
-	// it exits before this pty's fd number is reused by the next test.
-	_, _ = master.Write([]byte{'\n'})
-	time.Sleep(50 * time.Millisecond)
+	// The prompt must not still be reading the tty. A later line has
+	// to arrive intact, including its echo, for the next prompt.
+	if _, err := master.Write([]byte("next-line\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = unix.SetNonblock(int(slave.Fd()), true)
+	deadline = time.Now().Add(time.Second)
+	var got bytes.Buffer
+	tmp := make([]byte, 64)
+	for time.Now().Before(deadline) && !strings.Contains(got.String(), "next-line") {
+		n, rerr := unix.Read(int(slave.Fd()), tmp)
+		if n > 0 {
+			got.Write(tmp[:n])
+			continue
+		}
+		if rerr != nil {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !strings.Contains(got.String(), "next-line") {
+		t.Fatalf("next reader got %q", got.String())
+	}
 }
