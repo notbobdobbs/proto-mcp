@@ -70,6 +70,10 @@ type ttyCtl struct {
 	raw        *term.State
 	restoreFD  int
 	hasRestore bool
+	// wakeFD is captured once so a cancel does not call File.Fd while
+	// the caller closes the same *os.File.
+	wakeFD  int
+	hasWake bool
 }
 
 func (c *ttyCtl) enterRaw() error {
@@ -164,11 +168,14 @@ func setNonblock(fd int) error {
 
 // wake unblocks a tty read that the kernel did not interrupt.
 func (c *ttyCtl) wake() {
-	if c.f == nil {
+	c.mu.Lock()
+	fd, ok := c.wakeFD, c.hasWake
+	c.mu.Unlock()
+	if !ok {
 		return
 	}
 	var b byte
-	_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(c.f.Fd()), uintptr(unix.TIOCSTI), uintptr(unsafe.Pointer(&b)))
+	_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TIOCSTI), uintptr(unsafe.Pointer(&b)))
 }
 
 func (c *ttyCtl) restore() {
@@ -282,7 +289,7 @@ func PromptSecret(ctx context.Context, label string) (secret.Secret, error) {
 func promptSecretTTY(ctx context.Context, tty *os.File, label string) (secret.Secret, error) {
 	promptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	ctl := &ttyCtl{f: tty}
+	ctl := &ttyCtl{f: tty, wakeFD: int(tty.Fd()), hasWake: true}
 	defer ctl.release()
 	// Signals only cancel. The read loop is on this goroutine; it
 	// returns through finish (which zeros the password) and then

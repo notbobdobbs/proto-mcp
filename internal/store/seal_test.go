@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -109,12 +110,16 @@ func TestFileStoreSealsBodies(t *testing.T) {
 	if !bytes.HasPrefix(sealed, []byte(sealMagic)) {
 		t.Fatal("canonical mirror is not sealed")
 	}
-	info, err := os.Stat(filepath.Join(dir, "store.key"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Errorf("store.key mode = %#o, want 0600", info.Mode().Perm())
+	// Darwin keeps the mirror key in the Keychain, not store.key.
+	// Non-darwin tests (and only those) create that file.
+	if runtime.GOOS != "darwin" {
+		info, err := os.Stat(filepath.Join(dir, "store.key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Errorf("store.key mode = %#o, want 0600", info.Mode().Perm())
+		}
 	}
 
 	if err := s.Close(); err != nil {
@@ -147,8 +152,14 @@ func TestFileStoreSealsBodies(t *testing.T) {
 	}
 
 	// A different key must fail closed and leave the sealed file in place.
-	if err := os.WriteFile(filepath.Join(dir, "store.key"), bytes.Repeat([]byte{7}, 32), 0o600); err != nil {
-		t.Fatal(err)
+	if os.Getenv("PROTONMCP_STORE_KEY") != "" {
+		t.Setenv("PROTONMCP_STORE_KEY", strings.Repeat("77", 32))
+	} else if runtime.GOOS != "darwin" {
+		if err := os.WriteFile(filepath.Join(dir, "store.key"), bytes.Repeat([]byte{7}, 32), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		t.Skip("swapping the macOS Keychain key is not part of this test")
 	}
 	if _, err := Open(path); err == nil {
 		t.Fatal("Open with the wrong key succeeded")
